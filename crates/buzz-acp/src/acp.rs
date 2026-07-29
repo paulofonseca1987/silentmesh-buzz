@@ -14,6 +14,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
 use crate::observer::{ObserverContext, ObserverHandle};
+use crate::permission::{AutoOption, PermissionRequest, ToolCallRef, TOOL_CALL_MEMORY};
 use crate::usage::{TurnUsage, UsageTracker};
 
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
@@ -162,6 +163,12 @@ pub struct AcpClient {
     /// Guards against double-response if a timeout fires after the allow_once
     /// response was written but before `pending_permission_id` was cleared.
     permission_responded: bool,
+    /// Recently announced `tool_call` session/updates, newest last, bounded by
+    /// [`TOOL_CALL_MEMORY`]. A permission request's own `toolCall` reference
+    /// is often sparse (claude-code-acp sends only the id); resolving it
+    /// against the announcement matched by `toolCallId` recovers the tool
+    /// title/kind/input the runtime-mode policy needs.
+    recent_tool_calls: std::collections::VecDeque<ToolCallRef>,
     /// The JSON-RPC id of the most recently sent `session/prompt` request.
     /// Used by [`cancel_with_cleanup`] to drain the correct response.
     /// Set in [`session_prompt_with_idle_timeout`]; consumed in [`cancel_with_cleanup`].
@@ -545,6 +552,7 @@ impl AcpClient {
             next_id: 0,
             pending_permission_id: None,
             permission_responded: false,
+            recent_tool_calls: std::collections::VecDeque::new(),
             last_prompt_id: None,
             current_hard_deadline: None,
             observer: None,
@@ -1732,6 +1740,11 @@ impl AcpClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
                 tracing::info!(target: "acp::tool", "tool_call: {title} ({kind})");
+                // Remember the announcement so a following permission request
+                // can be resolved to the tool it gates (by `toolCallId`).
+                if let Some(call) = ToolCallRef::from_update(update) {
+                    self.remember_tool_call(call);
+                }
                 true
             }
             "tool_call_update" => {
@@ -1852,10 +1865,40 @@ impl AcpClient {
         }
     }
 
+    /// Remember an announced tool call for permission correlation, evicting
+    /// the oldest entry beyond [`TOOL_CALL_MEMORY`]. A re-announced id
+    /// replaces its earlier entry (agents re-send `tool_call` on retries).
+    fn remember_tool_call(&mut self, call: ToolCallRef) {
+        self.recent_tool_calls.retain(|c| c.id != call.id);
+        self.recent_tool_calls.push_back(call);
+        while self.recent_tool_calls.len() > TOOL_CALL_MEMORY {
+            self.recent_tool_calls.pop_front();
+        }
+    }
+
+    /// Resolve a permission request's (often sparse) tool-call reference
+    /// against the announced `tool_call` updates, matched by `toolCallId`.
+    fn resolve_tool_call(&self, reference: Option<&ToolCallRef>) -> Option<ToolCallRef> {
+        let reference = reference?;
+        let announced = reference.id.as_ref().and_then(|id| {
+            self.recent_tool_calls
+                .iter()
+                .rev()
+                .find(|c| c.id.as_ref() == Some(id))
+        });
+        Some(match announced {
+            Some(announced) => reference.filled_from(announced),
+            None => reference.clone(),
+        })
+    }
+
     /// Auto-approve a `session/request_permission` request from the agent.
     ///
-    /// Finds the option with `kind == "allow_once"` and responds with its `optionId`.
-    /// If no `allow_once` option exists, falls back to `reject_once`.
+    /// Parses the request into a typed [`PermissionRequest`], resolves the
+    /// tool call it gates (correlated with the announcing `tool_call`
+    /// session/update by `toolCallId`), and responds with the option the
+    /// full-access policy selects: `allow_once`, falling back to
+    /// `reject_once`.
     ///
     /// **Critical:** Never hardcode `optionId` — always find it dynamically by `kind`.
     ///
@@ -1869,52 +1912,49 @@ impl AcpClient {
             .ok_or_else(|| AcpError::Protocol("permission request missing id".into()))?;
 
         // Store pending permission id so cancel_with_cleanup can respond to it.
+        // Must happen before any further parsing can fail, so teardown still
+        // responds `cancelled` to a malformed request.
         self.pending_permission_id = Some(id.clone());
         // Mark as not yet responded — guards against double-response race.
         self.permission_responded = false;
 
-        let options = msg["params"]["options"]
-            .as_array()
-            .ok_or_else(|| AcpError::Protocol("permission request missing options".into()))?;
+        let request = PermissionRequest::parse_params(id.clone(), &msg["params"])
+            .map_err(AcpError::Protocol)?;
 
         tracing::debug!(
             target: "acp::permission",
             "session/request_permission id={id}, {} options",
-            options.len()
+            request.options.len()
         );
 
-        // Find allow_once by kind — NEVER hardcode optionId.
-        let allow_once = options
-            .iter()
-            .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("allow_once"));
-
-        let response = if let Some(opt) = allow_once {
-            let option_id = opt["optionId"]
-                .as_str()
-                .ok_or_else(|| AcpError::Protocol("allow_once option missing optionId".into()))?;
-            tracing::info!(
+        // Resolve the gated tool call. Unused by the full-access policy below,
+        // but load-bearing for supervised mode (P3): request kind, human-facing
+        // detail, and payload all come from here.
+        if let Some(tool_call) = self.resolve_tool_call(request.tool_call.as_ref()) {
+            tracing::debug!(
                 target: "acp::permission",
-                "auto-approving permission id={id} with allow_once optionId={option_id:?}"
+                "permission id={id} gates tool call {}: {} ({})",
+                tool_call.id.as_deref().unwrap_or("?"),
+                tool_call.title.as_deref().unwrap_or("?"),
+                tool_call.kind.as_deref().unwrap_or("?"),
             );
-            permission_response_selected(&id, option_id)
-        } else {
-            // No allow_once — fall back to reject_once.
-            tracing::warn!(
-                target: "acp::permission",
-                "no allow_once option found in permission request id={id}, falling back to reject_once"
-            );
-            let reject = options
-                .iter()
-                .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("reject_once"));
+        }
 
-            if let Some(opt) = reject {
-                let option_id = opt["optionId"].as_str().unwrap_or("reject");
-                permission_response_selected(&id, option_id)
-            } else {
-                return Err(AcpError::Protocol(
-                    "no suitable permission option found (neither allow_once nor reject_once)"
-                        .into(),
-                ));
+        let response = match request.auto_option().map_err(AcpError::Protocol)? {
+            AutoOption::AllowOnce(option_id) => {
+                tracing::info!(
+                    target: "acp::permission",
+                    "auto-approving permission id={id} with allow_once optionId={option_id:?}"
+                );
+                permission_response_selected(&request.id, option_id)
+            }
+            AutoOption::RejectOnce(option_id) => {
+                // No allow_once — fall back to reject_once.
+                tracing::warn!(
+                    target: "acp::permission",
+                    "no allow_once option found in permission request id={id}, falling back to reject_once"
+                );
+                permission_response_selected(&request.id, option_id)
             }
         };
 
