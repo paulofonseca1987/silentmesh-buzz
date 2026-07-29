@@ -32,7 +32,8 @@ courtesy split in case upstream lands something.
 | 47001 | `KIND_WORK_THREAD_METADATA` | command | Task metadata edit (goal / deadline / DRI) — any full member; agents only recommend. Tags `e` (thread root), `h`; content JSON with the changed fields. Relay validates authority and updates the projection. |
 | 47002 | `KIND_WORK_THREAD_STATE` | command | State transition per §3 — relay validates the transition *and* the author's authority, updates the projection, rejects otherwise. Tags `e` (root), `h`, `state` (target), optional `canonicalize` flag on close. |
 | 47003 | `KIND_WORK_THREAD_RECOMMEND` | regular (append-only) | Agent recommendation (open / metadata / done) — **inert until a human confirms** by sending the real 47001/47002 referencing it via an `e` tag. Never touches the projection. |
-| 47010 | `KIND_WORK_THREAD_CHECKPOINT` | regular | Per-turn checkpoint ref (branch + commit) — later slice. |
+| 47010 | `KIND_WORK_THREAD_CHECKPOINT` | regular (append-only) | Per-turn checkpoint ref: tags `e` (root), `h`, `commit` (40/64-hex git id), optional `branch` + `turn`. Any channel participant (bots included); the thread must exist in the channel. |
+| 47011 | `KIND_WORK_THREAD_OVERDUE` | **relay-only** | Overdue notice from the leader-elected deadline sweep — tags the DRI (`p`; fallback: opener), `e` (root), `h`. At-most-once per deadline (`overdue_notified_at` claim); a 47001 deadline edit re-arms it. Client submissions rejected. |
 | 47020 | `KIND_WORK_THREAD_FORK` | command | Thread fork at head/checkpoint — later slice. |
 | 47021 | `KIND_WORK_THREAD_PROMOTE` | command | Personal-channel promotion through the gate — later slice. |
 
