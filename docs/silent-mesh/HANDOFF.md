@@ -33,20 +33,30 @@ repo (relay-signed kind:30617). Guest role disabled in depth.
 `BUZZ_WORKSPACE_CHANNEL_GATE` (default **off**) gates non-DM channel
 creation to workspace owner/admin when enabled.
 
-**Phase 2b–2e — work threads.** Kinds 47000 (root/task), 47001 (metadata
+**Phase 2b–2f — work threads.** Kinds 47000 (root/task), 47001 (metadata
 cmd), 47002 (state cmd), 47003 (agent recommendation, inert), 47010
 (checkpoint), 47011 (overdue notice, relay-only), 47012 (canonicalization
-outcome, relay-only). D41 state machine enforced relay-side
+outcome, relay-only), 47013 (sibling-archive notice, relay-only), 47020
+(fork root). D41 state machine enforced relay-side
 (`handlers/work_thread.rs`; exhaustive matrix tests); `work_threads`
-projection (migrations 0027–0029) with TOCTOU-safe transitions and
+projection (migrations 0027–0030) with TOCTOU-safe transitions and
 idempotent command replay. Overdue sweep (leader-only, at-most-once per
 deadline, deadline-edit re-arms). Canonicalize-on-close
 (`api/git/canonicalize.rs`): grafts the latest checkpoint under
 `canon/<thread-short>/` on the default branch via hydrate → pre-2.0 git
 plumbing → pointer-CAS publish (+ kind:30618), with claim/re-arm
 bookkeeping, crash-recovery sweep, and a kind:47012 outcome notice that
-never fails the close. `buzz threads` CLI family
-(open/list/show/set/state/recommend/checkpoint) + buzz-sdk builders.
+never fails the close. Thread forking (2f, D27/D28): kind 47020 is a
+root-like regular event (its id = the new thread id, provenance
+`e`/`commit` tags — lowercase, unmarked; fork point must be a recorded
+parent checkpoint, checked over the full paged history; any full member,
+any parent state); closing a winner with `archive-siblings` closes and
+batch-archives its fork family in one family-advisory-locked transaction
+(recursive walk; snoozed included under close authority;
+pending-canonicalization siblings skipped; concurrent family closes
+serialize so exactly one winner survives) and emits kind:47013 notices.
+`buzz threads` CLI family
+(open/list/show/set/state/fork/recommend/checkpoint) + buzz-sdk builders.
 
 ## Working conventions (as practiced)
 
@@ -74,30 +84,38 @@ never fails the close. `buzz threads` CLI family
 - The forge S3 probes (and the Phase 2e full-path canonicalize test) need
   live MinIO: `docker compose up -d minio`, then
   `BUZZ_GIT_S3_PROBE=1 cargo test -p buzz-relay --lib canonicalize::s3_probe_tests -- --ignored`.
-  **This has not yet run anywhere** — the dev sandbox had no MinIO. Run it
-  before trusting the merged-path behavior end-to-end.
+  First ran green 2026-07-29 on the WSL2 machine (live MinIO) during the
+  2f session — the merged-path behavior is now covered end-to-end.
 - Don't start `redis-server` with the repo as cwd (it drops `dump.rdb` into
   the working tree).
 - Production git is 2.39 (bookworm): no `merge-tree --merge-base`, which is
   why canonicalize uses read-tree/commit-tree plumbing.
+- `cargo clippy/check --workspace --all-targets` needs OpenSSL headers
+  (openssl-sys via buzz-relay's mesh-llm dev-deps). On a machine without
+  `libssl-dev` and without sudo: `apt-get download libssl-dev`, `dpkg -x`
+  it somewhere, build a prefix with `include/openssl` (merge the
+  `x86_64-linux-gnu/openssl` arch headers in — `opensslconf.h` lives
+  there) and `lib/libssl.so`/`libcrypto.so` symlinks to the system
+  `.so.3`, then run gates with `OPENSSL_DIR=<prefix>`. Beware masked
+  pipeline exit codes (`cargo … | tail` reports tail's status).
 
 ## Next slices (roadmap Phase 2 remainder, then Phase 3+)
 
-1. **2f — thread forking (D27) + sibling archiving**: command kind 47020
-   (fork at head or a named checkpoint → new 47000-rooted thread with
-   provenance tags: `e` parent root, `commit` fork point; conversation
-   inherited by reference). Batch sibling-fork archiving into the winner's
-   close flow (47002 close handler).
-2. **2g — personal channels + promotion (D29) with Privacy Gate scaffold
+1. **2g — personal channels + promotion (D29) with Privacy Gate scaffold
    (D30)**: command kind 47021; member-written summary + deterministic
    secret scan; files + summary transfer, conversation does not.
-3. **2h — folder/file write ACLs (D4)**: per-path rules in the pre-receive
+2. **2h — folder/file write ACLs (D4)**: per-path rules in the pre-receive
    policy hook (`api/git/hook.rs` / `policy.rs`) + agent tool layer. Note:
    the hook currently sees ref updates, not changed paths — it needs the
    pack/paths surfaced (see mapping notes in git history of this branch).
-4. **buzz-acp worktree binding**: align agent workspaces onto thread
+3. **buzz-acp worktree binding**: align agent workspaces onto thread
    worktrees; emit kind:47010 checkpoints automatically at turn end
    (today checkpoints are CLI/manual).
+4. **Command-kind timeout gate** (found in the 2f review, pre-existing
+   since Phase 1): ingest routes command kinds (47001/47002, DM,
+   workflow, approval commands) to the command executor *before* the
+   moderation timeout write-block, so a timed-out admin can still issue
+   them. Decide intended semantics, then move or mirror the gate.
 5. Phase 2 exit-criterion dry run from buzz-cli (roadmap lines 87–100),
    then Phase 3 (model plane) per roadmap.
 

@@ -35,7 +35,8 @@ courtesy split in case upstream lands something.
 | 47010 | `KIND_WORK_THREAD_CHECKPOINT` | regular (append-only) | Per-turn checkpoint ref: tags `e` (root), `h`, `commit` (40/64-hex git id), optional `branch` + `turn`. Any channel participant (bots included); the thread must exist in the channel. |
 | 47011 | `KIND_WORK_THREAD_OVERDUE` | **relay-only** | Overdue notice from the leader-elected deadline sweep — tags the DRI (`p`; fallback: opener), `e` (root), `h`. At-most-once per deadline (`overdue_notified_at` claim); a 47001 deadline edit re-arms it. Client submissions rejected. |
 | 47012 | `KIND_WORK_THREAD_CANON` | **relay-only** | Canonicalization outcome from the close-with-canonicalize job — tags `e` (root), `h`, optional `commit` (new main tip); content JSON `{outcome, prefix}`. The job grafts the thread's latest 47010 checkpoint under `canon/<thread-short>/` on the default branch via hydrate → plumbing → pointer-CAS publish (bounded rehydrate-retry on conflict; `canonicalized_at` claim is once-only, re-armed by re-close; leader sweep recovers crashed jobs). Never fails the close. |
-| 47020 | `KIND_WORK_THREAD_FORK` | command | Thread fork at head/checkpoint — later slice. |
+| 47013 | `KIND_WORK_THREAD_SIBLING_ARCHIVED` | **relay-only** | Sibling-archive notice — one per losing fork archived by a winner's close-with-`archive-siblings` (D28). Tags `e` (the archived thread's root), `h`, `winner` (winner root hex); content JSON `{winner}`. Lets event-folding clients see the batch archive; the projection batch is the authority. |
+| 47020 | `KIND_WORK_THREAD_FORK` | regular (append-only) | Thread fork (D27): the fork event **is the new thread's root** (its id = new thread id) — shipped as a root-like regular event, not a command, since the new root must be client-signed anyway. Content = the variation's goal; tags: exactly one **unmarked** `e` (parent root — `["e", <id>]` only, so a fork can't double-register as a NIP-10 reply), `h` (same channel), optional `commit` (fork point — must be a kind:47010 checkpoint the parent recorded; the check pages through the full checkpoint history; absent = head), optional `deadline`/`dri` as on 47000. All hex tag values lowercase (one canonical case for byte-exact `#e`/`commit` matching; 47010's `e`/`commit` tags share the rule). Any full member; parent forkable from any state. Conversation inherited by reference; projection row carries `forked_from`/`fork_commit`. |
 | 47021 | `KIND_WORK_THREAD_PROMOTE` | command | Personal-channel promotion through the gate — later slice. |
 
 All are channel-scoped (`h` tag) and ride the existing membership-checked
@@ -68,6 +69,29 @@ A replayed (already-stored) 47001/47002 command short-circuits as an
 idempotent duplicate *before* authority validation — otherwise a replayed
 close would read as an illegal `closed → closed` transition.
 
+**Sibling archiving (2f, D28)** is a second path into `archived` that is
+*not* a client 47002 transition: closing a winner with the
+`archive-siblings` tag archives every other thread in its fork family
+(walk `forked_from` up to the original root, then the whole subtree) from
+`open|snoozed|ready|closed`. The winner's TOCTOU close and the batch run
+in **one DB transaction**, serialized per family by a Postgres advisory
+transaction lock keyed on `(community, family root)` — so the close and
+the batch commit or roll back together, and two concurrent family closes
+cannot mutually archive each other's winner: the second serializes behind
+the first, finds its own winner already archived, and loses its status
+guard cleanly (exactly one winner survives). `snoozed` is deliberately
+included even though the client matrix has no `snoozed → archived` edge —
+the batch runs under the closer's admin authority as part of the close
+flow, and a parked loser still loses. A sibling that is closed with a
+**pending canonicalization** (flag set, unclaimed) is skipped — archiving
+it would silently cancel an admin-authorized canon/ merge (claim and
+recovery sweep both require `status = 'closed'`); it becomes archivable
+once its kind:47012 outcome lands. Each archived sibling gets a
+relay-signed kind:47013 notice, emitted best-effort after the commit; a
+crash in between leaves the projection correct and the fold view stale
+(the projection is authoritative). The batch never leaves the winner's
+channel.
+
 ## 4. Storage
 
 Migration 0027:
@@ -92,6 +116,11 @@ Migration 0027:
   Projection only — the signed events are the truth; the row makes
   list/read cheap and transitions TOCTOU-safe
   (`UPDATE … WHERE status = $expected`).
+
+Later additive migrations on `work_threads`: 0028 `overdue_notified_at`
+(2d), 0029 `canonicalized_at` + `canonicalize_outcome` (2e), 0030
+`forked_from` + `fork_commit` with a partial index on
+`(community_id, forked_from)` for the sibling-family walk (2f).
 
 ## 5. Authority enforcement points (2a)
 
@@ -118,6 +147,21 @@ Migration 0027:
   the git API); if the forge is init-on-first-push, the binding row plus a
   server-side init is used instead — resolved during implementation
   against the mapped seam.
-- Personal channels (D29), implicit Channel-Admin in them, forking,
-  promotion, checkpoints, canonicalization mechanics, and file ACLs are
-  later Phase 2 slices; nothing in this slice blocks them.
+- Personal channels (D29), implicit Channel-Admin in them, promotion,
+  and file ACLs are later Phase 2 slices; nothing in this slice blocks
+  them. (Forking, checkpoints, and canonicalization shipped in 2d–2f.)
+
+Known limitations shared with upstream patterns (recorded 2f review):
+
+- **Projection-creation side effects are post-storage and best-effort**
+  (47000 and 47020 alike, the upstream `handle_side_effects` model): if
+  the row insert fails after the event stored, the failure is logged and
+  the thread is invisible to 47001/47002/47010 (and the family walk)
+  until an operator re-inserts the row. No 47xxx-specific regression;
+  fixing it means moving projection creation pre-storage, upstream-wide.
+- **Command kinds bypass the moderation timeout write-block**: the
+  command-executor routing (47001/47002, DM/workflow/approval commands)
+  runs before the community ban/timeout gate in ingest, so a timed-out
+  Channel Admin can still close/archive threads (and, since 2f, trigger
+  sibling batches). Pre-existing for every command kind since Phase 1;
+  flagged as a follow-up slice in the handoff.
