@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 25);
+        assert_eq!(migrations.len(), 26);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -899,10 +899,36 @@ mod tests {
             .contains("CREATE INDEX relay_invites_expires_at_idx ON relay_invites (expires_at)"));
         assert!(!relay_invites.contains("_operator_global_tables"));
 
+        // Agent permission requests: pending human approvals for supervised
+        // ACP tool calls. Community-prefixed PK/UNIQUE, 32-byte hashed token
+        // (46010/46030/46031 d-tag handle), channel FK for membership-scoped
+        // reads. Never listed in _operator_global_tables — community-scoped.
+        assert_eq!(migrations[25].version, 26);
+        let agent_permissions = migrations[25].sql.as_str();
+        assert!(agent_permissions.contains("CREATE TABLE agent_permission_requests"));
+        assert!(agent_permissions.contains("CREATE TYPE agent_permission_status AS ENUM"));
+        assert!(agent_permissions.contains("PRIMARY KEY (community_id, request_id)"));
+        assert!(agent_permissions.contains("UNIQUE (community_id, token)"));
+        assert!(agent_permissions
+            .contains("token           BYTEA       NOT NULL CHECK (length(token) = 32)"));
+        assert!(agent_permissions
+            .contains("CHECK (request_kind IN ('command', 'file-read', 'file-change', 'other'))"));
+        assert!(agent_permissions.contains(
+            "CHECK (decision IN ('allow_once', 'allow_always', 'reject_once', 'cancel'))"
+        ));
+        assert!(
+            agent_permissions.contains("REFERENCES channels (community_id, id) ON DELETE CASCADE")
+        );
+        assert!(!agent_permissions.contains("_operator_global_tables"));
+
         let desired_schema = include_str!("../../../schema/schema.sql");
         assert!(
             desired_schema.contains("CREATE TABLE join_policy_acceptances"),
             "desired-state schema must include join-policy evidence used by invite claims",
+        );
+        assert!(
+            desired_schema.contains("CREATE TABLE agent_permission_requests"),
+            "desired-state schema must include agent permission requests",
         );
     }
 

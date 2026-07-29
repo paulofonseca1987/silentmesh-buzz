@@ -609,6 +609,49 @@ CREATE TABLE relay_invites (
 
 CREATE INDEX relay_invites_expires_at_idx ON relay_invites (expires_at);
 
+-- ── Agent permission requests ─────────────────────────────────────────────────
+-- Pending human approvals for ACP tool calls (supervised agents). Mirrors
+-- workflow_approvals' idioms (community-prefixed keys, hashed token, TOCTOU
+-- pending-only updates, expiry) but is its own table: agent requests have no
+-- workflow to reference. Keep in sync with migrations/0026.
+
+CREATE TYPE agent_permission_status AS ENUM
+    ('pending', 'granted', 'denied', 'cancelled', 'expired');
+
+CREATE TABLE agent_permission_requests (
+    community_id    UUID        NOT NULL REFERENCES communities(id),
+    request_id      UUID        NOT NULL DEFAULT gen_random_uuid(),
+    token           BYTEA       NOT NULL CHECK (length(token) = 32),
+    channel_id      UUID        NOT NULL,
+    agent_pubkey    BYTEA       NOT NULL CHECK (length(agent_pubkey) = 32),
+    session_ref     TEXT,
+    request_kind    TEXT        NOT NULL
+        CHECK (request_kind IN ('command', 'file-read', 'file-change', 'other')),
+    tool_name       TEXT,
+    detail          TEXT        NOT NULL CHECK (char_length(detail) <= 400),
+    payload         JSONB,
+    options_offered JSONB       NOT NULL,
+    status          agent_permission_status NOT NULL DEFAULT 'pending',
+    decision        TEXT
+        CHECK (decision IN ('allow_once', 'allow_always', 'reject_once', 'cancel')),
+    decider_pubkey  BYTEA       CHECK (decider_pubkey IS NULL OR length(decider_pubkey) = 32),
+    note            TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ NOT NULL,
+    resolved_at     TIMESTAMPTZ,
+    PRIMARY KEY (community_id, request_id),
+    UNIQUE (community_id, token),
+    FOREIGN KEY (community_id, channel_id)
+        REFERENCES channels (community_id, id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_agent_permission_requests_channel
+    ON agent_permission_requests (community_id, channel_id, status);
+CREATE INDEX idx_agent_permission_requests_status
+    ON agent_permission_requests (community_id, status, created_at DESC);
+CREATE INDEX idx_agent_permission_requests_expiry
+    ON agent_permission_requests (expires_at) WHERE status = 'pending';
+
 -- ── Archived identities (NIP-IA) ──────────────────────────────────────────────
 -- Conformance: archive cannot hide a key in another community. PK scoped.
 

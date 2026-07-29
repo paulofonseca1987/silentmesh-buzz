@@ -11,6 +11,8 @@
 
 /// Explicit deployment-global admin report reads.
 pub mod admin_moderation;
+/// Agent permission request CRUD (supervised ACP tool-call approvals).
+pub mod agent_permission;
 /// API token storage and lookup.
 pub mod api_token;
 /// Relay-scoped archived identity persistence (NIP-IA).
@@ -2812,6 +2814,75 @@ impl Db {
             token_hash,
             status,
             approver_pubkey,
+            note,
+        )
+        .await
+    }
+
+    /// Create an agent permission request. Returns the server-minted id.
+    pub async fn create_agent_permission_request(
+        &self,
+        params: agent_permission::CreateAgentPermissionRequestParams<'_>,
+    ) -> Result<uuid::Uuid> {
+        agent_permission::create_agent_permission_request(&self.pool, params).await
+    }
+
+    /// Fetch an agent permission request by its already-hashed token.
+    pub async fn get_agent_permission_by_stored_hash(
+        &self,
+        community_id: CommunityId,
+        token_hash: &[u8],
+    ) -> Result<agent_permission::AgentPermissionRequestRecord> {
+        agent_permission::get_agent_permission_by_stored_hash(&self.pool, community_id, token_hash)
+            .await
+    }
+
+    /// Fetch an agent permission request by its server-minted id.
+    pub async fn get_agent_permission_request(
+        &self,
+        community_id: CommunityId,
+        request_id: uuid::Uuid,
+    ) -> Result<agent_permission::AgentPermissionRequestRecord> {
+        agent_permission::get_agent_permission_request(&self.pool, community_id, request_id).await
+    }
+
+    /// List agent permission requests visible through the given channels.
+    pub async fn list_agent_permission_requests(
+        &self,
+        community_id: CommunityId,
+        channel_ids: &[uuid::Uuid],
+        status: Option<agent_permission::AgentPermissionStatus>,
+        limit: i64,
+    ) -> Result<Vec<agent_permission::AgentPermissionRequestRecord>> {
+        agent_permission::list_agent_permission_requests(
+            &self.pool,
+            community_id,
+            channel_ids,
+            status,
+            limit,
+        )
+        .await
+    }
+
+    /// Resolve a pending agent permission request (TOCTOU-safe;
+    /// `Ok(false)` = already acted on, treat as conflict).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_agent_permission_by_stored_hash(
+        &self,
+        community_id: CommunityId,
+        token_hash: &[u8],
+        status: agent_permission::AgentPermissionStatus,
+        decision: Option<agent_permission::AgentPermissionDecision>,
+        decider_pubkey: Option<&[u8]>,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        agent_permission::resolve_agent_permission_by_stored_hash(
+            &self.pool,
+            community_id,
+            token_hash,
+            status,
+            decision,
+            decider_pubkey,
             note,
         )
         .await
