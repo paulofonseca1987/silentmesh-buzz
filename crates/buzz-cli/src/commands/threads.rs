@@ -8,10 +8,12 @@
 //!
 //! Reads fold the signed events client-side — the events are the truth.
 //! Every stored 47001/47002 was applied by the relay (rejected commands are
-//! never stored), and relay-signed 47013 notices record the batch sibling
-//! archiving a winner's close performed, so folding them in `created_at`
-//! order reproduces the projection; ties or skewed client clocks can differ
-//! transiently from the relay's row, which remains authoritative.
+//! never stored), and the relay's own notices (47011–47014) record what its
+//! sweeps and close flows did, so folding them in `created_at` order
+//! reproduces the projection. Same-second ties resolve in favour of relay
+//! notices (see [`fold_key`]) because a notice is only written after the
+//! command it reports on; skewed client clocks can still differ from the
+//! relay's row, which remains authoritative.
 
 use crate::client::BuzzClient;
 use crate::error::CliError;
@@ -36,14 +38,32 @@ fn tag_value<'a>(event: &'a serde_json::Value, name: &str) -> Option<&'a str> {
     })
 }
 
-/// Order key for folding: `(created_at, id)` — the relay stores commands in
-/// validation order, so this reproduces it except under client-clock skew.
-fn fold_key(event: &serde_json::Value) -> (i64, String) {
+/// Order key for folding: `(created_at, relay_notice, id)`.
+///
+/// The relay stores commands in validation order, so `created_at`
+/// reproduces it. The middle term breaks same-second ties in favour of
+/// relay-emitted notices (47011–47014): a notice is only ever written as
+/// a consequence of a command the relay already applied, so it is
+/// causally later even when the one-second wire clock cannot show it.
+/// Without this, a losing thread's own `ready` command could sort after
+/// the sibling-archive notice that superseded it and the fold would
+/// permanently contradict the projection — observed in the Phase 2
+/// exit-criterion dry run, where both events shared a second and the id
+/// tie-break happened to favour the command.
+///
+/// Residual (documented, far rarer): two *relay* notices, or a client
+/// command genuinely issued after a notice within the same second, still
+/// fall back to id order. The relay's `work_threads` row stays
+/// authoritative in every case.
+fn fold_key(event: &serde_json::Value) -> (i64, u8, String) {
+    let kind = event.get("kind").and_then(|v| v.as_u64()).unwrap_or(0);
+    let relay_notice = u8::from(matches!(kind, 47011..=47014));
     (
         event
             .get("created_at")
             .and_then(|v| v.as_i64())
             .unwrap_or(0),
+        relay_notice,
         event
             .get("id")
             .and_then(|v| v.as_str())
@@ -347,6 +367,52 @@ pub async fn cmd_show_thread(
         })
         .collect();
 
+    // Relay-emitted notices about this thread: overdue (47011),
+    // canonicalization outcome (47012), sibling-archive (47013), and
+    // promotion (47014). These are the relay's own signals — an agent
+    // driving a thread learns its deadline passed or its canonicalization
+    // failed from here, so `show` surfaces them alongside the human and
+    // agent events rather than leaving them invisible to the CLI.
+    let notice_filter = serde_json::json!({
+        "kinds": [47011, 47012, 47013, 47014],
+        "#h": [channel],
+        "#e": [thread_id],
+    });
+    let notice_resp = client.query(&notice_filter).await?;
+    let mut notices: Vec<serde_json::Value> =
+        serde_json::from_str(&notice_resp).unwrap_or_default();
+    notices.sort_by_key(fold_key);
+    let notices: Vec<serde_json::Value> = notices
+        .iter()
+        .map(|n| {
+            let kind = n.get("kind").and_then(|v| v.as_u64()).unwrap_or(0);
+            let body: Option<serde_json::Value> = n
+                .get("content")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| serde_json::from_str(s).ok());
+            serde_json::json!({
+                "id": n.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                "kind": kind,
+                "type": match kind {
+                    47011 => "overdue",
+                    47012 => "canonicalized",
+                    47013 => "sibling_archived",
+                    47014 => "promoted",
+                    _ => "unknown",
+                },
+                // The DRI the overdue notice tags, when present.
+                "dri": tag_value(n, "p"),
+                "commit": tag_value(n, "commit"),
+                "winner": tag_value(n, "winner"),
+                "to": tag_value(n, "to"),
+                "thread": tag_value(n, "thread"),
+                "body": body,
+                "created_at": n.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0),
+            })
+        })
+        .collect();
+
     // Forks of this thread (kind:47020 roots referencing it as parent).
     let fork_filter = serde_json::json!({
         "kinds": [47020],
@@ -373,6 +439,7 @@ pub async fn cmd_show_thread(
     view["recommendations"] = serde_json::Value::Array(recommendations);
     view["checkpoints"] = serde_json::Value::Array(checkpoints);
     view["forks"] = serde_json::Value::Array(forks);
+    view["notices"] = serde_json::Value::Array(notices);
     println!("{view}");
     Ok(())
 }
@@ -821,6 +888,44 @@ mod tests {
         )];
         fold_commands(&mut folded, &commands);
         assert_eq!(folded.status, "closed");
+    }
+
+    /// Regression from the Phase 2 exit-criterion dry run: a relay notice
+    /// and the command it supersedes can share a wire second, and the id
+    /// tie-break used to let the command win — leaving the fold showing
+    /// `ready` for a thread the projection had already archived.
+    #[test]
+    fn same_second_relay_notice_beats_the_command_it_supersedes() {
+        let root_id = "88".repeat(32);
+        let winner_id = "99".repeat(32);
+        let channel = "7f7f7f7f-1111-2222-3333-444444444444";
+        let root = event(47000, "losing variation", &[&["h", channel]], 100, &root_id);
+        let mut folded = FoldedThread::from_root(&root);
+
+        // Same created_at; the notice's id sorts BEFORE the command's, which
+        // is exactly the case that used to invert the outcome.
+        let mut commands = vec![
+            event(
+                47002,
+                "",
+                &[&["e", &root_id], &["h", channel], &["state", "ready"]],
+                200,
+                "ffff",
+            ),
+            event(
+                47013,
+                &format!(r#"{{"winner":"{winner_id}"}}"#),
+                &[&["e", &root_id], &["h", channel], &["winner", &winner_id]],
+                200,
+                "0000",
+            ),
+        ];
+        commands.sort_by_key(fold_key);
+        fold_commands(&mut folded, &commands);
+        assert_eq!(
+            folded.status, "archived",
+            "the relay's archive notice must win a same-second tie"
+        );
     }
 
     #[test]

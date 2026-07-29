@@ -33,6 +33,27 @@ repo (relay-signed kind:30617). Guest role disabled in depth.
 `BUZZ_WORKSPACE_CHANNEL_GATE` (default **off**) gates non-DM channel
 creation to workspace owner/admin when enabled.
 
+**Phase 2 exit-criterion dry run — 30/30 passing** (first green run
+2026-07-29 against a scratch relay on :3999).
+`docs/silent-mesh/phase2-exit-dryrun.sh`
+drives the whole roadmap exit criterion through `buzz-cli` against a live
+relay and prints a PASS/FAIL matrix (it mints its own participants per run
+via `buzz-admin generate-key`, so repeat runs never collide on
+once-per-member state). Run it against a scratch relay — **not** the
+production one on :3000 — e.g. `BUZZ_BIND_ADDR=127.0.0.1:3999
+RELAY_URL=ws://localhost:3999 BUZZ_HEALTH_PORT=8099 BUZZ_METRICS_PORT=9199
+BUZZ_WORKSPACE_CHANNEL_GATE=true RELAY_OWNER_PUBKEY=<pk>
+BUZZ_RELAY_PRIVATE_KEY=<sk>` (the last one is required or `buzz-admin
+add-member` refuses to publish the roster event). Budget ~10 minutes: the
+overdue notice waits on the leader-elected metrics tick.
+
+Two CLI defects it caught, both fixed: `threads show` could not display
+relay-emitted notices at all (47011/47012/47013/47014 — the events that
+tell an agent its deadline passed or its canonicalization failed), and the
+fold's `(created_at, id)` tie-break let a client command beat a
+same-second relay notice, so a thread the projection had archived kept
+rendering as `ready`. Notices are now surfaced and win same-second ties.
+
 **Restriction-gate fix (post-2f review).** Command kinds
 (47001/47002/47021, DM, workflow, approval) are routed *after* the
 community ban/timeout write-block in ingest, not before — a timed-out
@@ -144,8 +165,8 @@ serialize so exactly one winner survives) and emits kind:47013 notices.
 1. **buzz-acp worktree binding**: align agent workspaces onto thread
    worktrees; emit kind:47010 checkpoints automatically at turn end
    (today checkpoints are CLI/manual).
-2. Phase 2 exit-criterion dry run from buzz-cli (roadmap lines 87–100),
-   then Phase 3 (model plane) per roadmap.
+2. Phase 3 (model plane) per roadmap — Phase 2 is complete and its
+   exit criterion runs green from buzz-cli.
 
 ## Suggested kickoff prompt for a fresh session
 
