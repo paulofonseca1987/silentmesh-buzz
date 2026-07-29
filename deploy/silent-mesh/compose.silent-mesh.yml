@@ -1,0 +1,25 @@
+# Silent Mesh single-host override — compose with the upstream prod profile:
+#
+#   docker compose -f ../compose/compose.yml -f compose.silent-mesh.yml up -d --build
+#
+# Changes vs upstream prod (deploy/compose/compose.yml):
+#   * relay is built from THIS fork's source, not pulled from ghcr.io
+#   * relay binds only to the VPN interface (D11) — set SM_VPN_BIND_ADDR to
+#     your Tailscale/WireGuard IP (e.g. 100.64.0.7). Never 0.0.0.0.
+#   * no Caddy / public TLS layer — compose.caddy.yml is intentionally unused
+#   * Postgres/Redis/MinIO stay internal to the compose network (upstream
+#     already does not publish them)
+#
+# GPU note: the local inference server (Phase 3, sm-gateway backend) will be
+# added here as an additional service with `device_requests` for the two
+# RTX 4060s. Nothing GPU-related is needed for Phase 0.
+
+services:
+  relay:
+    image: !reset null
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: runtime
+    ports: !override
+      - "${SM_VPN_BIND_ADDR:?set SM_VPN_BIND_ADDR to your VPN interface IP}:3000:3000"
