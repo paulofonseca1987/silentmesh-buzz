@@ -34,6 +34,7 @@ courtesy split in case upstream lands something.
 | 47003 | `KIND_WORK_THREAD_RECOMMEND` | regular (append-only) | Agent recommendation (open / metadata / done) — **inert until a human confirms** by sending the real 47001/47002 referencing it via an `e` tag. Never touches the projection. |
 | 47010 | `KIND_WORK_THREAD_CHECKPOINT` | regular (append-only) | Per-turn checkpoint ref: tags `e` (root), `h`, `commit` (40/64-hex git id), optional `branch` + `turn`. Any channel participant (bots included); the thread must exist in the channel. |
 | 47011 | `KIND_WORK_THREAD_OVERDUE` | **relay-only** | Overdue notice from the leader-elected deadline sweep — tags the DRI (`p`; fallback: opener), `e` (root), `h`. At-most-once per deadline (`overdue_notified_at` claim); a 47001 deadline edit re-arms it. Client submissions rejected. |
+| 47012 | `KIND_WORK_THREAD_CANON` | **relay-only** | Canonicalization outcome from the close-with-canonicalize job — tags `e` (root), `h`, optional `commit` (new main tip); content JSON `{outcome, prefix}`. The job grafts the thread's latest 47010 checkpoint under `canon/<thread-short>/` on the default branch via hydrate → plumbing → pointer-CAS publish (bounded rehydrate-retry on conflict; `canonicalized_at` claim is once-only, re-armed by re-close; leader sweep recovers crashed jobs). Never fails the close. |
 | 47020 | `KIND_WORK_THREAD_FORK` | command | Thread fork at head/checkpoint — later slice. |
 | 47021 | `KIND_WORK_THREAD_PROMOTE` | command | Personal-channel promotion through the gate — later slice. |
 
