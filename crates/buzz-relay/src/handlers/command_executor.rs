@@ -1047,12 +1047,29 @@ async fn handle_approval_grant(
     let token_hash = hex::decode(&token_hash_hex)
         .map_err(|_| IngestError::Rejected("invalid: bad approval token hash hex".into()))?;
 
-    // 2. Look up the approval record
-    let approval = state
+    // 2. Look up the approval record — workflow domain first; if the hash
+    //    resolves nothing there, fall through to agent permission requests
+    //    (both domains share the kind:46030/46031 command path and the
+    //    hashed-token `d` tag).
+    let approval = match state
         .db
         .get_approval_by_stored_hash(tenant.community(), &token_hash)
         .await
-        .map_err(|_| IngestError::Rejected("invalid: approval not found".into()))?;
+    {
+        Ok(approval) => approval,
+        Err(_) => {
+            return handle_agent_permission_decision(
+                tenant,
+                state,
+                event,
+                auth,
+                &token_hash,
+                &token_hash_hex,
+                true,
+            )
+            .await;
+        }
+    };
 
     // 3. Validate approval is pending and not expired
     if approval.status != ApprovalStatus::Pending {
@@ -1173,12 +1190,29 @@ async fn handle_approval_deny(
     let token_hash = hex::decode(&token_hash_hex)
         .map_err(|_| IngestError::Rejected("invalid: bad approval token hash hex".into()))?;
 
-    // 2. Look up the approval record
-    let approval = state
+    // 2. Look up the approval record — workflow domain first; if the hash
+    //    resolves nothing there, fall through to agent permission requests
+    //    (both domains share the kind:46030/46031 command path and the
+    //    hashed-token `d` tag).
+    let approval = match state
         .db
         .get_approval_by_stored_hash(tenant.community(), &token_hash)
         .await
-        .map_err(|_| IngestError::Rejected("invalid: approval not found".into()))?;
+    {
+        Ok(approval) => approval,
+        Err(_) => {
+            return handle_agent_permission_decision(
+                tenant,
+                state,
+                event,
+                auth,
+                &token_hash,
+                &token_hash_hex,
+                false,
+            )
+            .await;
+        }
+    };
 
     // 3. Validate approval is pending and not expired
     if approval.status != ApprovalStatus::Pending {
@@ -1304,6 +1338,339 @@ async fn handle_approval_deny(
             })
         ),
     })
+}
+
+/// Grant or deny an **agent permission request** — the agent domain of the
+/// shared kind:46030/46031 command path (the workflow domain is handled by
+/// the callers before falling through here).
+///
+/// Authorization (v1, ahead of the full role hierarchy): the decider must be
+/// a full member (owner/admin/member — not bot, not guest) of the channel
+/// the request lives in, and an agent can never decide its own request.
+/// Role specs and workspace-admin bypasses arrive with the role-hierarchy
+/// work; everything unrecognized fails closed.
+async fn handle_agent_permission_decision(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    auth: &IngestAuth,
+    token_hash: &[u8],
+    token_hash_hex: &str,
+    grant: bool,
+) -> Result<IngestResult, IngestError> {
+    use buzz_db::agent_permission::{AgentPermissionDecision, AgentPermissionStatus};
+
+    let self_bytes = auth.pubkey().to_bytes().to_vec();
+    let self_hex = hex::encode(&self_bytes);
+
+    let request = state
+        .db
+        .get_agent_permission_by_stored_hash(tenant.community(), token_hash)
+        .await
+        .map_err(|_| IngestError::Rejected("invalid: approval not found".into()))?;
+
+    if request.status != AgentPermissionStatus::Pending {
+        return Err(IngestError::Rejected(format!(
+            "invalid: approval already {}",
+            request.status
+        )));
+    }
+    if Utc::now() > request.expires_at {
+        return Err(IngestError::Rejected(
+            "invalid: approval token has expired".into(),
+        ));
+    }
+
+    // Authz: never the requesting agent itself, and only full channel members.
+    if self_bytes == request.agent_pubkey {
+        return Err(IngestError::Rejected(
+            "forbidden: an agent cannot decide its own permission request".into(),
+        ));
+    }
+    let role = state
+        .db
+        .get_member_role(tenant.community(), request.channel_id, &self_bytes)
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: member role lookup: {e}")))?;
+    match role.as_deref() {
+        Some("owner") | Some("admin") | Some("member") => {}
+        _ => {
+            return Err(IngestError::Rejected(
+                "forbidden: only a full member of the request's channel may decide".into(),
+            ));
+        }
+    }
+
+    // Persist the command event — returns open transaction
+    let tx = match persist_command_event(state, tenant, event, None).await? {
+        PersistResult::Duplicate => {
+            return Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: "duplicate: already processed".into(),
+            });
+        }
+        PersistResult::Inserted(tx) => tx,
+    };
+
+    let note = if event.content.is_empty() {
+        None
+    } else {
+        Some(event.content.as_str())
+    };
+    let (status, decision) = if grant {
+        (
+            AgentPermissionStatus::Granted,
+            AgentPermissionDecision::AllowOnce,
+        )
+    } else {
+        (
+            AgentPermissionStatus::Denied,
+            AgentPermissionDecision::RejectOnce,
+        )
+    };
+
+    let updated = state
+        .db
+        .resolve_agent_permission_by_stored_hash(
+            tenant.community(),
+            token_hash,
+            status,
+            Some(decision),
+            Some(&self_bytes),
+            note,
+        )
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: db resolve permission: {e}")))?;
+    if !updated {
+        return Err(IngestError::Rejected(
+            "invalid: approval already acted on (race)".into(),
+        ));
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: commit transaction: {e}")))?;
+
+    // Post-commit: outcome record into the channel + decision frame to the
+    // requesting agent's harness. Both best-effort — the row is authoritative.
+    let outcome_kind = if grant {
+        KIND_WORKFLOW_APPROVAL_GRANTED
+    } else {
+        KIND_WORKFLOW_APPROVAL_DENIED
+    };
+    spawn_agent_permission_outcome(
+        state,
+        tenant,
+        AgentPermissionOutcome {
+            outcome_kind,
+            request_id: request.request_id,
+            channel_id: request.channel_id,
+            agent_pubkey: request.agent_pubkey.clone(),
+            decision,
+            token_hash_hex: token_hash_hex.to_owned(),
+            command_event_id_hex: event.id.to_hex(),
+            decider_hex: self_hex,
+        },
+    );
+
+    Ok(IngestResult {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message: format!(
+            "response:{}",
+            serde_json::json!({
+                "status": if grant { "granted" } else { "denied" },
+                "request_id": request.request_id.to_string(),
+            })
+        ),
+    })
+}
+
+/// Data for one agent-permission outcome (channel record + harness frame).
+struct AgentPermissionOutcome {
+    /// `KIND_WORKFLOW_APPROVAL_GRANTED` (46011) or `..._DENIED` (46012).
+    outcome_kind: u32,
+    request_id: Uuid,
+    channel_id: Uuid,
+    /// Pubkey of the requesting agent (frame recipient).
+    agent_pubkey: Vec<u8>,
+    decision: buzz_db::agent_permission::AgentPermissionDecision,
+    /// Hex of the stored token hash — the kind:46010 request's `d` tag.
+    token_hash_hex: String,
+    /// Event ID hex of the human-signed kind:46030/46031 command.
+    command_event_id_hex: String,
+    /// Pubkey hex of the human who decided.
+    decider_hex: String,
+}
+
+fn spawn_agent_permission_outcome(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    outcome: AgentPermissionOutcome,
+) {
+    let state = Arc::clone(state);
+    let tenant = tenant.clone();
+    tokio::spawn(async move {
+        emit_agent_permission_outcome_event(&state, &tenant, &outcome).await;
+        send_permission_decision_frame(&state, &tenant, &outcome).await;
+    });
+}
+
+/// Emit the relay-signed kind:46011/46012 outcome record for an agent
+/// permission request into its channel. Correlates to the kind:46010 request
+/// via the shared `d` token-hash tag and to the human-signed command via an
+/// `e` tag. Returns the event id hex, or `None` when nothing was emitted.
+async fn emit_agent_permission_outcome_event(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    outcome: &AgentPermissionOutcome,
+) -> Option<String> {
+    let status = if outcome.outcome_kind == KIND_WORKFLOW_APPROVAL_GRANTED {
+        "granted"
+    } else {
+        "denied"
+    };
+    let content = serde_json::json!({
+        "domain": "agent",
+        "request_id": outcome.request_id,
+        "status": status,
+        "decision": outcome.decision.to_string(),
+        "approver": outcome.decider_hex,
+    });
+
+    let channel_str = outcome.channel_id.to_string();
+    let agent_hex = hex::encode(&outcome.agent_pubkey);
+    let tags: Result<Vec<Tag>, _> = [
+        ["d", outcome.token_hash_hex.as_str()],
+        ["e", outcome.command_event_id_hex.as_str()],
+        ["h", channel_str.as_str()],
+        ["p", agent_hex.as_str()],
+    ]
+    .into_iter()
+    .map(Tag::parse)
+    .collect();
+    let tags = match tags {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("agent permission outcome: tag build failed: {e}");
+            return None;
+        }
+    };
+
+    let event = match EventBuilder::new(
+        Kind::Custom(outcome.outcome_kind as u16),
+        content.to_string(),
+    )
+    .tags(tags)
+    .sign_with_keys(&state.relay_keypair)
+    {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("agent permission outcome: signing failed: {e}");
+            return None;
+        }
+    };
+    let event_id_hex = event.id.to_hex();
+
+    match state
+        .db
+        .insert_event(tenant.community(), &event, Some(outcome.channel_id))
+        .await
+    {
+        Ok((stored, true)) => {
+            let _ = dispatch_persistent_event(
+                tenant,
+                state,
+                &stored,
+                outcome.outcome_kind,
+                &state.relay_keypair.public_key().to_hex(),
+                None,
+            )
+            .await;
+            Some(event_id_hex)
+        }
+        Ok((_, false)) => Some(event_id_hex),
+        Err(e) => {
+            warn!("agent permission outcome: persist failed: {e}");
+            None
+        }
+    }
+}
+
+/// Push the decision to the requesting agent's harness as a relay-signed,
+/// NIP-44-encrypted kind:24200 control frame (payload type
+/// `permission_decision`), fanned out like agent observer frames (ephemeral,
+/// `p`-tag routed).
+///
+/// The frame is a wake-up, not the authority: the harness confirms the
+/// decision through the authenticated `GET /api/approvals` read before
+/// releasing it to the agent, so a spoofed or lost frame can neither forge
+/// nor block a decision (the harness also polls until expiry).
+async fn send_permission_decision_frame(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    outcome: &AgentPermissionOutcome,
+) {
+    let agent_pk = match nostr::PublicKey::from_slice(&outcome.agent_pubkey) {
+        Ok(pk) => pk,
+        Err(e) => {
+            warn!("permission decision frame: bad agent pubkey: {e}");
+            return;
+        }
+    };
+
+    let payload = serde_json::json!({
+        "type": "permission_decision",
+        "channelId": outcome.channel_id.to_string(),
+        "requestId": outcome.request_id.to_string(),
+        "decision": outcome.decision.to_string(),
+    })
+    .to_string();
+
+    let ciphertext = match nostr::nips::nip44::encrypt(
+        state.relay_keypair.secret_key(),
+        &agent_pk,
+        &payload,
+        nostr::nips::nip44::Version::V2,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("permission decision frame: encrypt failed: {e}");
+            return;
+        }
+    };
+
+    let tag = match Tag::parse(["p", &agent_pk.to_hex()]) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("permission decision frame: tag build failed: {e}");
+            return;
+        }
+    };
+    let event = match EventBuilder::new(Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16), ciphertext)
+        .tags([tag])
+        .sign_with_keys(&state.relay_keypair)
+    {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("permission decision frame: signing failed: {e}");
+            return;
+        }
+    };
+
+    // Ephemeral fan-out, mirroring `handle_agent_observer_event`: never
+    // stored, published globally, delivered to `#p`-scoped subscriptions.
+    state.mark_local_event(tenant.community(), &event.id);
+    if let Err(e) = state
+        .pubsub
+        .publish_event(tenant, buzz_pubsub::EventTopic::Global, &event)
+        .await
+    {
+        warn!("permission decision frame: publish failed: {e}");
+    }
+    let stored = buzz_core::StoredEvent::new(event, None);
+    super::event::fan_out_event_to_local_subscribers(state, tenant.community(), &stored).await;
 }
 
 /// Post-commit, best-effort emission of the approval outcome record —
@@ -1712,5 +2079,364 @@ mod approval_outcome_tests {
             content["run_id"].as_str(),
             Some(run_id.to_string().as_str())
         );
+    }
+
+    /// Full agent-domain approval flow across the HTTP surface and the
+    /// kind:46030/46031 command path: create (agent, X-Pubkey dev auth) →
+    /// kind:46010 summary event → membership-scoped list → authz rejections
+    /// (self-approval, non-member) → grant (allow_once, TOCTOU) → withdraw
+    /// (cancelled, agent-only) → deny (reject_once).
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn agent_permission_full_flow() {
+        use axum::extract::{Query, RawQuery, State};
+        use buzz_core::channel::{ChannelType, ChannelVisibility, MemberRole};
+        use buzz_db::agent_permission::{AgentPermissionDecision, AgentPermissionStatus};
+
+        let state = test_state().await;
+
+        let owner = nostr::Keys::generate();
+        let owner_hex = owner.public_key().to_hex();
+        let agent = nostr::Keys::generate();
+        let agent_hex = agent.public_key().to_hex();
+        let approver = nostr::Keys::generate();
+        let outsider = nostr::Keys::generate();
+
+        let host = format!("wf-agent-perm-{}.example", Uuid::new_v4().simple());
+        let community = match state
+            .db
+            .create_community_with_owner(&host, &owner_hex)
+            .await
+            .expect("create community")
+        {
+            CreateCommunityWithOwnerResult::Created(rec) => rec.id,
+            other => panic!("expected fresh community, got {other:?}"),
+        };
+        // Private channel so accessibility is membership-only (the list-scoping
+        // half of the test needs a channel outsiders cannot see).
+        let channel = state
+            .db
+            .create_channel(
+                community,
+                "agent-perm",
+                ChannelType::Stream,
+                ChannelVisibility::Private,
+                None,
+                &owner.public_key().to_bytes(),
+                None,
+            )
+            .await
+            .expect("create channel");
+        for (keys, role) in [(&agent, MemberRole::Bot), (&approver, MemberRole::Member)] {
+            let bytes = keys.public_key().to_bytes().to_vec();
+            state
+                .db
+                .ensure_user(community, &bytes)
+                .await
+                .expect("ensure user");
+            state
+                .db
+                .add_member(
+                    community,
+                    channel.id,
+                    &bytes,
+                    role,
+                    Some(&owner.public_key().to_bytes()),
+                )
+                .await
+                .expect("add member");
+        }
+        state
+            .db
+            .ensure_user(community, outsider.public_key().to_bytes().as_ref())
+            .await
+            .expect("ensure outsider");
+
+        let headers_for = |pubkey_hex: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(axum::http::header::HOST, host.parse().expect("host header"));
+            headers.insert("x-pubkey", pubkey_hex.parse().expect("pubkey header"));
+            headers
+        };
+
+        // 1. Create via the HTTP handler, signed (dev-auth) as the agent.
+        let create_body = serde_json::json!({
+            "channel_id": channel.id,
+            "session_ref": "sess-1/turn-2",
+            "request_kind": "command",
+            "tool_name": "shell",
+            "detail": "Run `cargo test`",
+            "payload": { "command": "cargo test" },
+            "options": [
+                { "optionId": "yes", "kind": "allow_once" },
+                { "optionId": "no", "kind": "reject_once" },
+            ],
+            "ttl_secs": 600,
+        })
+        .to_string();
+        let created = crate::api::approvals::create_approval(
+            State(Arc::clone(&state)),
+            headers_for(&agent_hex),
+            axum::body::Bytes::from(create_body.clone()),
+        )
+        .await
+        .expect("create approval")
+        .0;
+        let request_id: Uuid =
+            serde_json::from_value(created["request_id"].clone()).expect("request_id");
+        let token_hash_hex = created["token_hash"]
+            .as_str()
+            .expect("token_hash")
+            .to_owned();
+        let token_hash = hex::decode(&token_hash_hex).expect("token hash hex");
+
+        // A non-member agent cannot create.
+        let denied = crate::api::approvals::create_approval(
+            State(Arc::clone(&state)),
+            headers_for(&outsider.public_key().to_hex()),
+            axum::body::Bytes::from(create_body),
+        )
+        .await
+        .expect_err("non-member create must fail");
+        assert_eq!(denied.0, axum::http::StatusCode::FORBIDDEN);
+
+        // 2. The kind:46010 summary event landed in the channel: d = token
+        //    hash, p = agent, content carries the summary but never the payload.
+        let event_id_hex = created["event_id"].as_str().expect("46010 event id");
+        let id_bytes = nostr::EventId::from_hex(event_id_hex)
+            .expect("event id")
+            .as_bytes()
+            .to_vec();
+        let stored = state
+            .db
+            .get_event_by_id(community, &id_bytes)
+            .await
+            .expect("query 46010")
+            .expect("46010 persisted");
+        assert_eq!(
+            u32::from(stored.event.kind.as_u16()),
+            KIND_WORKFLOW_APPROVAL_REQUESTED
+        );
+        let tag_value = |name: &str| -> Option<String> {
+            stored.event.tags.iter().find_map(|t| {
+                let s = t.as_slice();
+                if s.first().map(|v| v.as_str()) == Some(name) {
+                    s.get(1).map(|v| v.to_string())
+                } else {
+                    None
+                }
+            })
+        };
+        assert_eq!(tag_value("d").as_deref(), Some(token_hash_hex.as_str()));
+        assert_eq!(tag_value("h"), Some(channel.id.to_string()));
+        assert_eq!(tag_value("p").as_deref(), Some(agent_hex.as_str()));
+        let content: serde_json::Value =
+            serde_json::from_str(&stored.event.content).expect("content json");
+        assert_eq!(content["domain"].as_str(), Some("agent"));
+        assert_eq!(content["detail"].as_str(), Some("Run `cargo test`"));
+        assert!(
+            content.get("payload").is_none() && !stored.event.content.contains("cargo test\" "),
+            "the 46010 must carry the summary only, never the tool payload"
+        );
+
+        // 3. Listing is membership-scoped: a member sees the request, an
+        //    outsider sees nothing.
+        let list_for = |pubkey_hex: String| {
+            let state = Arc::clone(&state);
+            let headers = headers_for(&pubkey_hex);
+            async move {
+                crate::api::approvals::list_approvals(
+                    State(state),
+                    headers,
+                    RawQuery(None),
+                    Query(crate::api::approvals::ListApprovalsQuery::default()),
+                )
+                .await
+                .expect("list approvals")
+                .0
+            }
+        };
+        let member_view = list_for(approver.public_key().to_hex()).await;
+        assert!(
+            member_view
+                .as_array()
+                .expect("array")
+                .iter()
+                .any(|r| r["request_id"] == serde_json::json!(request_id)),
+            "channel member must see the pending request"
+        );
+        let outsider_view = list_for(outsider.public_key().to_hex()).await;
+        assert!(
+            outsider_view
+                .as_array()
+                .expect("array")
+                .iter()
+                .all(|r| r["request_id"] != serde_json::json!(request_id)),
+            "non-member must not see the request"
+        );
+
+        // 4. Decisions ride the kind:46030/46031 command path.
+        let tenant = TenantContext::resolved(community, host.clone());
+        let grant_event = |keys: &nostr::Keys, approved: bool| {
+            buzz_sdk::build_workflow_approval(&token_hash_hex, approved, "")
+                .expect("builder")
+                .sign_with_keys(keys)
+                .expect("sign")
+        };
+        let http_auth = |keys: &nostr::Keys| IngestAuth::Http {
+            pubkey: keys.public_key(),
+            scopes: buzz_auth::Scope::all_known(),
+            auth_method: super::super::ingest::HttpAuthMethod::DevPubkey,
+        };
+
+        // The requesting agent cannot decide its own request.
+        let self_grant = handle_approval_grant(
+            &tenant,
+            &state,
+            &grant_event(&agent, true),
+            &http_auth(&agent),
+        )
+        .await;
+        assert!(
+            matches!(&self_grant, Err(IngestError::Rejected(msg)) if msg.contains("own permission request")),
+            "agent self-approval must be rejected"
+        );
+
+        // A non-member cannot decide.
+        let outsider_grant = handle_approval_grant(
+            &tenant,
+            &state,
+            &grant_event(&outsider, true),
+            &http_auth(&outsider),
+        )
+        .await;
+        assert!(
+            matches!(&outsider_grant, Err(IngestError::Rejected(msg)) if msg.contains("full member")),
+            "non-member decision must be rejected"
+        );
+
+        // A full member grants; the decision lands as allow_once.
+        let granted = handle_approval_grant(
+            &tenant,
+            &state,
+            &grant_event(&approver, true),
+            &http_auth(&approver),
+        )
+        .await
+        .expect("member grant");
+        assert!(granted.message.contains("granted"));
+        assert!(granted.message.contains(&request_id.to_string()));
+        let row = state
+            .db
+            .get_agent_permission_by_stored_hash(community, &token_hash)
+            .await
+            .expect("fetch row");
+        assert_eq!(row.status, AgentPermissionStatus::Granted);
+        assert_eq!(row.decision, Some(AgentPermissionDecision::AllowOnce));
+        assert_eq!(
+            row.decider_pubkey.as_deref(),
+            Some(approver.public_key().to_bytes().as_ref())
+        );
+
+        // A second decision conflicts.
+        let regrant = handle_approval_grant(
+            &tenant,
+            &state,
+            &grant_event(&approver, true),
+            &http_auth(&approver),
+        )
+        .await;
+        assert!(
+            matches!(&regrant, Err(IngestError::Rejected(msg)) if msg.contains("already granted")),
+            "second decision must conflict"
+        );
+
+        // 5. Withdraw: only the requesting agent may cancel its own pending
+        //    request; a decided request conflicts.
+        let second_body = serde_json::json!({
+            "channel_id": channel.id,
+            "request_kind": "file-change",
+            "detail": "Edit src/main.rs",
+            "options": [{ "optionId": "yes", "kind": "allow_once" }],
+        })
+        .to_string();
+        let second = crate::api::approvals::create_approval(
+            State(Arc::clone(&state)),
+            headers_for(&agent_hex),
+            axum::body::Bytes::from(second_body),
+        )
+        .await
+        .expect("second create")
+        .0;
+        let second_id: Uuid =
+            serde_json::from_value(second["request_id"].clone()).expect("second id");
+        let resolve_body = serde_json::json!({
+            "request_id": second_id,
+            "outcome": "cancelled",
+        })
+        .to_string();
+        let foreign_resolve = crate::api::approvals::resolve_approval(
+            State(Arc::clone(&state)),
+            headers_for(&approver.public_key().to_hex()),
+            axum::body::Bytes::from(resolve_body.clone()),
+        )
+        .await
+        .expect_err("non-creator withdraw must fail");
+        assert_eq!(foreign_resolve.0, axum::http::StatusCode::FORBIDDEN);
+        let withdrawn = crate::api::approvals::resolve_approval(
+            State(Arc::clone(&state)),
+            headers_for(&agent_hex),
+            axum::body::Bytes::from(resolve_body.clone()),
+        )
+        .await
+        .expect("agent withdraw")
+        .0;
+        assert_eq!(withdrawn["status"].as_str(), Some("cancelled"));
+        let again = crate::api::approvals::resolve_approval(
+            State(Arc::clone(&state)),
+            headers_for(&agent_hex),
+            axum::body::Bytes::from(resolve_body),
+        )
+        .await
+        .expect_err("second withdraw must conflict");
+        assert_eq!(again.0, axum::http::StatusCode::CONFLICT);
+
+        // 6. Deny path: reject_once recorded.
+        let third_body = serde_json::json!({
+            "channel_id": channel.id,
+            "request_kind": "command",
+            "detail": "Run `rm -rf /`",
+            "options": [
+                { "optionId": "yes", "kind": "allow_once" },
+                { "optionId": "no", "kind": "reject_once" },
+            ],
+        })
+        .to_string();
+        let third = crate::api::approvals::create_approval(
+            State(Arc::clone(&state)),
+            headers_for(&agent_hex),
+            axum::body::Bytes::from(third_body),
+        )
+        .await
+        .expect("third create")
+        .0;
+        let third_hash_hex = third["token_hash"].as_str().expect("hash").to_owned();
+        let third_hash = hex::decode(&third_hash_hex).expect("hex");
+        let deny_event = buzz_sdk::build_workflow_approval(&third_hash_hex, false, "too risky")
+            .expect("builder")
+            .sign_with_keys(&approver)
+            .expect("sign");
+        let denied = handle_approval_deny(&tenant, &state, &deny_event, &http_auth(&approver))
+            .await
+            .expect("deny");
+        assert!(denied.message.contains("denied"));
+        let row = state
+            .db
+            .get_agent_permission_by_stored_hash(community, &third_hash)
+            .await
+            .expect("fetch denied row");
+        assert_eq!(row.status, AgentPermissionStatus::Denied);
+        assert_eq!(row.decision, Some(AgentPermissionDecision::RejectOnce));
+        assert_eq!(row.note.as_deref(), Some("too risky"));
     }
 }
