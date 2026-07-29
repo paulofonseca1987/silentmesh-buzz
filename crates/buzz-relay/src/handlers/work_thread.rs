@@ -29,8 +29,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 use buzz_core::kind::{
-    KIND_WORK_THREAD_CHECKPOINT, KIND_WORK_THREAD_METADATA, KIND_WORK_THREAD_SIBLING_ARCHIVED,
-    KIND_WORK_THREAD_STATE,
+    KIND_WORK_THREAD_CHECKPOINT, KIND_WORK_THREAD_METADATA, KIND_WORK_THREAD_PROMOTED,
+    KIND_WORK_THREAD_SIBLING_ARCHIVED, KIND_WORK_THREAD_STATE,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_db::work_thread::WorkThreadStatus;
@@ -557,6 +557,469 @@ pub(crate) async fn handle_thread_state(
         accepted: true,
         message: format!("response:{response}"),
     })
+}
+
+/// Handle kind:47021 — promote a thread out of a personal channel
+/// (D29/D30).
+///
+/// The event is stored in the **target** channel and is the new thread's
+/// root (its id = the new thread id). Tags: `h` = target channel, exactly
+/// one unmarked lowercase `e` = source thread root, `from` = source
+/// (personal) channel UUID, optional lowercase `commit` = the checkpoint
+/// to promote (absent = latest). Content = the member-written summary.
+///
+/// Authority: the author must own the source personal channel and be a
+/// full member of the target channel. The Privacy Gate scaffold (the
+/// summary scan and the per-file secret scan) and the git graft run
+/// **before** the event is persisted — a gated or failed promotion stores
+/// nothing and transfers nothing. Files and summary move; the
+/// conversation stays behind (the relay-signed kind:47014 notice in the
+/// source channel records the close for event-folding clients).
+pub(crate) async fn handle_thread_promote(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    event: &Event,
+    auth: &IngestAuth,
+) -> Result<IngestResult, IngestError> {
+    let author = auth.pubkey().to_bytes().to_vec();
+
+    if let Some(dup) = replayed_command(tenant, state, event).await? {
+        return Ok(dup);
+    }
+
+    // Shape validation (commands validate in-handler).
+    if event.content.trim().is_empty() {
+        return Err(IngestError::Rejected(
+            "invalid: promotion requires a member-written summary (content)".into(),
+        ));
+    }
+    if event.content.len() > 16 * 1024 {
+        return Err(IngestError::Rejected(
+            "invalid: summary exceeds 16 KiB".into(),
+        ));
+    }
+    // The summary half of the Privacy Gate (D30) — the cheapest check,
+    // before any lookups or git work. `promote_thread_files` re-scans as
+    // defense-in-depth.
+    let summary_hits: Vec<String> = buzz_core::secret_scan::scan_text(&event.content)
+        .into_iter()
+        .map(|h| format!("{} in summary", h.rule))
+        .collect();
+    if !summary_hits.is_empty() {
+        return Err(IngestError::Rejected(format!(
+            "forbidden: privacy gate found credential-shaped content: {}",
+            summary_hits.join("; ")
+        )));
+    }
+    let lower_hex = |v: &str, len: usize| {
+        v.len() == len
+            && v.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    };
+    let mut source_root: Option<Vec<u8>> = None;
+    let mut e_tags = 0usize;
+    let mut from_channel: Option<Uuid> = None;
+    let mut req_commit: Option<String> = None;
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        if parts.len() < 2 {
+            continue;
+        }
+        match parts[0].as_str() {
+            "e" => {
+                e_tags += 1;
+                if parts.len() != 2 || !lower_hex(parts[1].as_str(), 64) {
+                    return Err(IngestError::Rejected(
+                        "invalid: source thread reference must be an unmarked lowercase 64-hex e tag"
+                            .into(),
+                    ));
+                }
+                source_root = hex::decode(parts[1].as_str()).ok();
+            }
+            "from" => {
+                if from_channel.is_some() {
+                    return Err(IngestError::Rejected("invalid: duplicate from tag".into()));
+                }
+                from_channel = parts[1].parse::<Uuid>().ok();
+                if from_channel.is_none() {
+                    return Err(IngestError::Rejected(
+                        "invalid: from must be the source channel UUID".into(),
+                    ));
+                }
+            }
+            "commit" => {
+                if req_commit.is_some() {
+                    return Err(IngestError::Rejected(
+                        "invalid: duplicate commit tag".into(),
+                    ));
+                }
+                let v = parts[1].as_str();
+                if !lower_hex(v, 40) && !lower_hex(v, 64) {
+                    return Err(IngestError::Rejected(
+                        "invalid: commit must be a full lowercase 40- or 64-hex git object id"
+                            .into(),
+                    ));
+                }
+                req_commit = Some(v.to_owned());
+            }
+            // Strict tag allowlist: the 47021 event fans out into the
+            // TARGET channel, so any extra tag would be an unscanned
+            // content channel across the privacy boundary.
+            "h" => {}
+            other => {
+                return Err(IngestError::Rejected(format!(
+                    "invalid: unexpected tag '{other}' on a promotion \
+                     (allowed: e, h, from, commit)"
+                )));
+            }
+        }
+    }
+    if e_tags != 1 {
+        return Err(IngestError::Rejected(
+            "invalid: promotion must reference exactly one source thread root (e tag)".into(),
+        ));
+    }
+    let source_root = source_root
+        .filter(|b| b.len() == 32)
+        .ok_or_else(|| IngestError::Rejected("invalid: bad source thread id".into()))?;
+    let from_channel = from_channel.ok_or_else(|| {
+        IngestError::Rejected("invalid: missing from (source channel) tag".into())
+    })?;
+    let target_channel = event
+        .tags
+        .iter()
+        .find_map(|t| {
+            let s = t.as_slice();
+            (s.first().map(|v| v.as_str()) == Some("h"))
+                .then(|| s.get(1).and_then(|v| v.parse::<Uuid>().ok()))
+                .flatten()
+        })
+        .ok_or_else(|| IngestError::Rejected("invalid: missing target channel (h tag)".into()))?;
+    if target_channel == from_channel {
+        return Err(IngestError::Rejected(
+            "invalid: promotion target must differ from the source channel".into(),
+        ));
+    }
+
+    // Source must be the author's own personal channel (D29).
+    let personal_owner = state
+        .db
+        .get_personal_channel_owner(tenant.community(), from_channel)
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: personal lookup: {e}")))?;
+    match personal_owner {
+        Some(owner) if owner == author => {}
+        Some(_) => {
+            return Err(IngestError::Rejected(
+                "forbidden: only the personal-channel owner may promote its threads".into(),
+            ));
+        }
+        None => {
+            return Err(IngestError::Rejected(
+                "invalid: promotion source must be a personal channel".into(),
+            ));
+        }
+    }
+
+    // Source thread: exists, lives in the source channel, still live.
+    let source_thread = state
+        .db
+        .get_work_thread(tenant.community(), &source_root)
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: thread lookup: {e}")))?
+        .ok_or_else(|| IngestError::Rejected("invalid: unknown source work thread".into()))?;
+    if source_thread.channel_id != from_channel {
+        return Err(IngestError::Rejected(
+            "invalid: thread does not belong to the source channel".into(),
+        ));
+    }
+    // Closed (but not archived) sources stay promotable: a crash between
+    // the pool-side close and the event commit must converge on retry
+    // (the graft is idempotent), and re-promoting finished work into
+    // another team channel is a legitimate, gated, audited action.
+    if source_thread.status == WorkThreadStatus::Archived {
+        return Err(IngestError::Rejected(
+            "invalid: an archived thread cannot be promoted (status: archived)".into(),
+        ));
+    }
+
+    // Target: an ordinary, live team channel the author can post threads to.
+    let target = match state
+        .db
+        .get_channel(tenant.community(), target_channel)
+        .await
+    {
+        Ok(t) => t,
+        Err(buzz_db::DbError::Sqlx(sqlx::Error::RowNotFound)) => {
+            return Err(IngestError::Rejected(
+                "invalid: unknown target channel".into(),
+            ));
+        }
+        Err(e) => {
+            return Err(IngestError::Internal(format!(
+                "error: target channel lookup: {e}"
+            )));
+        }
+    };
+    if target.channel_type == "dm" {
+        return Err(IngestError::Rejected(
+            "invalid: cannot promote into a DM channel".into(),
+        ));
+    }
+    if target.archived_at.is_some() {
+        return Err(IngestError::Rejected(
+            "invalid: cannot promote into an archived channel".into(),
+        ));
+    }
+    let target_personal = state
+        .db
+        .get_personal_channel_owner(tenant.community(), target_channel)
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: personal lookup: {e}")))?;
+    if target_personal.is_some() {
+        return Err(IngestError::Rejected(
+            "invalid: promotion target must be a team channel".into(),
+        ));
+    }
+    let role = state
+        .db
+        .get_member_role(tenant.community(), target_channel, &author)
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: member role lookup: {e}")))?;
+    if !matches!(
+        role.as_deref(),
+        Some("owner") | Some("admin") | Some("member")
+    ) {
+        return Err(IngestError::Rejected(
+            "forbidden: promotion requires full membership in the target channel".into(),
+        ));
+    }
+
+    // A named checkpoint must be one the source thread actually recorded.
+    if let Some(commit) = &req_commit {
+        let recorded =
+            fork_point_is_recorded_checkpoint(state, tenant, from_channel, &source_root, commit)
+                .await?;
+        if !recorded {
+            return Err(IngestError::Rejected(
+                "invalid: commit is not a recorded checkpoint of the source thread".into(),
+            ));
+        }
+    }
+    let ckpt_commit = crate::api::git::promote::resolve_promote_checkpoint(
+        state,
+        tenant,
+        &source_thread,
+        req_commit.as_deref(),
+    )
+    .await
+    .map_err(|e| IngestError::Rejected(e.reject_message()))?;
+
+    // Privacy Gate + graft BEFORE the event exists: a refused or failed
+    // promotion stores nothing and transfers nothing. (This deliberately
+    // inverts the persist-then-mutate command pattern — the git work takes
+    // seconds and must be able to reject.)
+    let promoted = crate::api::git::promote::promote_thread_files(
+        state,
+        tenant,
+        &source_thread,
+        target_channel,
+        event.id.as_bytes(),
+        &event.content,
+        &ckpt_commit,
+    )
+    .await
+    .map_err(|e| IngestError::Rejected(e.reject_message()))?;
+
+    let tx = match persist_command_event(state, tenant, event, Some(target_channel)).await? {
+        PersistResult::Duplicate => {
+            return Ok(IngestResult {
+                event_id: event.id.to_hex(),
+                accepted: true,
+                message: "duplicate: already processed".into(),
+            });
+        }
+        PersistResult::Inserted(tx) => tx,
+    };
+
+    // The new target-channel thread: goal = the member-written summary.
+    state
+        .db
+        .create_work_thread(buzz_db::work_thread::CreateWorkThreadParams {
+            community_id: tenant.community(),
+            thread_id: event.id.as_bytes(),
+            channel_id: target_channel,
+            goal: event.content.trim(),
+            deadline: None,
+            dri_pubkey: None,
+            created_by: &author,
+            forked_from: None,
+            fork_commit: None,
+        })
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: create promoted thread: {e}")))?;
+
+    // Close the source thread ("promotes and closes"). Already-closed
+    // sources (crash-retry convergence, re-promotion) need no transition.
+    // Otherwise TOCTOU from the snapshot with one re-read retry — if it
+    // raced into closed/archived the goal is already met, and a
+    // still-live loser is reported honestly.
+    let mut source_closed = source_thread.status == WorkThreadStatus::Closed;
+    if !source_closed {
+        source_closed = state
+            .db
+            .transition_work_thread(
+                tenant.community(),
+                &source_root,
+                source_thread.status,
+                WorkThreadStatus::Closed,
+                None,
+            )
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: close source: {e}")))?;
+    }
+    if !source_closed {
+        if let Ok(Some(fresh)) = state
+            .db
+            .get_work_thread(tenant.community(), &source_root)
+            .await
+        {
+            source_closed = match fresh.status {
+                WorkThreadStatus::Closed | WorkThreadStatus::Archived => true,
+                live => state
+                    .db
+                    .transition_work_thread(
+                        tenant.community(),
+                        &source_root,
+                        live,
+                        WorkThreadStatus::Closed,
+                        None,
+                    )
+                    .await
+                    .unwrap_or(false),
+            };
+        }
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: commit transaction: {e}")))?;
+
+    if let Ok(Some(stored)) = state
+        .db
+        .get_event_by_id(tenant.community(), event.id.as_bytes())
+        .await
+    {
+        let _ = dispatch_persistent_event(
+            tenant,
+            state,
+            &stored,
+            buzz_core::kind::KIND_WORK_THREAD_PROMOTE,
+            &auth.pubkey().to_hex(),
+            None,
+        )
+        .await;
+    }
+
+    // The kind:47014 notice asserts "this thread closed because it was
+    // promoted" — emit it only when that is true. A still-live source
+    // (double race) is reported via source_closed=false instead of a
+    // notice that would contradict the projection.
+    if source_closed {
+        emit_promoted_notice(
+            tenant,
+            state,
+            from_channel,
+            &source_root,
+            target_channel,
+            event.id.as_bytes(),
+        )
+        .await;
+    }
+
+    metrics::counter!("buzz_work_thread_promotions_total").increment(1);
+
+    Ok(IngestResult {
+        event_id: event.id.to_hex(),
+        accepted: true,
+        message: format!(
+            "response:{}",
+            serde_json::json!({
+                "thread_id": event.id.to_hex(),
+                "source_thread": hex::encode(&source_root),
+                "source_channel": from_channel.to_string(),
+                "commit": promoted.commit,
+                "prefix": promoted.prefix,
+                "source_closed": source_closed,
+            })
+        ),
+    })
+}
+
+/// Relay-signed kind:47014 promotion notice into the **source** personal
+/// channel (D29) — records the relay-side close for event-folding clients.
+/// Best-effort after the commit; the projection is the authority.
+async fn emit_promoted_notice(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    source_channel: Uuid,
+    source_root: &[u8],
+    target_channel: Uuid,
+    new_thread_id: &[u8],
+) {
+    let source_hex = hex::encode(source_root);
+    let new_hex = hex::encode(new_thread_id);
+    let tag_rows = [
+        vec!["e".to_owned(), source_hex.clone()],
+        vec!["h".to_owned(), source_channel.to_string()],
+        vec!["to".to_owned(), target_channel.to_string()],
+        vec!["thread".to_owned(), new_hex.clone()],
+    ];
+    let tags: Result<Vec<Tag>, _> = tag_rows
+        .iter()
+        .map(|t| Tag::parse(t.iter().map(String::as_str)))
+        .collect();
+    let tags = match tags {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(thread = %source_hex, "promotion notice: tag build failed: {e}");
+            return;
+        }
+    };
+    let content = serde_json::json!({
+        "to": target_channel.to_string(),
+        "thread": new_hex,
+    })
+    .to_string();
+    let signed = match EventBuilder::new(Kind::Custom(KIND_WORK_THREAD_PROMOTED as u16), content)
+        .tags(tags)
+        .sign_with_keys(&state.relay_keypair)
+    {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(thread = %source_hex, "promotion notice: signing failed: {e}");
+            return;
+        }
+    };
+    match state
+        .db
+        .insert_event(tenant.community(), &signed, Some(source_channel))
+        .await
+    {
+        Ok((stored, true)) => {
+            let _ = dispatch_persistent_event(
+                tenant,
+                state,
+                &stored,
+                KIND_WORK_THREAD_PROMOTED,
+                &state.relay_keypair.public_key().to_hex(),
+                None,
+            )
+            .await;
+        }
+        Ok((_, false)) => {}
+        Err(e) => warn!(thread = %source_hex, "promotion notice: persist failed: {e}"),
+    }
 }
 
 /// Relay-signed kind:47013 sibling-archive notices — one per losing fork
@@ -1430,5 +1893,381 @@ mod pg_tests {
         .await
         .expect("recount notices");
         assert_eq!(notices_after.len(), 2, "replay must not re-emit notices");
+    }
+
+    /// Phase 2g: every promotion rejection that fires before any git work
+    /// — source-ownership authority, target-channel rules, thread state,
+    /// checkpoint validity, and the summary half of the Privacy Gate.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn promotion_authority_and_gate_validation() {
+        use buzz_core::kind::KIND_WORK_THREAD_PROMOTE;
+
+        let state = test_state().await;
+        let ws_owner = nostr::Keys::generate();
+        let member = nostr::Keys::generate();
+        let outsider = nostr::Keys::generate();
+
+        let host = format!("promote-{}.example", Uuid::new_v4().simple());
+        let community = match state
+            .db
+            .create_community_with_owner(&host, &ws_owner.public_key().to_hex())
+            .await
+            .expect("create community")
+        {
+            CreateCommunityWithOwnerResult::Created(rec) => rec.id,
+            other => panic!("expected fresh community, got {other:?}"),
+        };
+        let tenant = TenantContext::resolved(community, host);
+        for keys in [&ws_owner, &member, &outsider] {
+            state
+                .db
+                .ensure_user(community, keys.public_key().to_bytes().as_ref())
+                .await
+                .expect("ensure user");
+        }
+
+        // The member's personal channel + a team channel they belong to.
+        let personal_id = Uuid::new_v4();
+        let created = state
+            .db
+            .create_personal_channel(
+                community,
+                personal_id,
+                "my-space",
+                ChannelType::Stream,
+                buzz_core::channel::ChannelTier::Private,
+                None,
+                &member.public_key().to_bytes(),
+                None,
+            )
+            .await
+            .expect("create personal channel");
+        assert!(matches!(
+            created,
+            buzz_db::personal_channel::CreatePersonalChannelResult::Created(_)
+        ));
+        let team = state
+            .db
+            .create_channel(
+                community,
+                "team",
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                None,
+                &ws_owner.public_key().to_bytes(),
+                None,
+            )
+            .await
+            .expect("create team channel");
+        state
+            .db
+            .add_member(
+                community,
+                team.id,
+                &member.public_key().to_bytes(),
+                MemberRole::Member,
+                Some(&ws_owner.public_key().to_bytes()),
+            )
+            .await
+            .expect("add member to team");
+
+        // A live thread in the personal channel.
+        let personal_hex = personal_id.to_string();
+        let root = signed_event(
+            &member,
+            KIND_WORK_THREAD_OPEN,
+            "private exploration",
+            &[tag(&["h", &personal_hex])],
+        );
+        crate::handlers::side_effects::handle_side_effects(
+            &tenant,
+            KIND_WORK_THREAD_OPEN,
+            &root,
+            &state,
+        )
+        .await
+        .expect("47000 side effect");
+        let root_hex = root.id.to_hex();
+        let team_hex = team.id.to_string();
+
+        let promote = |keys: &nostr::Keys, tags: Vec<Vec<String>>, summary: &str| {
+            signed_event(keys, KIND_WORK_THREAD_PROMOTE, summary, &tags)
+        };
+        let base_tags = |to: &str, from: &str, root: &str| {
+            vec![tag(&["e", root]), tag(&["h", to]), tag(&["from", from])]
+        };
+        let expect_reject =
+            |res: Result<IngestResult, IngestError>, needle: &str, label: &str| match res {
+                Err(IngestError::Rejected(msg)) if msg.contains(needle) => {}
+                other => panic!("{label}: expected rejection containing {needle:?}, got {other:?}"),
+            };
+
+        // Only the personal owner promotes.
+        let ev = promote(
+            &outsider,
+            base_tags(&team_hex, &personal_hex, &root_hex),
+            "summary",
+        );
+        expect_reject(
+            handle_thread_promote(&tenant, &state, &ev, &http_auth(&outsider)).await,
+            "personal-channel owner",
+            "non-owner",
+        );
+
+        // The source must be a personal channel.
+        let ev = promote(
+            &member,
+            base_tags(&personal_hex, &team_hex, &root_hex),
+            "summary",
+        );
+        expect_reject(
+            handle_thread_promote(&tenant, &state, &ev, &http_auth(&member)).await,
+            "must be a personal channel",
+            "non-personal source",
+        );
+
+        // The target must not be a personal channel (here: source == target
+        // is caught first, so use a second member's personal channel).
+        let other_member = nostr::Keys::generate();
+        state
+            .db
+            .ensure_user(community, other_member.public_key().to_bytes().as_ref())
+            .await
+            .expect("ensure other member");
+        let other_personal = Uuid::new_v4();
+        state
+            .db
+            .create_personal_channel(
+                community,
+                other_personal,
+                "their-space",
+                ChannelType::Stream,
+                buzz_core::channel::ChannelTier::Private,
+                None,
+                &other_member.public_key().to_bytes(),
+                None,
+            )
+            .await
+            .expect("other personal");
+        let ev = promote(
+            &member,
+            base_tags(&other_personal.to_string(), &personal_hex, &root_hex),
+            "summary",
+        );
+        expect_reject(
+            handle_thread_promote(&tenant, &state, &ev, &http_auth(&member)).await,
+            "team channel",
+            "personal target",
+        );
+
+        // Full target membership is required.
+        let closed_team = state
+            .db
+            .create_channel(
+                community,
+                "closed-team",
+                ChannelType::Stream,
+                ChannelVisibility::Private,
+                None,
+                &ws_owner.public_key().to_bytes(),
+                None,
+            )
+            .await
+            .expect("closed team");
+        let ev = promote(
+            &member,
+            base_tags(&closed_team.id.to_string(), &personal_hex, &root_hex),
+            "summary",
+        );
+        expect_reject(
+            handle_thread_promote(&tenant, &state, &ev, &http_auth(&member)).await,
+            "membership in the target",
+            "non-member target",
+        );
+
+        // Unknown source thread.
+        let ev = promote(
+            &member,
+            base_tags(&team_hex, &personal_hex, &"9".repeat(64)),
+            "summary",
+        );
+        expect_reject(
+            handle_thread_promote(&tenant, &state, &ev, &http_auth(&member)).await,
+            "unknown source work thread",
+            "unknown thread",
+        );
+
+        // The summary half of the Privacy Gate fires before any git work.
+        let ev = promote(
+            &member,
+            base_tags(&team_hex, &personal_hex, &root_hex),
+            "creds: AKIAIOSFODNN7EXAMPLE",
+        );
+        expect_reject(
+            handle_thread_promote(&tenant, &state, &ev, &http_auth(&member)).await,
+            "privacy gate",
+            "secret summary",
+        );
+
+        // No checkpoint recorded → nothing to promote.
+        let ev = promote(
+            &member,
+            base_tags(&team_hex, &personal_hex, &root_hex),
+            "clean summary",
+        );
+        expect_reject(
+            handle_thread_promote(&tenant, &state, &ev, &http_auth(&member)).await,
+            "no recorded checkpoint",
+            "no checkpoint",
+        );
+
+        // A named commit must be a recorded checkpoint of the thread.
+        let mut tags_with_commit = base_tags(&team_hex, &personal_hex, &root_hex);
+        tags_with_commit.push(tag(&["commit", &"c".repeat(40)]));
+        let ev = promote(&member, tags_with_commit, "clean summary");
+        expect_reject(
+            handle_thread_promote(&tenant, &state, &ev, &http_auth(&member)).await,
+            "not a recorded checkpoint",
+            "unrecorded commit",
+        );
+
+        // With a checkpoint recorded but no repo bound (this test runs
+        // without git storage), the source-repo check is the next gate —
+        // and proves the thread-state path stays live until then.
+        let ckpt = signed_event(
+            &member,
+            buzz_core::kind::KIND_WORK_THREAD_CHECKPOINT,
+            "turn 1",
+            &[
+                tag(&["e", &root_hex]),
+                tag(&["h", &personal_hex]),
+                tag(&["commit", &"c".repeat(40)]),
+            ],
+        );
+        state
+            .db
+            .insert_event(community, &ckpt, Some(personal_id))
+            .await
+            .expect("store checkpoint");
+        let ev = promote(
+            &member,
+            base_tags(&team_hex, &personal_hex, &root_hex),
+            "clean summary",
+        );
+        expect_reject(
+            handle_thread_promote(&tenant, &state, &ev, &http_auth(&member)).await,
+            "no bound repo",
+            "missing repo",
+        );
+
+        // Extra tags are an unscanned channel across the privacy boundary —
+        // the allowlist rejects them.
+        let mut smuggle = base_tags(&team_hex, &personal_hex, &root_hex);
+        smuggle.push(tag(&["note", "AKIAIOSFODNN7EXAMPLE"]));
+        let ev = promote(&member, smuggle, "clean summary");
+        expect_reject(
+            handle_thread_promote(&tenant, &state, &ev, &http_auth(&member)).await,
+            "unexpected tag",
+            "smuggled tag",
+        );
+
+        // An archived target channel is read-only.
+        let archived_team = state
+            .db
+            .create_channel(
+                community,
+                "archived-team",
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                None,
+                &ws_owner.public_key().to_bytes(),
+                None,
+            )
+            .await
+            .expect("archived team");
+        state
+            .db
+            .add_member(
+                community,
+                archived_team.id,
+                &member.public_key().to_bytes(),
+                MemberRole::Member,
+                Some(&ws_owner.public_key().to_bytes()),
+            )
+            .await
+            .expect("join archived team");
+        state
+            .db
+            .archive_channel(community, archived_team.id)
+            .await
+            .expect("archive channel");
+        let ev = promote(
+            &member,
+            base_tags(&archived_team.id.to_string(), &personal_hex, &root_hex),
+            "clean summary",
+        );
+        expect_reject(
+            handle_thread_promote(&tenant, &state, &ev, &http_auth(&member)).await,
+            "archived channel",
+            "archived target",
+        );
+
+        // A CLOSED thread stays promotable (crash-retry convergence and
+        // re-promotion are legitimate) — it proceeds past state validation
+        // to the repo gate. An ARCHIVED thread does not.
+        assert!(state
+            .db
+            .transition_work_thread(
+                community,
+                root.id.as_bytes(),
+                WorkThreadStatus::Open,
+                WorkThreadStatus::Ready,
+                None,
+            )
+            .await
+            .expect("ready"));
+        assert!(state
+            .db
+            .transition_work_thread(
+                community,
+                root.id.as_bytes(),
+                WorkThreadStatus::Ready,
+                WorkThreadStatus::Closed,
+                None,
+            )
+            .await
+            .expect("close"));
+        let ev = promote(
+            &member,
+            base_tags(&team_hex, &personal_hex, &root_hex),
+            "clean summary",
+        );
+        expect_reject(
+            handle_thread_promote(&tenant, &state, &ev, &http_auth(&member)).await,
+            "no bound repo",
+            "closed source proceeds to the repo gate",
+        );
+        assert!(state
+            .db
+            .transition_work_thread(
+                community,
+                root.id.as_bytes(),
+                WorkThreadStatus::Closed,
+                WorkThreadStatus::Archived,
+                None,
+            )
+            .await
+            .expect("archive"));
+        let ev = promote(
+            &member,
+            base_tags(&team_hex, &personal_hex, &root_hex),
+            "clean summary",
+        );
+        expect_reject(
+            handle_thread_promote(&tenant, &state, &ev, &http_auth(&member)).await,
+            "archived thread",
+            "archived source",
+        );
     }
 }

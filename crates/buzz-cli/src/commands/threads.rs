@@ -66,11 +66,17 @@ struct FoldedThread {
     forked_from: Option<String>,
     /// Fork-point checkpoint commit (`None` = forked at head, or not a fork).
     fork_commit: Option<String>,
+    /// Source thread root when the root is a kind:47021 promotion.
+    promoted_from: Option<String>,
+    /// Source (personal) channel when the root is a kind:47021 promotion.
+    promoted_channel: Option<String>,
 }
 
 impl FoldedThread {
     fn from_root(root: &serde_json::Value) -> Self {
-        let is_fork = root.get("kind").and_then(|v| v.as_u64()) == Some(47020);
+        let kind = root.get("kind").and_then(|v| v.as_u64());
+        let is_fork = kind == Some(47020);
+        let is_promotion = kind == Some(47021);
         FoldedThread {
             thread_id: root
                 .get("id")
@@ -97,6 +103,12 @@ impl FoldedThread {
                 .flatten(),
             fork_commit: is_fork
                 .then(|| tag_value(root, "commit").map(str::to_owned))
+                .flatten(),
+            promoted_from: is_promotion
+                .then(|| tag_value(root, "e").map(str::to_owned))
+                .flatten(),
+            promoted_channel: is_promotion
+                .then(|| tag_value(root, "from").map(str::to_owned))
                 .flatten(),
         }
     }
@@ -145,12 +157,14 @@ impl FoldedThread {
             "created_at": self.created_at,
             "forked_from": self.forked_from,
             "fork_commit": self.fork_commit,
+            "promoted_from": self.promoted_from,
+            "promoted_channel": self.promoted_channel,
         })
     }
 }
 
-/// Fold 47001/47002 commands and relay-signed 47013 sibling-archive
-/// notices (already sorted) over the root view.
+/// Fold 47001/47002 commands and relay-signed 47013/47014 notices
+/// (already sorted) over the root view.
 fn fold_commands(thread: &mut FoldedThread, commands: &[serde_json::Value]) {
     for event in commands {
         match event.get("kind").and_then(|v| v.as_u64()) {
@@ -162,13 +176,16 @@ fn fold_commands(thread: &mut FoldedThread, commands: &[serde_json::Value]) {
             }
             // A winner's close archived this thread as a losing sibling.
             Some(47013) => thread.status = "archived".to_owned(),
+            // This thread was promoted to a team channel — the relay
+            // closed it in place; the files and summary moved.
+            Some(47014) => thread.status = "closed".to_owned(),
             _ => {}
         }
     }
 }
 
-/// Fetch all 47001/47002 commands (plus 47013 sibling-archive notices) for
-/// a set of thread roots, sorted for folding.
+/// Fetch all 47001/47002 commands (plus 47013/47014 relay notices) for a
+/// set of thread roots, sorted for folding.
 async fn fetch_commands(
     client: &BuzzClient,
     channel: &str,
@@ -178,7 +195,7 @@ async fn fetch_commands(
         return Ok(Vec::new());
     }
     let filter = serde_json::json!({
-        "kinds": [47001, 47002, 47013],
+        "kinds": [47001, 47002, 47013, 47014],
         "#h": [channel],
         "#e": roots,
     });
@@ -232,7 +249,7 @@ pub async fn cmd_list_threads(
     }
     let limit = limit.unwrap_or(100).clamp(1, 500);
     let filter = serde_json::json!({
-        "kinds": [47000, 47020],
+        "kinds": [47000, 47020, 47021],
         "#h": [channel],
         "limit": limit,
     });
@@ -270,7 +287,7 @@ pub async fn cmd_show_thread(
     let thread_id = validate_thread_id(thread)?;
 
     let root_filter = serde_json::json!({
-        "kinds": [47000, 47020],
+        "kinds": [47000, 47020, 47021],
         "#h": [channel],
         "ids": [thread_id],
     });
@@ -432,6 +449,46 @@ pub async fn cmd_set_thread(
     Ok(())
 }
 
+/// Promote a personal-channel thread into a team channel (kind 47021).
+/// The response echoes the write result with the new `thread_id` (the
+/// promotion event id) plus the graft commit and source-close status.
+pub async fn cmd_promote_thread(
+    client: &BuzzClient,
+    from: &str,
+    thread: &str,
+    to: &str,
+    summary: &str,
+    commit: Option<&str>,
+) -> Result<(), CliError> {
+    crate::validate::validate_uuid(from)?;
+    crate::validate::validate_uuid(to)?;
+    let source_channel =
+        uuid::Uuid::parse_str(from).map_err(|_| CliError::Usage("--from must be a UUID".into()))?;
+    let target_channel =
+        uuid::Uuid::parse_str(to).map_err(|_| CliError::Usage("--to must be a UUID".into()))?;
+    let source_root = validate_thread_id(thread)?;
+    let builder = buzz_sdk::build_thread_promote(
+        target_channel,
+        source_channel,
+        &source_root,
+        summary,
+        commit,
+    )
+    .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let thread_id = event.id.to_hex();
+    let resp = client.submit_event(event).await?;
+    let normalized = crate::client::normalize_write_response(&resp);
+    match serde_json::from_str::<serde_json::Value>(&normalized) {
+        Ok(mut v) if v.is_object() => {
+            v["thread_id"] = serde_json::Value::String(thread_id);
+            println!("{v}");
+        }
+        _ => println!("{normalized}"),
+    }
+    Ok(())
+}
+
 /// Transition a thread's D41 state (kind 47002).
 pub async fn cmd_thread_state(
     client: &BuzzClient,
@@ -557,6 +614,13 @@ pub async fn dispatch(cmd: crate::ThreadsCmd, client: &BuzzClient) -> Result<(),
             )
             .await
         }
+        ThreadsCmd::Promote {
+            from,
+            thread,
+            to,
+            summary,
+            commit,
+        } => cmd_promote_thread(client, &from, &thread, &to, &summary, commit.as_deref()).await,
         ThreadsCmd::Fork {
             channel,
             thread,
@@ -714,6 +778,49 @@ mod tests {
         );
         let folded_plain = FoldedThread::from_root(&plain);
         assert!(folded_plain.forked_from.is_none() && folded_plain.fork_commit.is_none());
+    }
+
+    #[test]
+    fn promotion_root_and_notice_fold() {
+        let source_id = "66".repeat(32);
+        let new_id = "77".repeat(32);
+        let personal = "7f7f7f7f-1111-2222-3333-444444444444";
+        let team = "7f7f7f7f-5555-6666-7777-888888888888";
+
+        // The 47021 root in the TARGET channel folds as an open thread with
+        // promotion provenance; its goal is the member-written summary.
+        let promo_root = event(
+            47021,
+            "Parser fix, tested",
+            &[&["e", &source_id], &["h", team], &["from", personal]],
+            300,
+            &new_id,
+        );
+        let folded = FoldedThread::from_root(&promo_root);
+        assert_eq!(folded.goal, "Parser fix, tested");
+        assert_eq!(folded.status, "open");
+        assert_eq!(folded.promoted_from.as_deref(), Some(source_id.as_str()));
+        assert_eq!(folded.promoted_channel.as_deref(), Some(personal));
+        assert!(folded.forked_from.is_none());
+
+        // The relay-signed 47014 notice in the SOURCE channel folds the
+        // promoted thread to closed.
+        let source_root = event(47000, "private work", &[&["h", personal]], 100, &source_id);
+        let mut folded = FoldedThread::from_root(&source_root);
+        let commands = vec![event(
+            47014,
+            &format!(r#"{{"to":"{team}","thread":"{new_id}"}}"#),
+            &[
+                &["e", &source_id],
+                &["h", personal],
+                &["to", team],
+                &["thread", &new_id],
+            ],
+            301,
+            "dd00",
+        )];
+        fold_commands(&mut folded, &commands);
+        assert_eq!(folded.status, "closed");
     }
 
     #[test]

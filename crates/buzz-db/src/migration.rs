@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 30);
+        assert_eq!(migrations.len(), 31);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -975,6 +975,17 @@ mod tests {
         assert!(!forks.contains("CREATE TABLE"));
         assert!(!forks.contains("_operator_global_tables"));
 
+        // Phase 2g: the personal-channel registry (D29) — one tenant-scoped
+        // table, one personal channel per member (PK), channel-side UNIQUE
+        // for the reverse lookup, cascade follows the channel.
+        assert_eq!(migrations[30].version, 31);
+        let personal = migrations[30].sql.as_str();
+        assert!(personal.contains("CREATE TABLE personal_channels"));
+        assert!(personal.contains("PRIMARY KEY (community_id, owner_pubkey)"));
+        assert!(personal.contains("UNIQUE (community_id, channel_id)"));
+        assert!(personal.contains("REFERENCES channels (community_id, id) ON DELETE CASCADE"));
+        assert!(!personal.contains("_operator_global_tables"));
+
         let desired_schema = include_str!("../../../schema/schema.sql");
         assert!(
             desired_schema.contains("CREATE TABLE join_policy_acceptances"),
@@ -1010,6 +1021,10 @@ mod tests {
                 && desired_schema.contains("fork_commit")
                 && desired_schema.contains("idx_work_threads_forked_from"),
             "desired-state schema must carry the fork provenance columns and index",
+        );
+        assert!(
+            desired_schema.contains("CREATE TABLE personal_channels"),
+            "desired-state schema must include the personal-channel registry",
         );
     }
 
@@ -1253,7 +1268,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(30));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(31));
     }
 
     #[tokio::test]

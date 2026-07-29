@@ -37,6 +37,8 @@ pub mod migration;
 pub mod moderation;
 /// Monthly table partition management.
 pub mod partition;
+/// Personal-channel registry (Silent Mesh D29).
+pub mod personal_channel;
 /// Buzz product-feedback sidecar persistence.
 pub mod product_feedback;
 /// Community-scoped push lease and durable wake-outbox persistence.
@@ -2927,6 +2929,53 @@ impl Db {
             canonicalize,
         )
         .await
+    }
+
+    /// Create a member's personal channel (D29): channel row (visibility
+    /// forced private), owner membership, and registry row, atomically —
+    /// one personal channel per member per community.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_personal_channel(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        name: &str,
+        channel_type: channel::ChannelType,
+        tier: channel::ChannelTier,
+        description: Option<&str>,
+        owner_pubkey: &[u8],
+        ttl_seconds: Option<i32>,
+    ) -> Result<personal_channel::CreatePersonalChannelResult> {
+        personal_channel::create_personal_channel(
+            &self.pool,
+            community_id,
+            channel_id,
+            name,
+            channel_type,
+            tier,
+            description,
+            owner_pubkey,
+            ttl_seconds,
+        )
+        .await
+    }
+
+    /// Whose personal channel is `channel_id`, if anyone's (D29)?
+    pub async fn get_personal_channel_owner(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+    ) -> Result<Option<Vec<u8>>> {
+        personal_channel::get_personal_channel_owner(&self.pool, community_id, channel_id).await
+    }
+
+    /// The member's personal channel in this community, if they have one.
+    pub async fn get_personal_channel_for(
+        &self,
+        community_id: CommunityId,
+        owner_pubkey: &[u8],
+    ) -> Result<Option<Uuid>> {
+        personal_channel::get_personal_channel_for(&self.pool, community_id, owner_pubkey).await
     }
 
     /// Close the winner and archive its fork family in one family-locked

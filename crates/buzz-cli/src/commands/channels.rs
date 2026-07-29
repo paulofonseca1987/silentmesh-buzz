@@ -328,6 +328,22 @@ pub async fn cmd_create_channel(
     Ok(())
 }
 
+/// Create the caller's personal channel (kind 9007 + `personal` tag, D29):
+/// always private, one per member, implicit Channel Admin.
+pub async fn cmd_create_personal_channel(
+    client: &BuzzClient,
+    name: &str,
+    description: Option<&str>,
+) -> Result<(), CliError> {
+    let channel_uuid = Uuid::new_v4();
+    let builder = buzz_sdk::build_create_personal_channel(channel_uuid, name, description)
+        .map_err(|e| CliError::Other(format!("build_create_personal_channel failed: {e}")))?;
+    let event = client.sign_event(builder)?;
+    let resp = client.submit_event(event).await?;
+    print_create_response(&resp, "channel_id", &channel_uuid.to_string());
+    Ok(())
+}
+
 /// A resolved live managed-agent instance backing a template persona slug.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct ResolvedAgent {
@@ -1123,6 +1139,9 @@ pub async fn dispatch(
                 )
                 .await
             }
+        }
+        ChannelsCmd::CreatePersonal { name, description } => {
+            cmd_create_personal_channel(client, &name, description.as_deref()).await
         }
         ChannelsCmd::Update {
             channel,

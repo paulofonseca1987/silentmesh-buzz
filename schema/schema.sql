@@ -163,6 +163,23 @@ CREATE TABLE channel_repos (
         REFERENCES channels (community_id, id) ON DELETE CASCADE
 );
 
+-- ── Personal channels ─────────────────────────────────────────────────────────
+-- A member's private space (self + their agents, D29). One per member per
+-- community (PK); the UNIQUE makes the reverse lookup cheap. Rows are
+-- created in the same transaction as the channel. Keep in sync with
+-- migrations/0031.
+
+CREATE TABLE personal_channels (
+    community_id UUID NOT NULL REFERENCES communities(id),
+    owner_pubkey BYTEA NOT NULL CHECK (length(owner_pubkey) = 32),
+    channel_id   UUID NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (community_id, owner_pubkey),
+    UNIQUE (community_id, channel_id),
+    FOREIGN KEY (community_id, channel_id)
+        REFERENCES channels (community_id, id) ON DELETE CASCADE
+);
+
 -- ── Work threads ──────────────────────────────────────────────────────────────
 -- Relay-side projection of the 47xxx work-thread events: the signed events
 -- are the truth; the row makes reads cheap and state transitions TOCTOU-safe

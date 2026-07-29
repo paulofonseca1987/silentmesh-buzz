@@ -576,6 +576,18 @@ pub enum ChannelsCmd {
         #[arg(long, value_name = "PATH")]
         templates_file: Option<String>,
     },
+    /// Create your personal channel (private; self + your agents; one per member)
+    #[command(
+        after_help = "A personal channel is your private space (Silent Mesh D29): always\nprivate, you are its Channel Admin, and only your own agents can join.\nThread work promotes into team channels via `buzz threads promote`.\n\nExample:\n  buzz channels create-personal --name my-space"
+    )]
+    CreatePersonal {
+        /// Channel name
+        #[arg(long)]
+        name: String,
+        /// Channel description
+        #[arg(long)]
+        description: Option<String>,
+    },
     /// Update channel name, description, or ephemeral TTL
     Update {
         /// Channel UUID
@@ -990,6 +1002,31 @@ pub enum ThreadsCmd {
         /// Archive the losing threads in this thread's fork family (close only)
         #[arg(long)]
         archive_siblings: bool,
+    },
+    /// Promote a personal-channel thread into a team channel (signs a kind:47021 command)
+    ///
+    /// Files (one checkpoint's tree) and your written summary transfer
+    /// through the Privacy Gate scaffold; the conversation stays behind.
+    /// The source thread closes.
+    #[command(
+        after_help = "The summary is mandatory — it is the gate's review artifact, and the relay\nruns a deterministic secret scan over it and every text file. Any finding\nrejects the promotion.\n\nExamples:\n  buzz threads promote --from <PERSONAL-UUID> --thread <64-hex> --to <TEAM-UUID> --summary 'Parser fix, tested'\n  buzz threads promote --from <PERSONAL-UUID> --thread <64-hex> --to <TEAM-UUID> --summary '...' --commit <40-hex>"
+    )]
+    Promote {
+        /// Source (personal) channel UUID
+        #[arg(long)]
+        from: String,
+        /// Source thread root event id (64-char hex)
+        #[arg(long)]
+        thread: String,
+        /// Target (team) channel UUID
+        #[arg(long)]
+        to: String,
+        /// Member-written summary (event content; the gate's review artifact)
+        #[arg(long)]
+        summary: String,
+        /// Optional checkpoint commit to promote (40/64-hex; omit = latest)
+        #[arg(long)]
+        commit: Option<String>,
     },
     /// Fork a thread into a variation at head or a checkpoint (signs a kind:47020 root)
     ///
@@ -2137,6 +2174,7 @@ mod tests {
                 "fork",
                 "list",
                 "open",
+                "promote",
                 "recommend",
                 "set",
                 "show",
@@ -2162,6 +2200,7 @@ mod tests {
                 "add-member",
                 "archive",
                 "create",
+                "create-personal",
                 "delete",
                 "get",
                 "join",
@@ -2268,7 +2307,7 @@ mod tests {
         let expected: Vec<(&str, usize)> = vec![
             ("agents", 5),
             ("canvas", 2),
-            ("channels", 16),
+            ("channels", 17),
             ("dms", 4),
             ("emoji", 5),
             ("feed", 1),

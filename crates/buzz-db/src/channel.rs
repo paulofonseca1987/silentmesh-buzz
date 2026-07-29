@@ -520,6 +520,46 @@ async fn add_member_inner(
 
     let channel = get_channel_tx(&mut tx, community_id, channel_id).await?;
 
+    // silent-mesh: personal channels (D29) hold exactly the member and
+    // their agents — enforced at the same choke point as the guest
+    // rejection so every caller (invites, templates, workspace authority)
+    // is covered. Even workspace owners/admins cannot join someone's
+    // personal space.
+    let personal_owner: Option<(Vec<u8>,)> = sqlx::query_as(
+        "SELECT owner_pubkey FROM personal_channels \
+         WHERE community_id = $1 AND channel_id = $2",
+    )
+    .bind(community_id.as_uuid())
+    .bind(channel_id)
+    .fetch_optional(tx.as_mut())
+    .await?;
+    if let Some((personal_owner,)) = personal_owner {
+        if pubkey != personal_owner.as_slice() {
+            if role != MemberRole::Bot {
+                return Err(DbError::AccessDenied(
+                    "personal channels admit only the member and their own agents (bot role)"
+                        .into(),
+                ));
+            }
+            let agent_owner: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
+                "SELECT agent_owner_pubkey FROM users \
+                 WHERE community_id = $1 AND pubkey = $2",
+            )
+            .bind(community_id.as_uuid())
+            .bind(pubkey)
+            .fetch_optional(tx.as_mut())
+            .await?;
+            let owned_by_member = agent_owner
+                .and_then(|(o,)| o)
+                .is_some_and(|o| o == personal_owner);
+            if !owned_by_member {
+                return Err(DbError::AccessDenied(
+                    "personal channels admit only the member and their own agents".into(),
+                ));
+            }
+        }
+    }
+
     let effective_role = if workspace_authority {
         // Workspace authority (verified by the caller) substitutes for
         // in-channel elevation on both channel visibilities.
@@ -1205,7 +1245,7 @@ pub async fn get_users_bulk(
     Ok(out)
 }
 
-fn row_to_channel_record(row: sqlx::postgres::PgRow) -> Result<ChannelRecord> {
+pub(crate) fn row_to_channel_record(row: sqlx::postgres::PgRow) -> Result<ChannelRecord> {
     let id: Uuid = row.try_get("id")?;
     let topic_required: bool = row.try_get("topic_required")?;
 

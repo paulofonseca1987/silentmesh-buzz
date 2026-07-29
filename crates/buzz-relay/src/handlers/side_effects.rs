@@ -424,6 +424,40 @@ pub async fn validate_admin_event(
             let target_pubkey =
                 extract_p_tag(event).ok_or_else(|| anyhow::anyhow!("missing p tag"))?;
 
+            // silent-mesh: personal channels (D29) hold exactly the member
+            // and their agents. Only the personal owner manages membership;
+            // agents join with the bot role. `add_member` is the DB-layer
+            // backstop; rejecting here gives the client a real error.
+            if let Some(personal_owner) = state
+                .db
+                .get_personal_channel_owner(tenant.community(), channel_id)
+                .await?
+            {
+                if actor_bytes != personal_owner {
+                    return Err(anyhow::anyhow!(
+                        "only the personal-channel owner may manage its members"
+                    ));
+                }
+                if target_pubkey != personal_owner {
+                    let owned_bot = state
+                        .db
+                        .get_agent_channel_policy(tenant.community(), &target_pubkey)
+                        .await?
+                        .and_then(|(_, owner)| owner)
+                        .is_some_and(|o| o == personal_owner);
+                    if !owned_bot {
+                        return Err(anyhow::anyhow!(
+                            "personal channels admit only the member and their own agents"
+                        ));
+                    }
+                    if requested_role != Some(buzz_db::channel::MemberRole::Bot) {
+                        return Err(anyhow::anyhow!(
+                            "agents join personal channels with an explicit bot role"
+                        ));
+                    }
+                }
+            }
+
             // Changing an ACTIVE existing member's role is privileged in both
             // directions, on every visibility. `get_members` filters
             // `removed_at IS NULL`, so a soft-removed row is deliberately not an
@@ -545,6 +579,21 @@ pub async fn validate_admin_event(
                 return Err(anyhow::anyhow!(
                     "the channel tier is immutable (declared at creation)"
                 ));
+            }
+            // silent-mesh: personal channels (D29) stay private forever — a
+            // visibility flip would silently open a member's personal space
+            // (and re-enable kind:9021 self-joins).
+            if event
+                .tags
+                .iter()
+                .any(|t| t.kind().to_string() == "visibility")
+                && state
+                    .db
+                    .get_personal_channel_owner(tenant.community(), channel_id)
+                    .await?
+                    .is_some()
+            {
+                return Err(anyhow::anyhow!("personal channels are always private"));
             }
             // EDIT_METADATA: require at least one recognized metadata tag.
             const RECOGNIZED_TAGS: &[&str] = &[

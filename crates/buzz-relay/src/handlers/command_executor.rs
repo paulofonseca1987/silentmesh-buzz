@@ -77,6 +77,10 @@ pub async fn handle_command(
         KIND_WORK_THREAD_STATE => {
             super::work_thread::handle_thread_state(tenant, state, &event, &auth).await
         }
+        // silent-mesh: thread promotion out of a personal channel (D29/D30).
+        buzz_core::kind::KIND_WORK_THREAD_PROMOTE => {
+            super::work_thread::handle_thread_promote(tenant, state, &event, &auth).await
+        }
         _ => Err(IngestError::Rejected(format!(
             "unknown command kind: {kind}"
         ))),

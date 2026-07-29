@@ -165,6 +165,7 @@ pub fn reject_with_transport(transport: &'static str, reason: &'static str) {
 }
 
 /// Successful ingestion result.
+#[derive(Debug)]
 pub struct IngestResult {
     /// Hex-encoded event ID.
     pub event_id: String,
@@ -510,6 +511,7 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
             | KIND_WORK_THREAD_CHECKPOINT
             | KIND_WORK_THREAD_OVERDUE
             | KIND_WORK_THREAD_FORK
+            | buzz_core::kind::KIND_WORK_THREAD_PROMOTE
     )
 }
 
@@ -2569,10 +2571,31 @@ async fn ingest_event_inner(
             .parse()
             .map_err(|_| IngestError::Rejected(format!("invalid tier: {tier_str}")))?;
 
+        // silent-mesh: a `personal` tag marks the member's personal channel
+        // (D29) — self + their agents. Personal channels are member-creatable
+        // (the workspace gate below does not apply), always private, and
+        // limited to one per member (enforced in the registry).
+        let is_personal = event
+            .tags
+            .iter()
+            .any(|t| t.kind().to_string() == "personal");
+        if is_personal && visibility != buzz_db::channel::ChannelVisibility::Private {
+            let explicit = event
+                .tags
+                .iter()
+                .any(|t| t.kind().to_string() == "visibility");
+            if explicit {
+                return Err(IngestError::Rejected(
+                    "invalid: personal channels are always private".into(),
+                ));
+            }
+        }
+
         // silent-mesh: team-channel creation is a workspace-authority action
         // (D42) when the deployment enables the gate. DM channels never ride
-        // kind:9007, so this covers exactly the team surfaces.
-        if state.config.workspace_channel_gate {
+        // kind:9007, so this covers exactly the team surfaces; personal
+        // channels (D29) stay member-creatable.
+        if state.config.workspace_channel_gate && !is_personal {
             let actor_hex = event.pubkey.to_hex();
             let member = state
                 .db
@@ -2604,21 +2627,56 @@ async fn ingest_event_inner(
             let ttl_seconds = super::resolve_ttl(&event, state.config.ephemeral_ttl_override);
 
             let actor_bytes = event.pubkey.to_bytes().to_vec();
-            let (_, was_created) = state
-                .db
-                .create_channel_with_id_tiered(
-                    tenant.community(),
-                    client_uuid,
-                    name,
-                    channel_type,
-                    visibility,
-                    tier,
-                    description.as_deref(),
-                    &actor_bytes,
-                    ttl_seconds,
-                )
-                .await
-                .map_err(|e| IngestError::Internal(format!("error: {e}")))?;
+            let was_created = if is_personal {
+                use buzz_db::personal_channel::CreatePersonalChannelResult;
+                match state
+                    .db
+                    .create_personal_channel(
+                        tenant.community(),
+                        client_uuid,
+                        name,
+                        channel_type,
+                        tier,
+                        description.as_deref(),
+                        &actor_bytes,
+                        ttl_seconds,
+                    )
+                    .await
+                    .map_err(|e| IngestError::Internal(format!("error: {e}")))?
+                {
+                    CreatePersonalChannelResult::Created(_) => true,
+                    CreatePersonalChannelResult::DuplicateChannel => false,
+                    // A replay of the same create (the member's personal
+                    // channel IS this uuid) is a duplicate, not an error.
+                    CreatePersonalChannelResult::AlreadyHasPersonal(existing)
+                        if existing == client_uuid =>
+                    {
+                        false
+                    }
+                    CreatePersonalChannelResult::AlreadyHasPersonal(existing) => {
+                        return Err(IngestError::Rejected(format!(
+                            "invalid: member already has a personal channel ({existing})"
+                        )));
+                    }
+                }
+            } else {
+                let (_, was_created) = state
+                    .db
+                    .create_channel_with_id_tiered(
+                        tenant.community(),
+                        client_uuid,
+                        name,
+                        channel_type,
+                        visibility,
+                        tier,
+                        description.as_deref(),
+                        &actor_bytes,
+                        ttl_seconds,
+                    )
+                    .await
+                    .map_err(|e| IngestError::Internal(format!("error: {e}")))?;
+                was_created
+            };
 
             if !was_created {
                 return Ok(IngestResult {
@@ -3638,6 +3696,7 @@ mod tests {
             KIND_WORK_THREAD_CHECKPOINT,
             KIND_WORK_THREAD_OVERDUE,
             KIND_WORK_THREAD_FORK,
+            buzz_core::kind::KIND_WORK_THREAD_PROMOTE,
         ] {
             assert_eq!(
                 required_scope_for_kind(kind, &dummy).unwrap(),
@@ -3657,14 +3716,20 @@ mod tests {
             KIND_WORK_THREAD_CHECKPOINT
         ));
         assert!(!buzz_core::kind::is_command_kind(KIND_WORK_THREAD_FORK));
-        // The overdue and sibling-archive notices are emitted only by the
-        // relay's own sweep/close flows — the relay-only gate rejects client
-        // submissions before storage.
+        assert!(buzz_core::kind::is_command_kind(
+            buzz_core::kind::KIND_WORK_THREAD_PROMOTE
+        ));
+        // The overdue, sibling-archive, and promotion notices are emitted
+        // only by the relay's own sweep/close/promote flows — the relay-only
+        // gate rejects client submissions before storage.
         assert!(buzz_core::kind::is_relay_only_kind(
             KIND_WORK_THREAD_OVERDUE
         ));
         assert!(buzz_core::kind::is_relay_only_kind(
             buzz_core::kind::KIND_WORK_THREAD_SIBLING_ARCHIVED
+        ));
+        assert!(buzz_core::kind::is_relay_only_kind(
+            buzz_core::kind::KIND_WORK_THREAD_PROMOTED
         ));
         assert!(!buzz_core::kind::is_relay_only_kind(
             KIND_WORK_THREAD_CHECKPOINT

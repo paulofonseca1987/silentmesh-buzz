@@ -34,6 +34,8 @@ pub mod pairing;
 pub mod presence;
 /// Canonical relay runtime identities.
 pub mod relay;
+/// Deterministic secret scanners — the Privacy Gate scaffold (D30).
+pub mod secret_scan;
 /// Tenant identity — the server-resolved community key carried on scoped paths.
 pub mod tenant;
 /// Schnorr signature and event ID verification.

@@ -97,7 +97,7 @@ fn canon_prefix(thread_id: &[u8]) -> String {
 
 /// Run a git subprocess with the forge's hardened env plus job-specific
 /// vars (identity, index/work-tree redirection). Returns trimmed stdout.
-async fn run_git_env(
+pub(crate) async fn run_git_env(
     cwd: &Path,
     args: &[&str],
     envs: &[(&str, &str)],
@@ -146,7 +146,7 @@ async fn run_git_env(
 
 /// Resolve the latest checkpoint commit for a thread from its kind:47010
 /// events (newest `(created_at, id)` wins). Returns the 40/64-hex oid.
-async fn latest_checkpoint_commit(
+pub(crate) async fn latest_checkpoint_commit(
     state: &Arc<AppState>,
     tenant: &TenantContext,
     thread: &WorkThreadRecord,
@@ -503,7 +503,7 @@ async fn run_canonicalize_job(
 }
 
 /// Mirror `finalize_push`'s post-CAS kind:30618 emission (relay actor).
-async fn publish_ref_state(
+pub(crate) async fn publish_ref_state(
     state: &Arc<AppState>,
     tenant: &TenantContext,
     repo_id: &str,

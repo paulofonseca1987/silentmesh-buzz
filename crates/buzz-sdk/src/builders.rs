@@ -14,7 +14,7 @@ use buzz_core::{
         KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_USER_STATUS,
         KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, KIND_WORK_THREAD_CHECKPOINT,
         KIND_WORK_THREAD_FORK, KIND_WORK_THREAD_METADATA, KIND_WORK_THREAD_OPEN,
-        KIND_WORK_THREAD_RECOMMEND, KIND_WORK_THREAD_STATE,
+        KIND_WORK_THREAD_PROMOTE, KIND_WORK_THREAD_RECOMMEND, KIND_WORK_THREAD_STATE,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -697,6 +697,35 @@ pub fn build_create_channel(
     }
     if let Some(secs) = ttl {
         tags.push(tag(&["ttl", &secs.to_string()])?);
+    }
+    Ok(EventBuilder::new(Kind::Custom(9007), "").tags(tags))
+}
+
+/// Build a personal-channel create event (kind 9007 with the `personal`
+/// tag, Silent Mesh D29).
+///
+/// A personal channel is the member's private space (self + their
+/// agents): the relay forces visibility private, bootstraps the member as
+/// the channel owner (implicit Channel Admin), and allows exactly one per
+/// member per community. Member-creatable even when the workspace channel
+/// gate restricts team-channel creation.
+pub fn build_create_personal_channel(
+    channel_id: Uuid,
+    name: &str,
+    about: Option<&str>,
+) -> Result<EventBuilder, SdkError> {
+    let name = buzz_core::channel::canonical_channel_name(name);
+    if name.trim().is_empty() {
+        return Err(SdkError::InvalidTag("channel name is required".into()));
+    }
+    let mut tags = vec![
+        tag(&["h", &channel_id.to_string()])?,
+        tag(&["name", name])?,
+        tag(&["personal", "true"])?,
+        tag(&["visibility", "private"])?,
+    ];
+    if let Some(a) = about {
+        tags.push(tag(&["about", a])?);
     }
     Ok(EventBuilder::new(Kind::Custom(9007), "").tags(tags))
 }
@@ -1707,6 +1736,52 @@ pub fn build_thread_fork(
         tags.push(tag(&["dri", &validated])?);
     }
     Ok(EventBuilder::new(Kind::Custom(KIND_WORK_THREAD_FORK as u16), goal).tags(tags))
+}
+
+/// Build a thread-promotion command (kind 47021, D29/D30) — moves a
+/// personal-channel thread's files and a member-written summary into a
+/// team channel through the Privacy Gate scaffold.
+///
+/// - `target_channel`: the team channel receiving the thread (`h` tag).
+/// - `source_channel`: the member's personal channel (`from` tag).
+/// - `source_root`: the source thread's root event id (`e` tag).
+/// - `summary`: the member-written summary (event content, non-empty —
+///   this is the gate's review/confirm artifact).
+/// - `commit`: optional checkpoint to promote (absent = the latest).
+///
+/// The signed event's id is the **new** target-channel thread's id. The
+/// relay validates authority (source ownership, target membership), runs
+/// the deterministic secret scan over the summary and every text file,
+/// and rejects the whole promotion on any finding.
+pub fn build_thread_promote(
+    target_channel: Uuid,
+    source_channel: Uuid,
+    source_root: &str,
+    summary: &str,
+    commit: Option<&str>,
+) -> Result<EventBuilder, SdkError> {
+    if target_channel == source_channel {
+        return Err(SdkError::InvalidInput(
+            "target must differ from the source channel".into(),
+        ));
+    }
+    let root = check_hex_exact(source_root, 64, "source_root")?;
+    if summary.trim().is_empty() {
+        return Err(SdkError::InvalidInput(
+            "promotion requires a member-written summary".into(),
+        ));
+    }
+    check_content(summary, 16 * 1024)?;
+    let mut tags = vec![
+        tag(&["e", &root])?,
+        tag(&["h", &target_channel.to_string()])?,
+        tag(&["from", &source_channel.to_string()])?,
+    ];
+    if let Some(commit) = commit {
+        let commit = check_commit_hex(commit, "commit")?;
+        tags.push(tag(&["commit", &commit])?);
+    }
+    Ok(EventBuilder::new(Kind::Custom(KIND_WORK_THREAD_PROMOTE as u16), summary).tags(tags))
 }
 
 /// Build a per-turn checkpoint (kind 47010) — records a worktree commit for
@@ -4160,6 +4235,45 @@ mod tests {
         assert!(build_thread_fork(channel, &parent, "  ", None, None, None).is_err());
         assert!(build_thread_fork(channel, "short", "goal", None, None, None).is_err());
         assert!(build_thread_fork(channel, &parent, "goal", Some("abc123"), None, None).is_err());
+    }
+
+    #[test]
+    fn thread_promote_carries_gate_shape() {
+        let target = uuid();
+        let source = uuid();
+        let root = "b".repeat(64);
+        let sha1 = "c".repeat(40);
+
+        let ev = sign(
+            build_thread_promote(target, source, &root, "Parser fix, tested", Some(&sha1)).unwrap(),
+        );
+        assert_eq!(ev.kind.as_u16() as u32, KIND_WORK_THREAD_PROMOTE);
+        assert_eq!(ev.content, "Parser fix, tested");
+        assert!(has_tag(&ev, "e", &root));
+        assert!(has_tag(&ev, "h", &target.to_string()));
+        assert!(has_tag(&ev, "from", &source.to_string()));
+        assert!(has_tag(&ev, "commit", &sha1));
+
+        // Latest-checkpoint promotion: no commit tag.
+        let latest = sign(build_thread_promote(target, source, &root, "summary", None).unwrap());
+        assert!(tag_values(&latest, "commit").is_empty());
+
+        // The summary is mandatory — it is the gate's review artifact.
+        assert!(build_thread_promote(target, source, &root, "  ", None).is_err());
+        assert!(build_thread_promote(target, target, &root, "summary", None).is_err());
+        assert!(build_thread_promote(target, source, "short", "summary", None).is_err());
+    }
+
+    #[test]
+    fn personal_channel_create_is_private_and_marked() {
+        let ch = uuid();
+        let ev = sign(build_create_personal_channel(ch, "my-space", Some("mine")).unwrap());
+        assert_eq!(ev.kind.as_u16(), 9007);
+        assert!(has_tag(&ev, "personal", "true"));
+        assert!(has_tag(&ev, "visibility", "private"));
+        assert!(has_tag(&ev, "name", "my-space"));
+        assert!(has_tag(&ev, "about", "mine"));
+        assert!(build_create_personal_channel(ch, "  ", None).is_err());
     }
 
     #[test]

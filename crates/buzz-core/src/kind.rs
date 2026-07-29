@@ -561,6 +561,13 @@ pub const KIND_WORK_THREAD_CANON: u32 = 47012;
 /// winning thread's root (hex). Content JSON `{"winner": "<hex>"}`.
 /// Relay-only: the batch runs under the closer's admin authority.
 pub const KIND_WORK_THREAD_SIBLING_ARCHIVED: u32 = 47013;
+/// Relay-signed promotion notice (Silent Mesh D29) — emitted into the
+/// **source** personal channel when a thread is promoted to a team channel
+/// via kind:47021, so event-folding clients see the relay-side close.
+/// Tags: `e` = the promoted (source) thread's root, `h` = source channel,
+/// `to` = target channel UUID, `thread` = the new target-channel root
+/// (hex). Content JSON `{to, thread}`. Relay-only.
+pub const KIND_WORK_THREAD_PROMOTED: u32 = 47014;
 /// Work-thread fork (Silent Mesh D27) — a regular stored root event, like
 /// kind:47000, whose id is the **new** thread's id. Provenance tags:
 /// exactly one `e` = parent thread root, `h` = channel (same channel as the
@@ -569,6 +576,19 @@ pub const KIND_WORK_THREAD_SIBLING_ARCHIVED: u32 = 47013;
 /// variation's goal; optional `deadline`/`dri` tags as on kind:47000.
 /// Conversation is inherited by reference (the `e` tag), never copied.
 pub const KIND_WORK_THREAD_FORK: u32 = 47020;
+/// Work-thread promotion out of a personal channel (Silent Mesh D29/D30)
+/// — command kind, relay-validated and executed through the Privacy Gate
+/// scaffold: the member-written summary (content, non-empty) and every
+/// text file in the promoted checkpoint are run through the deterministic
+/// secret scan, then the checkpoint tree is grafted into the **target**
+/// channel repo under `promoted/<new-thread-short>/` and the source
+/// thread closes. The event is stored in the target channel and **is the
+/// new thread's root** (its id = the new thread id). Tags: `h` = target
+/// channel, exactly one unmarked lowercase `e` = source thread root,
+/// `from` = source (personal) channel UUID, optional lowercase `commit` =
+/// checkpoint to promote (absent = the thread's latest). Files and
+/// summary transfer; the conversation stays behind.
+pub const KIND_WORK_THREAD_PROMOTE: u32 = 47021;
 
 // System / admin custom range (48000–48999)
 /// An audit log entry was recorded.
@@ -708,7 +728,9 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_WORK_THREAD_OVERDUE,
     KIND_WORK_THREAD_CANON,
     KIND_WORK_THREAD_SIBLING_ARCHIVED,
+    KIND_WORK_THREAD_PROMOTED,
     KIND_WORK_THREAD_FORK,
+    KIND_WORK_THREAD_PROMOTE,
     KIND_AGENT_TURN_METRIC,
     KIND_WORKFLOW_DEF,
     KIND_LONG_FORM,
@@ -796,11 +818,11 @@ pub const fn is_identity_archive_request_kind(kind: u32) -> bool {
 }
 
 /// Returns `true` if `kind` is a Silent Mesh work-thread kind
-/// (47000–47003, 47010–47013, 47020).
+/// (47000–47003, 47010–47014, 47020–47021).
 ///
 /// The canonical route check — use this instead of scattering `47000..`
-/// matches across ingest/dispatch. Note 47011/47012/47013 (overdue, canon,
-/// and sibling-archive notices) are also relay-only
+/// matches across ingest/dispatch. Note 47011/47012/47013/47014 (overdue,
+/// canon, sibling-archive, and promotion notices) are also relay-only
 /// ([`is_relay_only_kind`]) — part of the family for dispatch and
 /// workflow-exclusion purposes, but never client-submittable.
 pub const fn is_work_thread_kind(kind: u32) -> bool {
@@ -814,7 +836,9 @@ pub const fn is_work_thread_kind(kind: u32) -> bool {
             | KIND_WORK_THREAD_OVERDUE
             | KIND_WORK_THREAD_CANON
             | KIND_WORK_THREAD_SIBLING_ARCHIVED
+            | KIND_WORK_THREAD_PROMOTED
             | KIND_WORK_THREAD_FORK
+            | KIND_WORK_THREAD_PROMOTE
     )
 }
 
@@ -831,6 +855,7 @@ pub const fn is_command_kind(kind: u32) -> bool {
             | KIND_APPROVAL_DENY
             | KIND_WORK_THREAD_METADATA
             | KIND_WORK_THREAD_STATE
+            | KIND_WORK_THREAD_PROMOTE
     )
 }
 
@@ -845,11 +870,12 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
             | KIND_DM_VISIBILITY
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
-            // silent-mesh: overdue, canonicalization, and sibling-archive
-            // notices come only from the relay's own sweeps/jobs.
+            // silent-mesh: overdue, canonicalization, sibling-archive, and
+            // promotion notices come only from the relay's own sweeps/jobs.
             | KIND_WORK_THREAD_OVERDUE
             | KIND_WORK_THREAD_CANON
             | KIND_WORK_THREAD_SIBLING_ARCHIVED
+            | KIND_WORK_THREAD_PROMOTED
     )
 }
 
@@ -918,6 +944,17 @@ const _: () = assert!(!is_parameterized_replaceable(KIND_WORK_THREAD_FORK));
 const _: () = assert!(!is_ephemeral(KIND_WORK_THREAD_FORK));
 const _: () = assert!(!is_relay_only_kind(KIND_WORK_THREAD_FORK));
 const _: () = assert!(KIND_WORK_THREAD_FORK <= u16::MAX as u32);
+const _: () = assert!(!is_replaceable(KIND_WORK_THREAD_PROMOTED));
+const _: () = assert!(!is_parameterized_replaceable(KIND_WORK_THREAD_PROMOTED));
+const _: () = assert!(!is_ephemeral(KIND_WORK_THREAD_PROMOTED));
+const _: () = assert!(is_relay_only_kind(KIND_WORK_THREAD_PROMOTED));
+const _: () = assert!(KIND_WORK_THREAD_PROMOTED <= u16::MAX as u32);
+const _: () = assert!(!is_replaceable(KIND_WORK_THREAD_PROMOTE));
+const _: () = assert!(!is_parameterized_replaceable(KIND_WORK_THREAD_PROMOTE));
+const _: () = assert!(!is_ephemeral(KIND_WORK_THREAD_PROMOTE));
+const _: () = assert!(!is_relay_only_kind(KIND_WORK_THREAD_PROMOTE));
+const _: () = assert!(is_command_kind(KIND_WORK_THREAD_PROMOTE));
+const _: () = assert!(KIND_WORK_THREAD_PROMOTE <= u16::MAX as u32);
 
 // Compile-time: NIP-34 parameterized replaceable kinds are in the correct range.
 const _: () = assert!(
