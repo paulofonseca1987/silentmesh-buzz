@@ -550,6 +550,11 @@ pub const KIND_WORK_THREAD_CHECKPOINT: u32 = 47010;
 /// falls back to the opener). Clients cannot submit this kind — the scope
 /// gate rejects it; only the relay's own signer inserts it.
 pub const KIND_WORK_THREAD_OVERDUE: u32 = 47011;
+/// Relay-signed canonicalization outcome (Silent Mesh D38/D40) — emitted
+/// after a close-with-canonicalize merges the thread's latest checkpoint
+/// into the channel repo's `canon/` layer (or fails to). Tags: `e` = root,
+/// `h` = channel, optional `commit` = new main tip. Relay-only.
+pub const KIND_WORK_THREAD_CANON: u32 = 47012;
 
 // System / admin custom range (48000–48999)
 /// An audit log entry was recorded.
@@ -687,6 +692,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_WORK_THREAD_RECOMMEND,
     KIND_WORK_THREAD_CHECKPOINT,
     KIND_WORK_THREAD_OVERDUE,
+    KIND_WORK_THREAD_CANON,
     KIND_AGENT_TURN_METRIC,
     KIND_WORKFLOW_DEF,
     KIND_LONG_FORM,
@@ -789,6 +795,7 @@ pub const fn is_work_thread_kind(kind: u32) -> bool {
             | KIND_WORK_THREAD_RECOMMEND
             | KIND_WORK_THREAD_CHECKPOINT
             | KIND_WORK_THREAD_OVERDUE
+            | KIND_WORK_THREAD_CANON
     )
 }
 
@@ -819,8 +826,10 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
             | KIND_DM_VISIBILITY
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
-            // silent-mesh: overdue notices come only from the deadline sweep.
+            // silent-mesh: overdue + canonicalization notices come only
+            // from the relay's own sweeps/jobs.
             | KIND_WORK_THREAD_OVERDUE
+            | KIND_WORK_THREAD_CANON
     )
 }
 
@@ -872,6 +881,11 @@ const _: () = assert!(!is_ephemeral(KIND_WORK_THREAD_OVERDUE));
 const _: () = assert!(is_relay_only_kind(KIND_WORK_THREAD_OVERDUE));
 const _: () = assert!(!is_relay_only_kind(KIND_WORK_THREAD_CHECKPOINT));
 const _: () = assert!(KIND_WORK_THREAD_OVERDUE <= u16::MAX as u32);
+const _: () = assert!(!is_replaceable(KIND_WORK_THREAD_CANON));
+const _: () = assert!(!is_parameterized_replaceable(KIND_WORK_THREAD_CANON));
+const _: () = assert!(!is_ephemeral(KIND_WORK_THREAD_CANON));
+const _: () = assert!(is_relay_only_kind(KIND_WORK_THREAD_CANON));
+const _: () = assert!(KIND_WORK_THREAD_CANON <= u16::MAX as u32);
 
 // Compile-time: NIP-34 parameterized replaceable kinds are in the correct range.
 const _: () = assert!(

@@ -167,7 +167,7 @@ CREATE TABLE channel_repos (
 -- Relay-side projection of the 47xxx work-thread events: the signed events
 -- are the truth; the row makes reads cheap and state transitions TOCTOU-safe
 -- (UPDATE ... WHERE status = expected). thread_id = 32-byte root event id.
--- Keep in sync with migrations/0027 and 0028.
+-- Keep in sync with migrations/0027, 0028, and 0029.
 
 CREATE TABLE work_threads (
     community_id UUID NOT NULL REFERENCES communities(id),
@@ -183,6 +183,8 @@ CREATE TABLE work_threads (
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     closed_at    TIMESTAMPTZ,
     overdue_notified_at TIMESTAMPTZ,
+    canonicalized_at TIMESTAMPTZ,
+    canonicalize_outcome TEXT,
     PRIMARY KEY (community_id, thread_id),
     FOREIGN KEY (community_id, channel_id)
         REFERENCES channels (community_id, id) ON DELETE CASCADE

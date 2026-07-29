@@ -1510,6 +1510,15 @@ async fn run_usage_metrics_tick(
         if overdue_notices > 0 {
             info!(overdue_notices, "work-thread overdue notices emitted");
         }
+
+        // silent-mesh: canonicalize crash-recovery sweep — reruns close-
+        // with-canonicalize jobs the close handler spawned but a restart
+        // interrupted before they claimed (Phase 2e).
+        let canon_jobs =
+            buzz_relay::api::git::canonicalize::run_canonicalize_sweep(state, &host_map).await;
+        if canon_jobs > 0 {
+            info!(canon_jobs, "work-thread canonicalize jobs recovered");
+        }
     }
 
     Ok(())

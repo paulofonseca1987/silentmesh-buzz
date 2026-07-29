@@ -413,6 +413,19 @@ pub(crate) async fn handle_thread_state(
         .await;
     }
 
+    // silent-mesh: close-with-canonicalize fires the canon/ merge job
+    // (Phase 2e, D38/D40) after the close has committed. Best-effort — the
+    // job claims via `canonicalized_at` and the leader sweep recovers jobs
+    // lost to a crash between this commit and the spawn.
+    if target == WorkThreadStatus::Closed && canonicalize == Some(true) {
+        let state = Arc::clone(state);
+        let tenant = tenant.clone();
+        let thread_id = thread_id.clone();
+        tokio::spawn(async move {
+            crate::api::git::canonicalize::canonicalize_thread(&state, &tenant, &thread_id).await;
+        });
+    }
+
     Ok(IngestResult {
         event_id: event.id.to_hex(),
         accepted: true,
@@ -738,6 +751,63 @@ mod pg_tests {
             .await
             .expect("replayed close is idempotent");
         assert!(replay.message.contains("duplicate"));
+
+        // Phase 2e: the close-with-canonicalize spawned the canon job. This
+        // channel has no bound repo, so the job must claim, record the
+        // honest `no_repo` outcome, and emit a relay-signed kind:47012
+        // notice into the channel.
+        let mut outcome = None;
+        for _ in 0..50 {
+            let t = state
+                .db
+                .get_work_thread(community, root.id.as_bytes())
+                .await
+                .expect("get thread")
+                .expect("thread exists");
+            if t.canonicalize_outcome.is_some() {
+                outcome = t.canonicalize_outcome;
+                assert!(t.canonicalized_at.is_some());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            outcome.as_deref(),
+            Some("no_repo"),
+            "canonicalize job must record the no-repo outcome"
+        );
+        let notice_pool = sqlx::PgPool::connect(&state.config.database_url)
+            .await
+            .expect("pg pool");
+        let notices: Vec<(Vec<u8>, serde_json::Value, String)> = sqlx::query_as(
+            "SELECT pubkey, tags, content FROM events \
+             WHERE community_id = $1 AND kind = $2 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(buzz_core::kind::KIND_WORK_THREAD_CANON as i32)
+        .fetch_all(&notice_pool)
+        .await
+        .expect("query canon notices");
+        let notice = notices
+            .iter()
+            .find(|(_, tags, _)| {
+                tags.as_array().is_some_and(|ts| {
+                    ts.iter().any(|t| {
+                        t.as_array().is_some_and(|t| {
+                            t.first().and_then(|v| v.as_str()) == Some("e")
+                                && t.get(1).and_then(|v| v.as_str()) == Some(root_hex.as_str())
+                        })
+                    })
+                })
+            })
+            .expect("kind:47012 notice stored for the thread");
+        assert_eq!(
+            notice.0,
+            state.relay_keypair.public_key().to_bytes().to_vec(),
+            "canon notice must be relay-signed"
+        );
+        let body: serde_json::Value = serde_json::from_str(&notice.2).expect("notice JSON");
+        assert_eq!(body["outcome"].as_str(), Some("no_repo"));
 
         // Admin archives; only the workspace Owner may reopen from storage.
         let archive = transition(&ch_admin, "archived", None);

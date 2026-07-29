@@ -93,6 +93,12 @@ pub struct WorkThreadRecord {
     /// When the overdue sweep last emitted a kind:47011 notice, if it has.
     /// Cleared when the deadline is edited so a new deadline can go overdue.
     pub overdue_notified_at: Option<DateTime<Utc>>,
+    /// When the canonicalize job claimed this thread (once-only). Re-armed
+    /// by a new close-with-canonicalize transition.
+    pub canonicalized_at: Option<DateTime<Utc>>,
+    /// Recorded canonicalization outcome (`merged`, `unchanged`, `no_repo`,
+    /// `no_checkpoint`, `commit_missing`, `conflict`, `error:...`).
+    pub canonicalize_outcome: Option<String>,
 }
 
 /// Parameters for creating a work-thread projection row.
@@ -147,7 +153,8 @@ pub async fn get_work_thread(
         r#"
         SELECT community_id, thread_id, channel_id, goal, deadline, dri_pubkey,
                status::text AS status, canonicalize_on_close, created_by,
-               created_at, updated_at, closed_at, overdue_notified_at
+               created_at, updated_at, closed_at, overdue_notified_at,
+               canonicalized_at, canonicalize_outcome
         FROM work_threads
         WHERE community_id = $1 AND thread_id = $2
         "#,
@@ -172,7 +179,8 @@ pub async fn list_work_threads(
         r#"
         SELECT community_id, thread_id, channel_id, goal, deadline, dri_pubkey,
                status::text AS status, canonicalize_on_close, created_by,
-               created_at, updated_at, closed_at, overdue_notified_at
+               created_at, updated_at, closed_at, overdue_notified_at,
+               canonicalized_at, canonicalize_outcome
         FROM work_threads
         WHERE community_id = $1 AND channel_id = $2
           AND ($3::text IS NULL OR status = $3::work_thread_status)
@@ -247,6 +255,10 @@ pub async fn transition_work_thread(
         SET status     = $4::work_thread_status,
             canonicalize_on_close = COALESCE($5, canonicalize_on_close),
             closed_at  = CASE WHEN $4 = 'closed' THEN NOW() ELSE closed_at END,
+            canonicalized_at = CASE WHEN $4 = 'closed' AND COALESCE($5, FALSE)
+                                    THEN NULL ELSE canonicalized_at END,
+            canonicalize_outcome = CASE WHEN $4 = 'closed' AND COALESCE($5, FALSE)
+                                        THEN NULL ELSE canonicalize_outcome END,
             updated_at = NOW()
         WHERE community_id = $1 AND thread_id = $2
           AND status = $3::work_thread_status
@@ -271,7 +283,8 @@ pub async fn list_overdue_work_threads(pool: &PgPool, limit: i64) -> Result<Vec<
         r#"
         SELECT community_id, thread_id, channel_id, goal, deadline, dri_pubkey,
                status::text AS status, canonicalize_on_close, created_by,
-               created_at, updated_at, closed_at, overdue_notified_at
+               created_at, updated_at, closed_at, overdue_notified_at,
+               canonicalized_at, canonicalize_outcome
         FROM work_threads
         WHERE deadline IS NOT NULL
           AND deadline < NOW()
@@ -316,6 +329,83 @@ pub async fn claim_overdue_notification(
     Ok(claimed > 0)
 }
 
+/// Claim a thread's canonicalization (TOCTOU-safe once-only): stamps
+/// `canonicalized_at` only if the thread is closed with the flag set and
+/// unclaimed. `Ok(false)` = lost the race or nothing to do.
+pub async fn claim_canonicalization(
+    pool: &PgPool,
+    community_id: CommunityId,
+    thread_id: &[u8],
+) -> Result<bool> {
+    let claimed = sqlx::query(
+        r#"
+        UPDATE work_threads
+        SET canonicalized_at = NOW()
+        WHERE community_id = $1 AND thread_id = $2
+          AND status = 'closed'
+          AND canonicalize_on_close
+          AND canonicalized_at IS NULL
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(thread_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(claimed > 0)
+}
+
+/// Record the canonicalization outcome for operators and the kind:47012
+/// notice. Only meaningful after a successful claim.
+pub async fn record_canonicalize_outcome(
+    pool: &PgPool,
+    community_id: CommunityId,
+    thread_id: &[u8],
+    outcome: &str,
+) -> Result<bool> {
+    let updated = sqlx::query(
+        r#"
+        UPDATE work_threads
+        SET canonicalize_outcome = $3
+        WHERE community_id = $1 AND thread_id = $2
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(thread_id)
+    .bind(outcome)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(updated > 0)
+}
+
+/// List closed, flag-set, unclaimed threads — the canonicalize crash-recovery
+/// sweep's work list, across all communities.
+pub async fn list_pending_canonicalizations(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<WorkThreadRecord>> {
+    let limit = limit.clamp(1, 1000);
+    let rows = sqlx::query(
+        r#"
+        SELECT community_id, thread_id, channel_id, goal, deadline, dri_pubkey,
+               status::text AS status, canonicalize_on_close, created_by,
+               created_at, updated_at, closed_at, overdue_notified_at,
+               canonicalized_at, canonicalize_outcome
+        FROM work_threads
+        WHERE status = 'closed'
+          AND canonicalize_on_close
+          AND canonicalized_at IS NULL
+        ORDER BY closed_at ASC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(row_to_record).collect()
+}
+
 fn row_to_record(row: sqlx::postgres::PgRow) -> Result<WorkThreadRecord> {
     let community_id: Uuid = row.try_get("community_id")?;
     let status_str: String = row.try_get("status")?;
@@ -333,6 +423,8 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> Result<WorkThreadRecord> {
         updated_at: row.try_get("updated_at")?,
         closed_at: row.try_get("closed_at")?,
         overdue_notified_at: row.try_get("overdue_notified_at")?,
+        canonicalized_at: row.try_get("canonicalized_at")?,
+        canonicalize_outcome: row.try_get("canonicalize_outcome")?,
     })
 }
 
@@ -711,5 +803,181 @@ mod pg_tests {
         assert!(!claim_overdue_notification(&pool, community, &thread_id)
             .await
             .expect("closed thread must not claim"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn canonicalize_claim_is_once_and_rearms_on_reclose() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let channel_id = make_channel(&pool, community).await;
+        let thread_id = vec![0x44u8; 32];
+        let created_by = vec![0xaau8; 32];
+
+        assert!(create_work_thread(
+            &pool,
+            CreateWorkThreadParams {
+                community_id: community,
+                thread_id: &thread_id,
+                channel_id,
+                goal: "canon me",
+                deadline: None,
+                dri_pubkey: None,
+                created_by: &created_by,
+            },
+        )
+        .await
+        .expect("create thread"));
+
+        // Open threads never claim, flag or not.
+        assert!(!claim_canonicalization(&pool, community, &thread_id)
+            .await
+            .expect("open thread must not claim"));
+
+        // Close WITHOUT the flag: still no claim.
+        assert!(transition_work_thread(
+            &pool,
+            community,
+            &thread_id,
+            WorkThreadStatus::Open,
+            WorkThreadStatus::Ready,
+            None,
+        )
+        .await
+        .expect("open → ready"));
+        assert!(transition_work_thread(
+            &pool,
+            community,
+            &thread_id,
+            WorkThreadStatus::Ready,
+            WorkThreadStatus::Closed,
+            None,
+        )
+        .await
+        .expect("ready → closed (no canonicalize)"));
+        assert!(!claim_canonicalization(&pool, community, &thread_id)
+            .await
+            .expect("unflagged close must not claim"));
+        let pending = list_pending_canonicalizations(&pool, 100)
+            .await
+            .expect("list");
+        assert!(!pending
+            .iter()
+            .any(|t| t.community_id == community && t.thread_id == thread_id));
+
+        // Reopen (via archive) and re-close WITH the flag: claim works once.
+        assert!(transition_work_thread(
+            &pool,
+            community,
+            &thread_id,
+            WorkThreadStatus::Closed,
+            WorkThreadStatus::Archived,
+            None,
+        )
+        .await
+        .expect("closed → archived"));
+        assert!(transition_work_thread(
+            &pool,
+            community,
+            &thread_id,
+            WorkThreadStatus::Archived,
+            WorkThreadStatus::Open,
+            None,
+        )
+        .await
+        .expect("archived → open"));
+        assert!(transition_work_thread(
+            &pool,
+            community,
+            &thread_id,
+            WorkThreadStatus::Open,
+            WorkThreadStatus::Ready,
+            None,
+        )
+        .await
+        .expect("open → ready again"));
+        assert!(transition_work_thread(
+            &pool,
+            community,
+            &thread_id,
+            WorkThreadStatus::Ready,
+            WorkThreadStatus::Closed,
+            Some(true),
+        )
+        .await
+        .expect("ready → closed with canonicalize"));
+        let pending = list_pending_canonicalizations(&pool, 100)
+            .await
+            .expect("list pending");
+        assert!(pending
+            .iter()
+            .any(|t| t.community_id == community && t.thread_id == thread_id));
+        assert!(claim_canonicalization(&pool, community, &thread_id)
+            .await
+            .expect("first claim"));
+        assert!(!claim_canonicalization(&pool, community, &thread_id)
+            .await
+            .expect("second claim must lose"));
+        assert!(
+            record_canonicalize_outcome(&pool, community, &thread_id, "no_repo")
+                .await
+                .expect("record outcome")
+        );
+        let thread = get_work_thread(&pool, community, &thread_id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(thread.canonicalize_outcome.as_deref(), Some("no_repo"));
+
+        // Reopen → re-close with the flag re-arms claim AND clears outcome.
+        assert!(transition_work_thread(
+            &pool,
+            community,
+            &thread_id,
+            WorkThreadStatus::Closed,
+            WorkThreadStatus::Archived,
+            None,
+        )
+        .await
+        .expect("archive again"));
+        assert!(transition_work_thread(
+            &pool,
+            community,
+            &thread_id,
+            WorkThreadStatus::Archived,
+            WorkThreadStatus::Open,
+            None,
+        )
+        .await
+        .expect("reopen again"));
+        assert!(transition_work_thread(
+            &pool,
+            community,
+            &thread_id,
+            WorkThreadStatus::Open,
+            WorkThreadStatus::Ready,
+            None,
+        )
+        .await
+        .expect("ready again"));
+        assert!(transition_work_thread(
+            &pool,
+            community,
+            &thread_id,
+            WorkThreadStatus::Ready,
+            WorkThreadStatus::Closed,
+            Some(true),
+        )
+        .await
+        .expect("re-close with canonicalize"));
+        let thread = get_work_thread(&pool, community, &thread_id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert!(thread.canonicalized_at.is_none(), "re-close must re-arm");
+        assert!(thread.canonicalize_outcome.is_none(), "outcome cleared");
+        assert!(claim_canonicalization(&pool, community, &thread_id)
+            .await
+            .expect("re-armed claim"));
     }
 }

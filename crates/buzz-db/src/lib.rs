@@ -2948,6 +2948,34 @@ impl Db {
         work_thread::claim_overdue_notification(&self.pool, community_id, thread_id).await
     }
 
+    /// Claim a thread's canonicalization (TOCTOU-safe once-only).
+    pub async fn claim_canonicalization(
+        &self,
+        community_id: CommunityId,
+        thread_id: &[u8],
+    ) -> Result<bool> {
+        work_thread::claim_canonicalization(&self.pool, community_id, thread_id).await
+    }
+
+    /// Record the canonicalization outcome for a claimed thread.
+    pub async fn record_canonicalize_outcome(
+        &self,
+        community_id: CommunityId,
+        thread_id: &[u8],
+        outcome: &str,
+    ) -> Result<bool> {
+        work_thread::record_canonicalize_outcome(&self.pool, community_id, thread_id, outcome).await
+    }
+
+    /// List closed, canonicalize-flagged, unclaimed threads (crash-recovery
+    /// sweep work list, across all communities).
+    pub async fn list_pending_canonicalizations(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<work_thread::WorkThreadRecord>> {
+        work_thread::list_pending_canonicalizations(&self.pool, limit).await
+    }
+
     /// Create an approval request.
     pub async fn create_approval(&self, params: workflow::CreateApprovalParams<'_>) -> Result<()> {
         workflow::create_approval(&self.pool, params).await
