@@ -176,6 +176,9 @@ enum Cmd {
     /// Draft owner-reviewed agent creation and updates
     #[command(subcommand)]
     Agents(AgentsCmd),
+    /// List, show, grant, and deny agent permission approvals
+    #[command(subcommand)]
+    Approvals(ApprovalsCmd),
     /// Send, read, search, and manage messages
     #[command(subcommand)]
     Messages(MessagesCmd),
@@ -850,6 +853,49 @@ pub enum UsersCmd {
         /// Remove your status entirely
         #[arg(long, conflicts_with_all = ["text", "emoji"])]
         clear: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ApprovalsCmd {
+    /// List permission requests visible to you
+    List {
+        /// Filter by status: pending, granted, denied, cancelled, expired
+        #[arg(long)]
+        status: Option<String>,
+        /// Filter to one channel UUID
+        #[arg(long)]
+        channel: Option<String>,
+        /// Maximum rows (default 200)
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Show one permission request
+    Show {
+        /// Request UUID
+        #[arg(long)]
+        request: String,
+    },
+    /// Grant a permission request (signs a kind:46030 command)
+    #[command(
+        after_help = "Examples:\n  buzz approvals grant --request <UUID>\n  buzz approvals grant --request <64-hex-token-hash> --note 'looks safe'"
+    )]
+    Grant {
+        /// Request UUID, or the 64-char hex token hash from the kind:46010 event
+        #[arg(long)]
+        request: String,
+        /// Optional note recorded with the decision
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Deny a permission request (signs a kind:46031 command)
+    Deny {
+        /// Request UUID, or the 64-char hex token hash from the kind:46010 event
+        #[arg(long)]
+        request: String,
+        /// Optional note recorded with the decision
+        #[arg(long)]
+        note: Option<String>,
     },
 }
 
@@ -1789,6 +1835,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Emoji(sub) => commands::emoji::dispatch(sub, &client).await,
         Cmd::Dms(sub) => commands::dms::dispatch(sub, &client).await,
         Cmd::Users(sub) => commands::users::dispatch(sub, &client, &cli.format).await,
+        Cmd::Approvals(sub) => commands::approvals::dispatch(sub, &client).await,
         Cmd::Workflows(sub) => commands::workflows::dispatch(sub, &client).await,
         Cmd::Feed(sub) => commands::feed::dispatch(sub, &client, &cli.format).await,
         Cmd::Social(sub) => commands::social::dispatch(sub, &client).await,
@@ -1844,6 +1891,7 @@ mod tests {
     fn command_inventory_is_stable() {
         let expected_groups: Vec<&str> = vec![
             "agents",
+            "approvals",
             "canvas",
             "channels",
             "dms",
@@ -1914,6 +1962,10 @@ mod tests {
                 "draft-update",
                 "unarchive"
             ]
+        );
+        assert_eq!(
+            names(&cmd, "approvals"),
+            vec!["deny", "grant", "list", "show"]
         );
         assert_eq!(
             names(&cmd, "messages"),
