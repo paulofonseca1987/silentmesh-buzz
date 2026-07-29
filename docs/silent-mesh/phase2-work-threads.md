@@ -217,6 +217,71 @@ When a repo has ACLs and the path list is unusable — git failed
 (`!PATHS_TRUNCATED`), or an older hook sent no list at all — the endpoint
 **fails closed** rather than guessing.
 
+## 8. Agent worktree engine + auto-checkpoints (buzz-acp)
+
+The final Phase 2 slice closes the loop between an agent's turn and the
+thread's git trail: a work-thread agent turn runs in a **per-thread git
+worktree** of the channel's bound repo, and the harness commits + pushes +
+emits a kind:47010 checkpoint at turn end (replacing the manual
+`buzz threads checkpoint`).
+
+**What shipped this slice — the engine.** `crates/buzz-acp/src/worktree.rs`
+(`pub mod`) is the self-contained, tested git engine:
+
+- **`ThreadWorktrees`**: clones the channel repo once under
+  `<root>/<channel>/repo.git` (the clone is run **with** the NIP-98 auth
+  `-c` flags so it authenticates against the relay's gated forge, not a
+  plain clone that would 401), and `git worktree add`s a per-thread branch
+  `sm/thread/<root-short>` at `<root>/<channel>/wt/<short>`. Idempotent:
+  a present `.git` means the authenticated clone succeeded; `worktree
+  prune` clears stale registrations so an externally-deleted worktree
+  re-provisions; an empty channel repo (unborn HEAD) is a clean soft error,
+  not a broken worktree.
+- **`checkpoint`**: `git add -A`; a clean tree returns `NothingToCommit`;
+  otherwise commit (signing/hooks pinned off; identity per-invocation),
+  push the thread branch, return the pushed oid. A push failure is an
+  `Err` so the caller suppresses the 47010 (a checkpoint must name a
+  fetchable commit).
+- **`push_auth_config`**: the `git-credential-nostr` NIP-98 scheme
+  (`credential.useHttpPath=true`, a **0600-on-create** keyfile holding the
+  agent secret, `nostr.authtag` for the NIP-OA owner attestation) — the
+  same scheme `buzz-dev-mcp`'s shim builds, scoped to one repo. Pushes land
+  on `sm/thread/*`, clear of the `refs/heads/main` protection rule the
+  channel repo's 30617 declares.
+- **Hardening**: every git subprocess has a 120 s wall-clock timeout
+  (`kill_on_drop`), and the environment neutralizes both system
+  (`GIT_CONFIG_NOSYSTEM`) and user (`GIT_CONFIG_GLOBAL=/dev/null`) config
+  so a host `commit.gpgsign`/`core.hooksPath`/`credential.helper` can't
+  silently break checkpoints. All best-effort, mirroring
+  canonicalize-on-close: any git failure logs and skips.
+
+The pure helpers (`thread_branch`, `thread_scope_id`, `forge_http_base`/
+`url_host`, `repo_binding_from_events`/`event_kind_by_id`/
+`is_work_thread_root_kind`, `push_auth_config`) have unit tests; the git
+lifecycle (authenticated provision → worktree add → clean-skip →
+dirty-commit-and-push → idempotent re-entry → re-provision after external
+deletion → empty-repo soft-fail) is exercised end to end against a **local
+bare remote** by the gated
+`worktree::probe_tests::provision_commit_push_roundtrip`
+(`BUZZ_ACP_WORKTREE_PROBE=1 cargo test -p buzz-acp --lib worktree::probe_tests -- --ignored`).
+
+**Deferred to a dedicated follow-up — the harness wiring.** Binding the
+agent's ACP session cwd to the worktree and firing `checkpoint` at
+end-of-turn was prototyped and put through the adversarial review, which
+surfaced ~20 confirmed defects concentrated in two layers that **cannot be
+validated without a live agent + relay**: (a) the pool's session model —
+work-thread turns need their own session (own cwd), which collides with
+the channel-keyed `invalidate`/rotation/affinity/GC logic and needs a
+session-model refactor, not a bolted-on second map; and (b) the resolution
+path — trusting any author's kind:30617 for the repo binding is a
+redirection hole that needs the relay-owner pubkey resolved first. Rather
+than ship confirmed-broken wiring (the prototype's provisioning clone
+was even unauthenticated → always 401 live), the wiring is a separate
+slice built against a live harness. The tested engine is the durable
+substrate it will call.
+
+## 9. Known limitations
+
 Known limitations shared with upstream patterns (recorded 2f review):
 
 - **Projection-creation side effects are post-storage and best-effort**

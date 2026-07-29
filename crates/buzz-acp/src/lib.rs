@@ -12,6 +12,13 @@ mod queue;
 mod relay;
 mod setup_mode;
 mod usage;
+/// silent-mesh: work-thread git worktree engine (Phase 2). The provisioning,
+/// end-of-turn checkpoint, and NIP-98 push-auth mechanics live here as a
+/// self-contained, tested library; the harness integration that calls it
+/// (per-thread session cwd + the turn-end hook) is a separate slice that
+/// needs live-agent validation. `pub` so the crate exposes it as API while
+/// that wiring is built.
+pub mod worktree;
 
 pub use usage::TurnUsage;
 

@@ -54,6 +54,19 @@ fold's `(created_at, id)` tie-break let a client command beat a
 same-second relay notice, so a thread the projection had archived kept
 rendering as `ready`. Notices are now surfaced and win same-second ties.
 
+**Phase 2 (final) — buzz-acp worktree engine.** Shipped the tested git
+engine (`crates/buzz-acp/src/worktree.rs`, `pub mod`): `ThreadWorktrees`
+(authenticated clone of the channel repo + per-thread `sm/thread/<short>`
+worktree, idempotent with prune/empty-repo soft-fail), `checkpoint`
+(add/commit/skip-if-clean/push → oid), `push_auth_config` (NIP-98
+`git-credential-nostr` scheme, 0600-on-create keyfile), plus pure helpers.
+Every git op has a 120 s timeout and runs with system+user gitconfig
+neutralized; all best-effort. Covered by the gated
+`worktree::probe_tests` against a local bare remote (authenticated
+provision → worktree → clean-skip → commit+push → idempotent re-entry →
+re-provision-after-deletion → empty-repo soft-fail) + unit tests on the
+helpers. **The harness wiring is NOT shipped** — see next-slices #1.
+
 **Restriction-gate fix (post-2f review).** Command kinds
 (47001/47002/47021, DM, workflow, approval) are routed *after* the
 community ban/timeout write-block in ingest, not before — a timed-out
@@ -160,13 +173,33 @@ serialize so exactly one winner survives) and emits kind:47013 notices.
   `.so.3`, then run gates with `OPENSSL_DIR=<prefix>`. Beware masked
   pipeline exit codes (`cargo … | tail` reports tail's status).
 
-## Next slices (roadmap Phase 2 remainder, then Phase 3+)
+## Next slices (Phase 3+)
 
-1. **buzz-acp worktree binding**: align agent workspaces onto thread
-   worktrees; emit kind:47010 checkpoints automatically at turn end
-   (today checkpoints are CLI/manual).
-2. Phase 3 (model plane) per roadmap — Phase 2 is complete and its
-   exit criterion runs green from buzz-cli.
+Phase 2's scope items (2a–2h) all shipped and the exit criterion runs
+green from buzz-cli. The buzz-acp **worktree engine** landed as the final
+slice; its **harness wiring** is the one remaining Phase-2 follow-up.
+
+1. **buzz-acp worktree wiring** (engine is done — `worktree.rs`, tested;
+   see phase2-work-threads.md §8). Bind a work-thread turn's ACP session
+   cwd to `ThreadWorktrees::ensure_worktree(...)` and call `checkpoint` +
+   emit 47010 at end of turn. Two things the adversarial review proved
+   this needs and that the deferred prototype got wrong:
+   - **A session-model change, not a second map.** Work-thread turns need
+     their own session (own cwd), but the pool's `invalidate`/rotation/
+     `try_claim` affinity/channel-removal GC are all channel-keyed; a
+     bolt-on `thread_sessions` map desynced from all of them (retained a
+     broken session while dropping the healthy channel one; never reset the
+     shared turn counter → every-turn rotation; leaked entries on channel
+     removal). Do it as a proper effective-session-key refactor.
+   - **Verify the 30617 author.** The repo binding must be resolved from
+     the announcement signed by the *known relay owner*, not any author
+     with a matching `d` tag (redirection hole). Resolve the relay pubkey
+     first (NIP-11 or a startup fetch).
+   Must be validated against a **live** claude-code turn in a 47000-rooted
+   thread pushing to a running relay's forge — the whole value is that
+   round trip, unexercisable in the dev sandbox.
+2. Phase 3 (model plane) per roadmap: tier-aware router, per-request
+   attribution, local serving on the GPUs, TEE spike, native harness.
 
 ## Suggested kickoff prompt for a fresh session
 
