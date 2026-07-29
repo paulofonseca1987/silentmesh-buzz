@@ -451,6 +451,28 @@ pub fn resolve_step_templates(
     }
 }
 
+/// Details of an approval gate that suspended execution (WF-08).
+///
+/// Carried from the `request_approval` step to the caller so it can persist
+/// the pending-approval record, park the run in `waiting_approval`, and
+/// notify approvers (kind:46010).
+#[derive(Debug, Clone)]
+pub struct PendingApproval {
+    /// Raw (unhashed) approval token. Stored hashed (SHA-256) in
+    /// `workflow_approvals`; the raw value is surfaced to approvers so they
+    /// can grant/deny (`buzz workflows approve <token>`).
+    pub token: String,
+    /// ID of the `request_approval` step that suspended.
+    pub step_id: String,
+    /// Who may approve — the step's `from` field, templates resolved.
+    pub approver_spec: String,
+    /// Message shown to the approver, templates resolved.
+    pub message: String,
+    /// Seconds until the approval expires, from the step's `timeout`
+    /// (default 24h).
+    pub expires_in_secs: u64,
+}
+
 /// Result of dispatching a single step action.
 #[derive(Debug)]
 pub enum StepResult {
@@ -458,8 +480,8 @@ pub enum StepResult {
     Completed(JsonValue),
     /// Step requests suspension (approval gate). Execution must pause.
     Suspended {
-        /// Token used to resume or reject this approval gate.
-        approval_token: String,
+        /// The approval gate details used to persist and announce the gate.
+        approval: PendingApproval,
     },
     /// Step was skipped due to `if:` condition being false.
     Skipped,
@@ -658,13 +680,19 @@ pub async fn dispatch_action(
                 "RequestApproval from={from} timeout={timeout_str}: {message}"
             );
 
+            let expires_in_secs = parse_duration_secs(timeout_str)?;
             let token = generate_approval_token(run_id, step_id);
 
-            // TODO (WF-08): create approval record in DB, emit kind:46010.
-            // For now, return Suspended with the token so the caller can persist state.
-
+            // WF-08: the caller (`WorkflowEngine::finalize_run`) persists the
+            // approval record, parks the run, and emits kind:46010.
             Ok(StepResult::Suspended {
-                approval_token: token,
+                approval: PendingApproval {
+                    token,
+                    step_id: step_id.to_owned(),
+                    approver_spec: from.clone(),
+                    message: message.clone(),
+                    expires_in_secs,
+                },
             })
         }
 
@@ -942,7 +970,7 @@ async fn add_reaction_impl(message_id: &str, emoji: &str) -> Result<JsonValue, W
 pub struct ExecutionResult {
     /// Set when execution suspended at a `RequestApproval` step.
     /// `None` means the run completed normally.
-    pub approval_token: Option<String>,
+    pub pending_approval: Option<PendingApproval>,
     /// Index of the step that suspended (or the total step count on completion).
     pub step_index: usize,
     /// Accumulated step outputs at the point of suspension or completion.
@@ -1183,15 +1211,15 @@ async fn execute_steps(
                 }));
                 step_outputs.insert(step.id.clone(), output);
             }
-            StepResult::Suspended { approval_token } => {
+            StepResult::Suspended { approval } => {
                 info!(
                     run_id = %run_id, step = %step.id,
                     "Step suspended — awaiting approval (token: <redacted>)"
                 );
-                // Return the token and current state so the caller can persist the
-                // approval record and update the run's execution trace.
+                // Return the gate details and current state so the caller can
+                // persist the approval record and update the run's execution trace.
                 return Ok(ExecutionResult {
-                    approval_token: Some(approval_token),
+                    pending_approval: Some(approval),
                     step_index: i,
                     step_outputs,
                     trace,
@@ -1209,7 +1237,7 @@ async fn execute_steps(
 
     info!(run_id = %run_id, "Workflow run completed");
     Ok(ExecutionResult {
-        approval_token: None,
+        pending_approval: None,
         step_index: def.steps.len(),
         step_outputs,
         trace,
@@ -1833,5 +1861,98 @@ mod tests {
             resolve_send_message_channel(Some(&override_channel_id.to_string()), "", None)
                 .expect("override should be accepted");
         assert_eq!(resolved, override_channel_id.to_string());
+    }
+
+    /// A lazily-connected engine — the `request_approval` dispatch branch
+    /// never touches the DB, so no live Postgres is needed.
+    fn lazy_engine() -> WorkflowEngine {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://buzz:unused@127.0.0.1:1/buzz")
+            .expect("lazy pool");
+        WorkflowEngine::new(
+            buzz_db::Db::from_pool(pool),
+            crate::WorkflowConfig::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn request_approval_dispatch_carries_gate_details() {
+        let engine = lazy_engine();
+        let action = ActionDef::RequestApproval {
+            from: "any".to_owned(),
+            message: "Approve?".to_owned(),
+            timeout: None,
+        };
+        let result = dispatch_action(
+            "gate",
+            &action,
+            &engine,
+            CommunityId::from_uuid(Uuid::new_v4()),
+            Uuid::new_v4(),
+            &make_trigger(),
+        )
+        .await
+        .expect("dispatch");
+        match result {
+            StepResult::Suspended { approval } => {
+                assert_eq!(approval.step_id, "gate");
+                assert_eq!(approval.approver_spec, "any");
+                assert_eq!(approval.message, "Approve?");
+                assert_eq!(
+                    approval.expires_in_secs,
+                    24 * 3600,
+                    "timeout defaults to 24h"
+                );
+                assert!(!approval.token.is_empty());
+            }
+            other => panic!("expected Suspended, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_approval_dispatch_parses_explicit_timeout() {
+        let engine = lazy_engine();
+        let action = ActionDef::RequestApproval {
+            from: "any".to_owned(),
+            message: "Approve?".to_owned(),
+            timeout: Some("4h".to_owned()),
+        };
+        let result = dispatch_action(
+            "gate",
+            &action,
+            &engine,
+            CommunityId::from_uuid(Uuid::new_v4()),
+            Uuid::new_v4(),
+            &make_trigger(),
+        )
+        .await
+        .expect("dispatch");
+        match result {
+            StepResult::Suspended { approval } => {
+                assert_eq!(approval.expires_in_secs, 4 * 3600);
+            }
+            other => panic!("expected Suspended, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_approval_dispatch_rejects_bad_timeout() {
+        let engine = lazy_engine();
+        let action = ActionDef::RequestApproval {
+            from: "any".to_owned(),
+            message: "Approve?".to_owned(),
+            timeout: Some("soonish".to_owned()),
+        };
+        let err = dispatch_action(
+            "gate",
+            &action,
+            &engine,
+            CommunityId::from_uuid(Uuid::new_v4()),
+            Uuid::new_v4(),
+            &make_trigger(),
+        )
+        .await
+        .expect_err("bogus timeout must fail the step");
+        assert!(matches!(err, WorkflowError::InvalidDefinition(_)));
     }
 }

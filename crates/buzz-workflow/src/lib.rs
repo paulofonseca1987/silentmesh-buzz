@@ -35,9 +35,9 @@ pub mod error;
 pub mod executor;
 pub mod schema;
 
-pub use action_sink::{ActionSink, ActionSinkError};
+pub use action_sink::{ActionSink, ActionSinkError, ApprovalRequestNotice};
 pub use error::{PartialProgress, WorkflowError};
-pub use executor::ExecutionResult;
+pub use executor::{ExecutionResult, PendingApproval};
 pub use schema::{ActionDef, Step, TriggerDef, WorkflowDef};
 
 use std::collections::HashMap;
@@ -46,7 +46,7 @@ use std::sync::OnceLock;
 
 use buzz_core::kind::{event_kind_u32, is_workflow_execution_kind, KIND_REACTION};
 use buzz_core::tenant::CommunityId;
-use buzz_db::workflow::RunStatus;
+use buzz_db::workflow::{CreateApprovalParams, RunStatus};
 use buzz_db::Db;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -226,31 +226,17 @@ impl WorkflowEngine {
                 let trace_json = serde_json::Value::Array(full_trace);
                 let step_count = result.step_index as i32;
 
-                if result.approval_token.is_some() {
-                    // Approval gates are not yet implemented (WF-08).
-                    // Fail explicitly rather than creating unreachable WaitingApproval rows.
-                    tracing::warn!(
-                        run_id = %run_id,
-                        step_index = result.step_index,
-                        "Workflow hit approval gate — not yet implemented, marking as failed"
-                    );
-                    if let Err(e) = self
-                        .db
-                        .update_workflow_run(
-                            community_id,
-                            run_id,
-                            RunStatus::Failed,
-                            step_count,
-                            &trace_json,
-                            Some("approval gates not yet implemented — see WF-08"),
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            run_id = %run_id,
-                            "Failed to update run to Failed (approval gate): {e}"
-                        );
-                    }
+                if let Some(approval) = result.pending_approval {
+                    // WF-08: persist the approval gate — pending-approval row,
+                    // run parked in `waiting_approval`, kind:46010 emitted.
+                    self.suspend_run_for_approval(
+                        community_id,
+                        run_id,
+                        approval,
+                        step_count,
+                        &trace_json,
+                    )
+                    .await;
                 } else {
                     tracing::info!(run_id = %run_id, "Workflow run completed");
                     if let Err(e) = self
@@ -295,6 +281,177 @@ impl WorkflowEngine {
                     );
                 }
             }
+        }
+    }
+
+    /// Persist an approval gate for a run suspended at a `request_approval`
+    /// step (WF-08): create the pending-approval record, park the run in
+    /// `waiting_approval`, and emit the kind:46010 approval-requested event
+    /// into the workflow's channel.
+    ///
+    /// The DB writes are load-bearing — a failure marks the run `failed` so it
+    /// cannot hang in `running` with no approval to resolve it. The kind:46010
+    /// emission is best-effort: the approval row is the source of truth, so an
+    /// emission failure logs and leaves the run waiting.
+    async fn suspend_run_for_approval(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        approval: PendingApproval,
+        step_index: i32,
+        trace_json: &serde_json::Value,
+    ) {
+        // Approval TTL ceiling. Bounds the expiry arithmetic below (no
+        // overflow) and keeps a typo'd `timeout:` from parking a run forever.
+        const MAX_APPROVAL_TTL_SECS: u64 = 365 * 24 * 3600;
+
+        // Resolve the owning workflow (for the approval row and the channel
+        // to notify) through the run row — `finalize_run` callers don't
+        // carry it.
+        let workflow_id = match self.db.get_workflow_run(community_id, run_id).await {
+            Ok(run) => run.workflow_id,
+            Err(e) => {
+                self.mark_run_failed(
+                    community_id,
+                    run_id,
+                    step_index,
+                    trace_json,
+                    &format!("approval gate: failed to load run: {e}"),
+                )
+                .await;
+                return;
+            }
+        };
+        let workflow = match self.db.get_workflow(community_id, workflow_id).await {
+            Ok(w) => w,
+            Err(e) => {
+                self.mark_run_failed(
+                    community_id,
+                    run_id,
+                    step_index,
+                    trace_json,
+                    &format!("approval gate: failed to load workflow: {e}"),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let ttl_secs = approval.expires_in_secs.min(MAX_APPROVAL_TTL_SECS) as i64;
+        let expires_at = Utc::now() + chrono::Duration::seconds(ttl_secs);
+
+        if let Err(e) = self
+            .db
+            .create_approval(CreateApprovalParams {
+                community_id,
+                token: &approval.token,
+                workflow_id,
+                run_id,
+                step_id: &approval.step_id,
+                step_index,
+                approver_spec: &approval.approver_spec,
+                expires_at,
+            })
+            .await
+        {
+            self.mark_run_failed(
+                community_id,
+                run_id,
+                step_index,
+                trace_json,
+                &format!("approval gate: failed to create approval record: {e}"),
+            )
+            .await;
+            return;
+        }
+
+        if let Err(e) = self
+            .db
+            .update_workflow_run(
+                community_id,
+                run_id,
+                RunStatus::WaitingApproval,
+                step_index,
+                trace_json,
+                None,
+            )
+            .await
+        {
+            tracing::error!(
+                run_id = %run_id,
+                "Failed to update run to WaitingApproval: {e}"
+            );
+            return;
+        }
+        tracing::info!(
+            run_id = %run_id,
+            step = %approval.step_id,
+            "Workflow run suspended — waiting for approval"
+        );
+
+        // Announce the gate. Best-effort: the pending row above is the source
+        // of truth, and the grant/deny handlers resolve against it, not the
+        // event.
+        let Some(channel_id) = workflow.channel_id else {
+            tracing::warn!(
+                run_id = %run_id,
+                "workflow has no channel binding — approval-requested event (kind:46010) not emitted"
+            );
+            return;
+        };
+        let sink = match self.action_sink() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    "approval-requested event (kind:46010) not emitted: {e}"
+                );
+                return;
+            }
+        };
+        let notice = ApprovalRequestNotice {
+            workflow_id,
+            run_id,
+            step_id: approval.step_id,
+            step_index,
+            approver_spec: approval.approver_spec,
+            message: approval.message,
+            token: approval.token,
+            expires_at,
+        };
+        if let Err(e) = sink
+            .emit_approval_requested(community_id, &channel_id.to_string(), notice)
+            .await
+        {
+            tracing::warn!(
+                run_id = %run_id,
+                "approval-requested event (kind:46010) emission failed: {e}"
+            );
+        }
+    }
+
+    /// Mark a run `failed` with `reason`, logging (never propagating) DB errors.
+    async fn mark_run_failed(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        step_index: i32,
+        trace_json: &serde_json::Value,
+        reason: &str,
+    ) {
+        if let Err(e) = self
+            .db
+            .update_workflow_run(
+                community_id,
+                run_id,
+                RunStatus::Failed,
+                step_index,
+                trace_json,
+                Some(reason),
+            )
+            .await
+        {
+            tracing::error!(run_id = %run_id, "Failed to update run to Failed ({reason}): {e}");
         }
     }
 
@@ -1889,6 +2046,203 @@ steps:
             owner_runs.len(),
             1,
             "channel owner's call_webhook workflow fires"
+        );
+    }
+
+    /// WF-08: a `request_approval` step must park the run in
+    /// `waiting_approval`, create a pending approval row resolvable by the
+    /// raw token, and announce the gate through the action sink. Granting the
+    /// approval must be TOCTOU-safe, and resuming past the gate completes
+    /// the run.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn request_approval_parks_run_and_resumes_after_grant() {
+        use std::sync::Mutex;
+
+        type Recorded = (CommunityId, String, ApprovalRequestNotice);
+        struct RecordingSink {
+            notices: Mutex<Vec<Recorded>>,
+        }
+        impl ActionSink for RecordingSink {
+            fn send_message(
+                &self,
+                _community_id: CommunityId,
+                _channel_id: &str,
+                _text: &str,
+                _author_pubkey: &str,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<String, ActionSinkError>> + Send + '_>,
+            > {
+                Box::pin(async { Ok(String::new()) })
+            }
+            fn emit_approval_requested(
+                &self,
+                community_id: CommunityId,
+                channel_id: &str,
+                notice: ApprovalRequestNotice,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<String, ActionSinkError>> + Send + '_>,
+            > {
+                self.notices.lock().expect("notices lock").push((
+                    community_id,
+                    channel_id.to_owned(),
+                    notice,
+                ));
+                Box::pin(async { Ok(String::new()) })
+            }
+        }
+
+        let db = setup_db().await;
+        let creator = nostr::Keys::generate().public_key().to_bytes().to_vec();
+        let member = nostr::Keys::generate().public_key().to_bytes().to_vec();
+        let (community, channel_id) = setup_channel(&db, &creator, &member).await;
+
+        let def_json = serde_json::json!({
+            "name": "wf08-gate",
+            "trigger": {"on": "message_posted"},
+            "steps": [{
+                "id": "gate",
+                "action": "request_approval",
+                "from": "any",
+                "message": "Approve?",
+                "timeout": "4h",
+            }],
+            "enabled": true,
+        })
+        .to_string();
+        let workflow_id = db
+            .create_workflow(
+                community,
+                Some(channel_id),
+                &member,
+                "wf08-gate",
+                &def_json,
+                &[2u8; 32],
+            )
+            .await
+            .expect("create workflow");
+
+        let engine = Arc::new(WorkflowEngine::new(db.clone(), WorkflowConfig::default()));
+        let sink = Arc::new(RecordingSink {
+            notices: Mutex::new(Vec::new()),
+        });
+        engine.set_action_sink(Arc::clone(&sink) as Arc<dyn ActionSink>);
+
+        engine
+            .on_event(community, &message_event(channel_id))
+            .await
+            .expect("on_event");
+
+        // Execution is spawned — poll until the run parks at the gate.
+        let mut run = None;
+        for _ in 0..100 {
+            let runs = db
+                .list_workflow_runs(community, workflow_id, 10)
+                .await
+                .expect("list runs");
+            if let Some(r) = runs.first() {
+                if r.status == RunStatus::WaitingApproval {
+                    run = Some(r.clone());
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let run = run.expect("run must reach waiting_approval");
+        assert_eq!(run.current_step, 0, "suspended at the gate step");
+
+        // The pending approval row carries the step's parameters.
+        let approvals = db
+            .get_run_approvals(community, workflow_id, run.id)
+            .await
+            .expect("run approvals");
+        assert_eq!(approvals.len(), 1, "exactly one pending approval");
+        let row = &approvals[0];
+        assert_eq!(row.status, buzz_db::workflow::ApprovalStatus::Pending);
+        assert_eq!(row.step_id, "gate");
+        assert_eq!(row.step_index, 0);
+        assert_eq!(row.approver_spec, "any");
+        let ttl = row.expires_at - Utc::now();
+        assert!(
+            ttl > chrono::Duration::hours(3) && ttl <= chrono::Duration::hours(4),
+            "expiry must come from the step timeout (4h), got {ttl:?}"
+        );
+
+        // The sink was handed the announcement, and its raw token resolves to
+        // the same approval row (the DB stores only the hash).
+        let (notice_community, notice_channel, notice) = {
+            let notices = sink.notices.lock().expect("notices lock");
+            assert_eq!(notices.len(), 1, "exactly one kind:46010 announcement");
+            notices[0].clone()
+        };
+        assert_eq!(notice_community, community);
+        assert_eq!(notice_channel, channel_id.to_string());
+        assert_eq!(notice.workflow_id, workflow_id);
+        assert_eq!(notice.run_id, run.id);
+        assert_eq!(notice.step_id, "gate");
+        assert_eq!(notice.message, "Approve?");
+        let resolved = db
+            .get_approval(community, &notice.token)
+            .await
+            .expect("raw token must resolve to the approval row");
+        assert_eq!(resolved.run_id, run.id);
+
+        // Grant. A second decision on the same approval must conflict (TOCTOU).
+        let granted = db
+            .update_approval(
+                community,
+                &notice.token,
+                buzz_db::workflow::ApprovalStatus::Granted,
+                Some(&creator),
+                None,
+            )
+            .await
+            .expect("grant");
+        assert!(granted, "first decision succeeds");
+        let second = db
+            .update_approval(
+                community,
+                &notice.token,
+                buzz_db::workflow::ApprovalStatus::Denied,
+                Some(&creator),
+                None,
+            )
+            .await
+            .expect("second decision query");
+        assert!(
+            !second,
+            "second decision on the same approval must conflict"
+        );
+
+        // Resume past the gate — the run completes.
+        let def: WorkflowDef = serde_json::from_str(&def_json).expect("parse def");
+        let result = executor::execute_from_step(
+            &engine,
+            community,
+            run.id,
+            &def,
+            &executor::TriggerContext::default(),
+            1,
+            None,
+        )
+        .await;
+        engine
+            .finalize_run(
+                community,
+                run.id,
+                result,
+                run.execution_trace.as_array().cloned(),
+            )
+            .await;
+
+        let runs = db
+            .list_workflow_runs(community, workflow_id, 10)
+            .await
+            .expect("list runs after resume");
+        assert_eq!(
+            runs.first().expect("run exists").status,
+            RunStatus::Completed,
+            "granted gate must let the run complete"
         );
     }
 }

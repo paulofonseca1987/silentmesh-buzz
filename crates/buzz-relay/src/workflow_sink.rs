@@ -8,11 +8,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
-use buzz_core::kind::KIND_STREAM_MESSAGE;
+use buzz_core::kind::{KIND_STREAM_MESSAGE, KIND_WORKFLOW_APPROVAL_REQUESTED};
 use buzz_core::tenant::CommunityId;
-use buzz_workflow::action_sink::{ActionSink, ActionSinkError};
+use buzz_workflow::action_sink::{ActionSink, ActionSinkError, ApprovalRequestNotice};
 use chrono::Utc;
 use nostr::{EventBuilder, Kind, Tag};
+use sha2::{Digest, Sha256};
 use tracing::info;
 use uuid::Uuid;
 
@@ -354,6 +355,110 @@ impl ActionSink for RelayActionSink {
                     &stored_event,
                     kind_u32,
                     &author_pubkey_hex,
+                    None,
+                )
+                .await;
+            }
+
+            Ok(event_id_hex)
+        })
+    }
+
+    fn emit_approval_requested(
+        &self,
+        community_id: CommunityId,
+        channel_id: &str,
+        notice: ApprovalRequestNotice,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
+        let channel_id = channel_id.to_owned();
+
+        Box::pin(async move {
+            let state = self
+                .state
+                .upgrade()
+                .ok_or_else(|| ActionSinkError::Database("relay is shutting down".into()))?;
+
+            // Same tenant resolution as `send_message`: the run carries its
+            // owning community; the host is read back for labelling only.
+            let host = state
+                .db
+                .lookup_community_host(community_id)
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?
+                .ok_or_else(|| {
+                    ActionSinkError::Database(format!(
+                        "workflow run community {community_id} is not mapped to a host"
+                    ))
+                })?;
+            let tenant = buzz_core::tenant::TenantContext::resolved(community_id, host);
+
+            let channel_uuid = Uuid::parse_str(&channel_id)
+                .map_err(|e| ActionSinkError::InvalidInput(format!("invalid UUID: {e}")))?;
+            let channel_id_canonical = channel_uuid.to_string();
+
+            // `d` = hex(SHA-256(token)) — the same handle the kind:46030/46031
+            // grant/deny commands carry and the DB stores.
+            let token_hash_hex = hex::encode(Sha256::digest(notice.token.as_bytes()));
+
+            let mut tags = vec![
+                Tag::parse(["d", &token_hash_hex])
+                    .map_err(|e| ActionSinkError::EventBuild(format!("d tag: {e}")))?,
+                Tag::parse(["h", &channel_id_canonical])
+                    .map_err(|e| ActionSinkError::EventBuild(format!("h tag: {e}")))?,
+            ];
+
+            // A concrete-pubkey approver spec gets a `p` tag so the request
+            // lands in that user's "Needs Action" feed (populated from
+            // `event_mentions`, which is extracted from `p` tags on insert).
+            let spec = notice.approver_spec.trim();
+            if spec.len() == 64 && spec.chars().all(|c| c.is_ascii_hexdigit()) {
+                tags.push(
+                    Tag::parse(["p", &spec.to_ascii_lowercase()])
+                        .map_err(|e| ActionSinkError::EventBuild(format!("p tag: {e}")))?,
+                );
+            }
+
+            // The content carries the raw token: event delivery is
+            // membership-scoped, grant/deny stay authorization-checked
+            // server-side, and `buzz workflows approve <token>` needs it.
+            let content = serde_json::json!({
+                "workflow_id": notice.workflow_id,
+                "run_id": notice.run_id,
+                "step_id": notice.step_id,
+                "step_index": notice.step_index,
+                "from": notice.approver_spec,
+                "message": notice.message,
+                "token": notice.token,
+                "expires_at": notice.expires_at.to_rfc3339(),
+            });
+
+            let kind = Kind::Custom(KIND_WORKFLOW_APPROVAL_REQUESTED as u16);
+            let event = EventBuilder::new(kind, content.to_string())
+                .tags(tags)
+                .sign_with_keys(&state.relay_keypair)
+                .map_err(|e| ActionSinkError::EventBuild(format!("signing: {e}")))?;
+            let event_id_hex = event.id.to_hex();
+
+            info!(
+                event_id = %event_id_hex,
+                channel_id = %channel_id_canonical,
+                run_id = %notice.run_id,
+                "Workflow approval gate: posting kind {KIND_WORKFLOW_APPROVAL_REQUESTED} event"
+            );
+
+            let (stored_event, was_inserted) = state
+                .db
+                .insert_event(tenant.community(), &event, Some(channel_uuid))
+                .await
+                .map_err(|e| ActionSinkError::Database(e.to_string()))?;
+
+            if was_inserted {
+                let _ = dispatch_persistent_event(
+                    &tenant,
+                    &state,
+                    &stored_event,
+                    KIND_WORKFLOW_APPROVAL_REQUESTED,
+                    &state.relay_keypair.public_key().to_hex(),
                     None,
                 )
                 .await;
@@ -707,5 +812,110 @@ mod integration_tests {
             p_tag_targets.contains(&agent_hex.as_str()),
             "mentioned member {agent_hex} must be p-tagged so it wakes; got {p_tag_targets:?}"
         );
+    }
+
+    /// WF-08: `emit_approval_requested` must persist a kind:46010 event whose
+    /// `d` tag is the token hash the kind:46030/46031 grant/deny commands
+    /// reference, whose `p` tag routes a concrete approver to their "Needs
+    /// Action" feed, and whose content carries what an approver needs
+    /// (raw token, message, expiry).
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn emit_approval_requested_persists_correlated_46010() {
+        use sha2::{Digest, Sha256};
+
+        let state = test_state().await;
+
+        let owner = nostr::Keys::generate();
+        let owner_hex = owner.public_key().to_hex();
+        let approver_hex = nostr::Keys::generate().public_key().to_hex();
+
+        let host = format!("wf-appr-{}.example", uuid::Uuid::new_v4().simple());
+        let community = match state
+            .db
+            .create_community_with_owner(&host, &owner_hex)
+            .await
+            .expect("create community")
+        {
+            CreateCommunityWithOwnerResult::Created(rec) => rec.id,
+            other => panic!("expected fresh community, got {other:?}"),
+        };
+        let channel = state
+            .db
+            .create_channel(
+                community,
+                "wf-appr",
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                None,
+                &owner.public_key().to_bytes(),
+                None,
+            )
+            .await
+            .expect("create channel");
+
+        let sink = RelayActionSink::new(&state);
+        let token = uuid::Uuid::new_v4().to_string();
+        let expires_at = Utc::now() + chrono::Duration::hours(4);
+        let notice = ApprovalRequestNotice {
+            workflow_id: uuid::Uuid::new_v4(),
+            run_id: uuid::Uuid::new_v4(),
+            step_id: "gate".to_owned(),
+            step_index: 0,
+            approver_spec: approver_hex.clone(),
+            message: "Approve the deploy?".to_owned(),
+            token: token.clone(),
+            expires_at,
+        };
+        let event_id_hex = sink
+            .emit_approval_requested(community, &channel.id.to_string(), notice)
+            .await
+            .expect("emit kind:46010");
+
+        let id_bytes = nostr::EventId::from_hex(&event_id_hex)
+            .expect("event id")
+            .as_bytes()
+            .to_vec();
+        let stored = state
+            .db
+            .get_event_by_id(community, &id_bytes)
+            .await
+            .expect("query event")
+            .expect("event persisted");
+
+        assert_eq!(
+            u32::from(stored.event.kind.as_u16()),
+            KIND_WORKFLOW_APPROVAL_REQUESTED
+        );
+
+        let tag_value = |name: &str| -> Option<String> {
+            stored.event.tags.iter().find_map(|t| {
+                let s = t.as_slice();
+                if s.first().map(|v| v.as_str()) == Some(name) {
+                    s.get(1).map(|v| v.to_string())
+                } else {
+                    None
+                }
+            })
+        };
+        let expected_hash = hex::encode(Sha256::digest(token.as_bytes()));
+        assert_eq!(
+            tag_value("d").as_deref(),
+            Some(expected_hash.as_str()),
+            "d tag must be the token hash grant/deny commands reference"
+        );
+        assert_eq!(tag_value("h"), Some(channel.id.to_string()));
+        assert_eq!(
+            tag_value("p").as_deref(),
+            Some(approver_hex.as_str()),
+            "concrete approver must be p-tagged for the Needs Action feed"
+        );
+
+        let content: serde_json::Value =
+            serde_json::from_str(&stored.event.content).expect("content is JSON");
+        assert_eq!(content["token"].as_str(), Some(token.as_str()));
+        assert_eq!(content["message"].as_str(), Some("Approve the deploy?"));
+        assert_eq!(content["step_id"].as_str(), Some("gate"));
+        assert_eq!(content["from"].as_str(), Some(approver_hex.as_str()));
     }
 }

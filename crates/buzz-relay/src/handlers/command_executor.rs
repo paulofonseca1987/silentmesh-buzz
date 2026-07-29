@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use nostr::Event;
+use nostr::{Event, EventBuilder, Kind, Tag};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 use uuid::Uuid;
@@ -26,6 +26,7 @@ use buzz_workflow::executor::TriggerContext;
 use crate::state::AppState;
 use crate::webhook_secret;
 
+use super::event::dispatch_persistent_event;
 use super::ingest::{extract_channel_id, IngestAuth, IngestError, IngestResult};
 use super::side_effects::{
     emit_group_discovery_events, emit_membership_notification, emit_system_message,
@@ -1111,7 +1112,22 @@ async fn handle_approval_grant(
         .await
         .map_err(|e| IngestError::Internal(format!("error: commit transaction: {e}")))?;
 
-    // 6. Resume workflow execution (post-commit, async)
+    // 6. Emit the kind:46011 outcome record (post-commit, best-effort)
+    spawn_approval_outcome_event(
+        state,
+        tenant,
+        ApprovalOutcome {
+            outcome_kind: KIND_WORKFLOW_APPROVAL_GRANTED,
+            workflow_id: approval.workflow_id,
+            run_id: approval.run_id,
+            step_id: approval.step_id.clone(),
+            token_hash_hex,
+            command_event_id_hex: event.id.to_hex(),
+            decider_hex: self_hex,
+        },
+    );
+
+    // 7. Resume workflow execution (post-commit, async)
     let community_id = tenant.community();
     let run_id = approval.run_id;
     let workflow_id = approval.workflow_id;
@@ -1124,7 +1140,7 @@ async fn handle_approval_grant(
             .await;
     });
 
-    // 7. Return response
+    // 8. Return response
     Ok(IngestResult {
         event_id: event.id.to_hex(),
         accepted: true,
@@ -1222,7 +1238,22 @@ async fn handle_approval_deny(
         .await
         .map_err(|e| IngestError::Internal(format!("error: commit transaction: {e}")))?;
 
-    // 6. Cancel the workflow run (post-commit, async)
+    // 6. Emit the kind:46012 outcome record (post-commit, best-effort)
+    spawn_approval_outcome_event(
+        state,
+        tenant,
+        ApprovalOutcome {
+            outcome_kind: KIND_WORKFLOW_APPROVAL_DENIED,
+            workflow_id: approval.workflow_id,
+            run_id: approval.run_id,
+            step_id: approval.step_id.clone(),
+            token_hash_hex,
+            command_event_id_hex: event.id.to_hex(),
+            decider_hex: self_hex.clone(),
+        },
+    );
+
+    // 7. Cancel the workflow run (post-commit, async)
     let community_id = tenant.community();
     let run_id = approval.run_id;
     let pubkey_hex = self_hex.clone();
@@ -1261,7 +1292,7 @@ async fn handle_approval_deny(
         }
     });
 
-    // 7. Return response
+    // 8. Return response
     Ok(IngestResult {
         event_id: event.id.to_hex(),
         accepted: true,
@@ -1273,6 +1304,139 @@ async fn handle_approval_deny(
             })
         ),
     })
+}
+
+/// Post-commit, best-effort emission of the approval outcome record —
+/// kind:46011 (granted) / kind:46012 (denied) — into the workflow's channel.
+///
+/// The outcome correlates to the original kind:46010 request through the
+/// shared `d` token-hash tag and references the human-signed kind:46030/46031
+/// command via an `e` tag: the command's Schnorr signature is the "who
+/// approved what" proof; this relay-signed event is the visible outcome
+/// record. Failures are logged, never surfaced to the approver — the approval
+/// row already carries the decision.
+/// Data for one approval outcome record.
+struct ApprovalOutcome {
+    /// `KIND_WORKFLOW_APPROVAL_GRANTED` (46011) or `..._DENIED` (46012).
+    outcome_kind: u32,
+    workflow_id: Uuid,
+    run_id: Uuid,
+    step_id: String,
+    /// Hex of the stored token hash — the kind:46010 request's `d` tag.
+    token_hash_hex: String,
+    /// Event ID hex of the human-signed kind:46030/46031 command.
+    command_event_id_hex: String,
+    /// Pubkey hex of the human who decided.
+    decider_hex: String,
+}
+
+fn spawn_approval_outcome_event(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    outcome: ApprovalOutcome,
+) {
+    let state = Arc::clone(state);
+    let tenant = tenant.clone();
+    tokio::spawn(async move {
+        emit_approval_outcome_event(&state, &tenant, outcome).await;
+    });
+}
+
+/// Body of [`spawn_approval_outcome_event`], awaitable for tests.
+///
+/// Returns the emitted event ID hex, or `None` when nothing was emitted
+/// (channel-less workflow, build/persist failure — all logged).
+async fn emit_approval_outcome_event(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    outcome: ApprovalOutcome,
+) -> Option<String> {
+    let ApprovalOutcome {
+        outcome_kind,
+        workflow_id,
+        run_id,
+        step_id,
+        token_hash_hex,
+        command_event_id_hex,
+        decider_hex,
+    } = outcome;
+
+    let workflow = match state.db.get_workflow(tenant.community(), workflow_id).await {
+        Ok(w) => w,
+        Err(e) => {
+            warn!("approval outcome: failed to load workflow {workflow_id}: {e}");
+            return None;
+        }
+    };
+    // No channel to announce into — the approval row still carries the
+    // decision.
+    let channel_id = workflow.channel_id?;
+
+    let status = if outcome_kind == KIND_WORKFLOW_APPROVAL_GRANTED {
+        "granted"
+    } else {
+        "denied"
+    };
+    let content = serde_json::json!({
+        "workflow_id": workflow_id,
+        "run_id": run_id,
+        "step_id": step_id,
+        "status": status,
+        "approver": decider_hex,
+    });
+
+    let channel_str = channel_id.to_string();
+    let tags: Result<Vec<Tag>, _> = [
+        ["d", token_hash_hex.as_str()],
+        ["e", command_event_id_hex.as_str()],
+        ["h", channel_str.as_str()],
+    ]
+    .into_iter()
+    .map(Tag::parse)
+    .collect();
+    let tags = match tags {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("approval outcome: tag build failed: {e}");
+            return None;
+        }
+    };
+
+    let event = match EventBuilder::new(Kind::Custom(outcome_kind as u16), content.to_string())
+        .tags(tags)
+        .sign_with_keys(&state.relay_keypair)
+    {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("approval outcome: signing failed: {e}");
+            return None;
+        }
+    };
+    let event_id_hex = event.id.to_hex();
+
+    match state
+        .db
+        .insert_event(tenant.community(), &event, Some(channel_id))
+        .await
+    {
+        Ok((stored, true)) => {
+            let _ = dispatch_persistent_event(
+                tenant,
+                state,
+                &stored,
+                outcome_kind,
+                &state.relay_keypair.public_key().to_hex(),
+                None,
+            )
+            .await;
+            Some(event_id_hex)
+        }
+        Ok((_, false)) => Some(event_id_hex),
+        Err(e) => {
+            warn!("approval outcome: failed to persist kind {outcome_kind}: {e}");
+            None
+        }
+    }
 }
 
 /// Resume a suspended workflow run after an approval gate has been granted.
@@ -1367,4 +1531,186 @@ async fn resume_workflow_after_approval(
     engine
         .finalize_run(community_id, run_id, result, existing_trace)
         .await;
+}
+
+#[cfg(test)]
+mod approval_outcome_tests {
+    //! WF-08: the relay-signed kind:46011/46012 outcome record must land in
+    //! the workflow's channel, correlated to the request (`d` = token hash)
+    //! and to the human-signed command (`e` = command event id).
+    //!
+    //! Postgres-gated like the other DB-backed relay tests. Run with:
+    //!   `cargo test -p buzz-relay --lib approval_outcome -- --ignored`
+    use super::*;
+    use buzz_db::CreateCommunityWithOwnerResult;
+
+    /// Real-PG state mirroring `workflow_sink::integration_tests::test_state`.
+    async fn test_state() -> Arc<AppState> {
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.require_relay_membership = false;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (state, _audit_shutdown) = AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        Arc::new(state)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn approval_outcome_event_carries_correlation_tags() {
+        let state = test_state().await;
+
+        let owner = nostr::Keys::generate();
+        let owner_hex = owner.public_key().to_hex();
+
+        let host = format!("wf-outcome-{}.example", Uuid::new_v4().simple());
+        let community = match state
+            .db
+            .create_community_with_owner(&host, &owner_hex)
+            .await
+            .expect("create community")
+        {
+            CreateCommunityWithOwnerResult::Created(rec) => rec.id,
+            other => panic!("expected fresh community, got {other:?}"),
+        };
+        let channel = state
+            .db
+            .create_channel(
+                community,
+                "wf-outcome",
+                buzz_core::channel::ChannelType::Stream,
+                buzz_core::channel::ChannelVisibility::Open,
+                None,
+                &owner.public_key().to_bytes(),
+                None,
+            )
+            .await
+            .expect("create channel");
+
+        let def_json = serde_json::json!({
+            "name": "wf-outcome",
+            "trigger": {"on": "message_posted"},
+            "steps": [{
+                "id": "gate",
+                "action": "request_approval",
+                "from": "any",
+                "message": "Approve?",
+            }],
+            "enabled": true,
+        })
+        .to_string();
+        state
+            .db
+            .ensure_user(community, owner.public_key().to_bytes().as_ref())
+            .await
+            .expect("ensure owner user row");
+        let workflow_id = state
+            .db
+            .create_workflow(
+                community,
+                Some(channel.id),
+                &owner.public_key().to_bytes(),
+                "wf-outcome",
+                &def_json,
+                &[3u8; 32],
+            )
+            .await
+            .expect("create workflow");
+
+        let tenant = TenantContext::resolved(community, host);
+        let run_id = Uuid::new_v4();
+        let token_hash_hex = hex::encode(Sha256::digest(b"raw-token"));
+        let command_event_id_hex: String = "ab".repeat(32);
+
+        let emitted = emit_approval_outcome_event(
+            &state,
+            &tenant,
+            ApprovalOutcome {
+                outcome_kind: KIND_WORKFLOW_APPROVAL_GRANTED,
+                workflow_id,
+                run_id,
+                step_id: "gate".to_owned(),
+                token_hash_hex: token_hash_hex.clone(),
+                command_event_id_hex: command_event_id_hex.clone(),
+                decider_hex: owner_hex.clone(),
+            },
+        )
+        .await
+        .expect("outcome event emitted");
+
+        let id_bytes = nostr::EventId::from_hex(&emitted)
+            .expect("event id")
+            .as_bytes()
+            .to_vec();
+        let stored = state
+            .db
+            .get_event_by_id(community, &id_bytes)
+            .await
+            .expect("query event")
+            .expect("event persisted");
+
+        assert_eq!(
+            u32::from(stored.event.kind.as_u16()),
+            KIND_WORKFLOW_APPROVAL_GRANTED
+        );
+
+        let tag_value = |name: &str| -> Option<String> {
+            stored.event.tags.iter().find_map(|t| {
+                let s = t.as_slice();
+                if s.first().map(|v| v.as_str()) == Some(name) {
+                    s.get(1).map(|v| v.to_string())
+                } else {
+                    None
+                }
+            })
+        };
+        assert_eq!(
+            tag_value("d").as_deref(),
+            Some(token_hash_hex.as_str()),
+            "d tag must correlate to the kind:46010 request"
+        );
+        assert_eq!(
+            tag_value("e").as_deref(),
+            Some(command_event_id_hex.as_str()),
+            "e tag must reference the human-signed grant command"
+        );
+        assert_eq!(tag_value("h"), Some(channel.id.to_string()));
+
+        let content: serde_json::Value =
+            serde_json::from_str(&stored.event.content).expect("content is JSON");
+        assert_eq!(content["status"].as_str(), Some("granted"));
+        assert_eq!(content["approver"].as_str(), Some(owner_hex.as_str()));
+        assert_eq!(content["step_id"].as_str(), Some("gate"));
+        assert_eq!(
+            content["run_id"].as_str(),
+            Some(run_id.to_string().as_str())
+        );
+    }
 }
