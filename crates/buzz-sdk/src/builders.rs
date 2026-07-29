@@ -1,4 +1,4 @@
-//! Typed event builder functions (38 builders).
+//! Typed event builder functions.
 //!
 //! All functions return `Result<nostr::EventBuilder, SdkError>`.
 //! The caller signs: `builder.sign_with_keys(&keys)?`.
@@ -12,7 +12,8 @@ use buzz_core::{
         KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
         KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
         KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_USER_STATUS,
-        KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
+        KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, KIND_WORK_THREAD_METADATA, KIND_WORK_THREAD_OPEN,
+        KIND_WORK_THREAD_RECOMMEND, KIND_WORK_THREAD_STATE,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -1536,6 +1537,137 @@ pub fn build_workflow_approval(
     };
     let tags = vec![tag(&["d", token_hash])?];
     Ok(EventBuilder::new(Kind::Custom(kind as u16), note).tags(tags))
+}
+
+// ---------------------------------------------------------------------------
+// Work threads (Silent Mesh Phase 2, kinds 47000–47003)
+// ---------------------------------------------------------------------------
+
+/// The D41 lifecycle states a kind:47002 command may target.
+pub const THREAD_STATES: [&str; 5] = ["open", "snoozed", "ready", "closed", "archived"];
+
+/// Build a work-thread root event (kind 47000) — opens a thread as a task.
+///
+/// - `goal`: the task goal, becomes the event content (non-empty, ≤ 16 KiB).
+/// - `deadline`: optional unix-seconds deadline (`deadline` tag).
+/// - `dri`: optional directly-responsible pubkey hex (`dri` tag).
+///
+/// The signed event's id is the thread id. The relay requires the author to
+/// be a full channel member (bots recommend via kind:47003 instead).
+pub fn build_thread_open(
+    channel_id: Uuid,
+    goal: &str,
+    deadline: Option<i64>,
+    dri: Option<&str>,
+) -> Result<EventBuilder, SdkError> {
+    if goal.trim().is_empty() {
+        return Err(SdkError::InvalidInput("goal must not be empty".into()));
+    }
+    check_content(goal, 16 * 1024)?;
+    let mut tags = vec![tag(&["h", &channel_id.to_string()])?];
+    if let Some(deadline) = deadline {
+        tags.push(tag(&["deadline", &deadline.to_string()])?);
+    }
+    if let Some(dri) = dri {
+        let validated = check_pubkey_hex(dri, "dri")?;
+        tags.push(tag(&["dri", &validated])?);
+    }
+    Ok(EventBuilder::new(Kind::Custom(KIND_WORK_THREAD_OPEN as u16), goal).tags(tags))
+}
+
+/// Build a work-thread task-metadata command (kind 47001).
+///
+/// At least one field must be given. `deadline`/`dri` are double-`Option`:
+/// `Some(None)` clears the field, `None` leaves it untouched — mirroring the
+/// relay's JSON contract (`null` clears, absent keeps).
+pub fn build_thread_metadata(
+    channel_id: Uuid,
+    thread_root: &str,
+    goal: Option<&str>,
+    deadline: Option<Option<i64>>,
+    dri: Option<Option<&str>>,
+) -> Result<EventBuilder, SdkError> {
+    let root = check_hex_exact(thread_root, 64, "thread_root")?;
+    if goal.is_none() && deadline.is_none() && dri.is_none() {
+        return Err(SdkError::InvalidInput(
+            "metadata edit must change at least one of goal/deadline/dri".into(),
+        ));
+    }
+    let mut body = serde_json::Map::new();
+    if let Some(goal) = goal {
+        if goal.trim().is_empty() {
+            return Err(SdkError::InvalidInput("goal must not be empty".into()));
+        }
+        check_content(goal, 16 * 1024)?;
+        body.insert("goal".into(), serde_json::Value::String(goal.to_owned()));
+    }
+    if let Some(deadline) = deadline {
+        body.insert(
+            "deadline".into(),
+            deadline.map_or(serde_json::Value::Null, serde_json::Value::from),
+        );
+    }
+    if let Some(dri) = dri {
+        let value = match dri {
+            Some(pk) => serde_json::Value::String(check_pubkey_hex(pk, "dri")?),
+            None => serde_json::Value::Null,
+        };
+        body.insert("dri".into(), value);
+    }
+    let content = serde_json::Value::Object(body).to_string();
+    let tags = vec![tag(&["e", &root])?, tag(&["h", &channel_id.to_string()])?];
+    Ok(EventBuilder::new(Kind::Custom(KIND_WORK_THREAD_METADATA as u16), content).tags(tags))
+}
+
+/// Build a work-thread state-transition command (kind 47002).
+///
+/// `state` must be one of [`THREAD_STATES`]; `canonicalize` is only legal
+/// when the target state is `closed`. The relay validates both the
+/// transition and the author's D41 authority.
+pub fn build_thread_state(
+    channel_id: Uuid,
+    thread_root: &str,
+    state: &str,
+    canonicalize: Option<bool>,
+) -> Result<EventBuilder, SdkError> {
+    let root = check_hex_exact(thread_root, 64, "thread_root")?;
+    if !THREAD_STATES.contains(&state) {
+        return Err(SdkError::InvalidInput(format!(
+            "state must be one of: {}",
+            THREAD_STATES.join(", ")
+        )));
+    }
+    if canonicalize.is_some() && state != "closed" {
+        return Err(SdkError::InvalidInput(
+            "canonicalize only applies to close".into(),
+        ));
+    }
+    let mut tags = vec![
+        tag(&["e", &root])?,
+        tag(&["h", &channel_id.to_string()])?,
+        tag(&["state", state])?,
+    ];
+    if let Some(c) = canonicalize {
+        tags.push(tag(&["canonicalize", if c { "true" } else { "false" }])?);
+    }
+    Ok(EventBuilder::new(Kind::Custom(KIND_WORK_THREAD_STATE as u16), "").tags(tags))
+}
+
+/// Build a work-thread recommendation (kind 47003) — the agent-authored,
+/// append-only suggestion that stays inert until a human confirms it with a
+/// real kind:47001/47002 command.
+pub fn build_thread_recommend(
+    channel_id: Uuid,
+    thread_root: &str,
+    note: &str,
+) -> Result<EventBuilder, SdkError> {
+    let root = check_hex_exact(thread_root, 64, "thread_root")?;
+    if note.trim().is_empty() {
+        return Err(SdkError::InvalidInput("note must not be empty".into()));
+    }
+    check_content(note, 16 * 1024)?;
+    let tags = vec![tag(&["e", &root])?, tag(&["h", &channel_id.to_string()])?];
+    Ok(EventBuilder::new(Kind::Custom(KIND_WORK_THREAD_RECOMMEND as u16), note).tags(tags))
 }
 
 /// Build a DM open event (kind 41010).

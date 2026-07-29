@@ -179,6 +179,9 @@ enum Cmd {
     /// List, show, grant, and deny agent permission approvals
     #[command(subcommand)]
     Approvals(ApprovalsCmd),
+    /// Open, list, and drive work threads through the D41 lifecycle
+    #[command(subcommand)]
+    Threads(ThreadsCmd),
     /// Send, read, search, and manage messages
     #[command(subcommand)]
     Messages(MessagesCmd),
@@ -896,6 +899,109 @@ pub enum ApprovalsCmd {
         /// Optional note recorded with the decision
         #[arg(long)]
         note: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ThreadsCmd {
+    /// Open a work thread — a task with a goal (signs a kind:47000 root)
+    #[command(
+        after_help = "Examples:\n  buzz threads open --channel <UUID> --goal 'Ship the fix'\n  buzz threads open --channel <UUID> --goal 'Ship it' --deadline 1900000000 --dri <64-hex>"
+    )]
+    Open {
+        /// Channel UUID
+        #[arg(long)]
+        channel: String,
+        /// The task goal (event content)
+        #[arg(long)]
+        goal: String,
+        /// Optional deadline as unix seconds
+        #[arg(long)]
+        deadline: Option<i64>,
+        /// Optional directly-responsible pubkey (64-char hex)
+        #[arg(long)]
+        dri: Option<String>,
+    },
+    /// List work threads in a channel (folded from the signed events)
+    List {
+        /// Channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Filter by folded status: open, snoozed, ready, closed, archived
+        #[arg(long)]
+        status: Option<String>,
+        /// Maximum threads (default 100)
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Show one work thread with folded metadata, status, and recommendations
+    Show {
+        /// Channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Thread root event id (64-char hex)
+        #[arg(long)]
+        thread: String,
+    },
+    /// Edit task metadata — goal, deadline, DRI (signs a kind:47001 command)
+    #[command(
+        after_help = "Examples:\n  buzz threads set --channel <UUID> --thread <64-hex> --goal 'New goal'\n  buzz threads set --channel <UUID> --thread <64-hex> --deadline 1900000000\n  buzz threads set --channel <UUID> --thread <64-hex> --clear-deadline --clear-dri"
+    )]
+    Set {
+        /// Channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Thread root event id (64-char hex)
+        #[arg(long)]
+        thread: String,
+        /// New goal text
+        #[arg(long)]
+        goal: Option<String>,
+        /// New deadline as unix seconds
+        #[arg(long, conflicts_with = "clear_deadline")]
+        deadline: Option<i64>,
+        /// Clear the deadline
+        #[arg(long)]
+        clear_deadline: bool,
+        /// New DRI pubkey (64-char hex)
+        #[arg(long, conflicts_with = "clear_dri")]
+        dri: Option<String>,
+        /// Clear the DRI
+        #[arg(long)]
+        clear_dri: bool,
+    },
+    /// Transition a thread's D41 state (signs a kind:47002 command)
+    #[command(
+        after_help = "States: open, snoozed, ready, closed, archived.\nAuthority (D41): members snooze/ready/reopen-from-ready; Channel Admins close\nand archive; only the workspace Owner reopens from archived.\n\nExamples:\n  buzz threads state --channel <UUID> --thread <64-hex> --to ready\n  buzz threads state --channel <UUID> --thread <64-hex> --to closed --canonicalize"
+    )]
+    State {
+        /// Channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Thread root event id (64-char hex)
+        #[arg(long)]
+        thread: String,
+        /// Target state: open, snoozed, ready, closed, archived
+        #[arg(long)]
+        to: String,
+        /// Canonicalize on close (close only)
+        #[arg(long)]
+        canonicalize: bool,
+    },
+    /// Post an agent recommendation on a thread (signs a kind:47003 event)
+    ///
+    /// Recommendations are inert until a human confirms with a real
+    /// metadata/state command.
+    Recommend {
+        /// Channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Thread root event id (64-char hex)
+        #[arg(long)]
+        thread: String,
+        /// The recommendation text
+        #[arg(long)]
+        note: String,
     },
 }
 
@@ -1836,6 +1942,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Dms(sub) => commands::dms::dispatch(sub, &client).await,
         Cmd::Users(sub) => commands::users::dispatch(sub, &client, &cli.format).await,
         Cmd::Approvals(sub) => commands::approvals::dispatch(sub, &client).await,
+        Cmd::Threads(sub) => commands::threads::dispatch(sub, &client).await,
         Cmd::Workflows(sub) => commands::workflows::dispatch(sub, &client).await,
         Cmd::Feed(sub) => commands::feed::dispatch(sub, &client, &cli.format).await,
         Cmd::Social(sub) => commands::social::dispatch(sub, &client).await,
@@ -1909,6 +2016,7 @@ mod tests {
             "reactions",
             "repos",
             "social",
+            "threads",
             "upload",
             "users",
             "workflows",
@@ -1966,6 +2074,10 @@ mod tests {
         assert_eq!(
             names(&cmd, "approvals"),
             vec!["deny", "grant", "list", "show"]
+        );
+        assert_eq!(
+            names(&cmd, "threads"),
+            vec!["list", "open", "recommend", "set", "show", "state"]
         );
         assert_eq!(
             names(&cmd, "messages"),
