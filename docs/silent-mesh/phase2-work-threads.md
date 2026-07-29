@@ -225,9 +225,11 @@ Known limitations shared with upstream patterns (recorded 2f review):
   the thread is invisible to 47001/47002/47010 (and the family walk)
   until an operator re-inserts the row. No 47xxx-specific regression;
   fixing it means moving projection creation pre-storage, upstream-wide.
-- **Command kinds bypass the moderation timeout write-block**: the
-  command-executor routing (47001/47002, DM/workflow/approval commands)
-  runs before the community ban/timeout gate in ingest, so a timed-out
-  Channel Admin can still close/archive threads (and, since 2f, trigger
-  sibling batches). Pre-existing for every command kind since Phase 1;
-  flagged as a follow-up slice in the handoff.
+- ~~Command kinds bypass the moderation timeout write-block~~ — **fixed**
+  after the 2f review: command-executor routing now runs *after* the
+  ban/timeout gate, so a restricted actor cannot issue 47001/47002/47021,
+  DM, workflow, or approval commands. The two deliberate pre-gate
+  exemptions (moderation commands 9040–9044, relay-admin 9030–9033)
+  remain — both are the tooling used to lift restrictions, and neither is
+  a command kind. A source-order regression test pins the ordering, which
+  is otherwise invisible to unit-level calls.

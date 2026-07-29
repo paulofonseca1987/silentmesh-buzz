@@ -33,6 +33,13 @@ repo (relay-signed kind:30617). Guest role disabled in depth.
 `BUZZ_WORKSPACE_CHANNEL_GATE` (default **off**) gates non-DM channel
 creation to workspace owner/admin when enabled.
 
+**Restriction-gate fix (post-2f review).** Command kinds
+(47001/47002/47021, DM, workflow, approval) are routed *after* the
+community ban/timeout write-block in ingest, not before — a timed-out
+Channel Admin can no longer close threads or archive fork families. The
+pre-gate exemptions stay limited to moderation commands (9040–9044) and
+relay-admin (9030–9033), the tooling used to lift restrictions.
+
 **Phase 2h — folder/file write ACLs (D4).** `buzz-path-acl` tags on
 kind:30617 (`buzz_core::path_acl`): path patterns → `write:<role>` /
 `write:<64-hex pubkey>` / `readonly`, most-specific-wins with ties
@@ -137,12 +144,7 @@ serialize so exactly one winner survives) and emits kind:47013 notices.
 1. **buzz-acp worktree binding**: align agent workspaces onto thread
    worktrees; emit kind:47010 checkpoints automatically at turn end
    (today checkpoints are CLI/manual).
-2. **Command-kind timeout gate** (found in the 2f review, pre-existing
-   since Phase 1): ingest routes command kinds (47001/47002/47021, DM,
-   workflow, approval commands) to the command executor *before* the
-   moderation timeout write-block, so a timed-out admin can still issue
-   them. Decide intended semantics, then move or mirror the gate.
-3. Phase 2 exit-criterion dry run from buzz-cli (roadmap lines 87–100),
+2. Phase 2 exit-criterion dry run from buzz-cli (roadmap lines 87–100),
    then Phase 3 (model plane) per roadmap.
 
 ## Suggested kickoff prompt for a fresh session

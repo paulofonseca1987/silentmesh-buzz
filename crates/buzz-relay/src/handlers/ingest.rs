@@ -1824,12 +1824,6 @@ async fn ingest_event_inner(
         )));
     }
 
-    // Command kinds are routed AFTER signature verification, timestamp check,
-    // pubkey/auth match, and scope validation — never before.
-    if buzz_core::kind::is_command_kind(kind_u32) {
-        return super::command_executor::handle_command(tenant, state, event, auth).await;
-    }
-
     // Product feedback is sidecarred directly into its private deployment table.
     // It never enters ordinary event storage or subscription fan-out.
     if kind_u32 == KIND_PRODUCT_FEEDBACK {
@@ -1937,6 +1931,18 @@ async fn ingest_event_inner(
                 )));
             }
         }
+    }
+
+    // Command kinds are routed AFTER signature verification, timestamp check,
+    // pubkey/auth match, scope validation — and, silent-mesh, after the
+    // ban/timeout write-block above. Commands mutate community state
+    // (thread lifecycle, DMs, workflows, approvals, promotions); none is a
+    // moderation tool that must stay usable while restricted, so the two
+    // deliberate exemptions (moderation commands, relay-admin) do not
+    // extend to them. Before this move a timed-out Channel Admin could
+    // still close threads and archive fork families.
+    if buzz_core::kind::is_command_kind(kind_u32) {
+        return super::command_executor::handle_command(tenant, state, event, auth).await;
     }
 
     let mut channel_id = if kind_u32 == KIND_REACTION {
@@ -3680,6 +3686,39 @@ mod tests {
             .tags(nostr_tags)
             .sign_with_keys(&keys)
             .unwrap()
+    }
+
+    /// silent-mesh: command kinds must be routed AFTER the ban/timeout
+    /// write-block, so a restricted actor cannot issue them. Only the two
+    /// deliberate exemptions (moderation commands, relay-admin) sit before
+    /// the gate — and neither is a command kind. The source-order assertion
+    /// is the regression guard: this ordering is invisible to any
+    /// unit-level call of `ingest_event`, and getting it wrong silently
+    /// re-opens the hole (a timed-out Channel Admin closing threads).
+    #[test]
+    fn command_kinds_are_routed_after_the_restriction_gate() {
+        let src = include_str!("ingest.rs");
+        let gate = src
+            .find("moderation_restriction_state")
+            .expect("restriction gate present");
+        let routing = src
+            .find("if buzz_core::kind::is_command_kind(kind_u32) {")
+            .expect("command routing present");
+        assert!(
+            routing > gate,
+            "command-kind routing must come after the ban/timeout gate"
+        );
+
+        // The exemptions that legitimately precede the gate are moderation
+        // tooling only — none of them is a command kind.
+        for kind in [9040u32, 9041, 9042, 9043, 9044] {
+            assert!(buzz_core::kind::is_moderation_command_kind(kind));
+            assert!(!buzz_core::kind::is_command_kind(kind));
+        }
+        for kind in [RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE] {
+            assert!(is_relay_admin_kind(kind));
+            assert!(!buzz_core::kind::is_command_kind(kind));
+        }
     }
 
     /// silent-mesh: work-thread kinds are channel-scoped MessagesWrite events;
