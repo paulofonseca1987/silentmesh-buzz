@@ -12,6 +12,58 @@
 
 use serde_json::Value;
 
+use crate::config::RuntimeMode;
+
+/// What the runtime-mode policy does with a permission request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateAction {
+    /// Answer immediately with the allow-then-reject auto ladder.
+    AutoSelect,
+    /// Park the request for a human decision (pending row on the relay).
+    Park,
+}
+
+/// Decide whether a permission request is auto-selected or parked, from the
+/// harness runtime mode and the gated tool call's ACP kind.
+///
+/// `auto-accept-edits` auto-approves the file-shaped kinds (`read`, `edit`)
+/// and gates everything else — including requests whose tool call could not
+/// be correlated (`None`), which fail toward the gate, never around it.
+pub fn gate_action(mode: RuntimeMode, tool_kind: Option<&str>) -> GateAction {
+    match mode {
+        RuntimeMode::FullAccess => GateAction::AutoSelect,
+        RuntimeMode::Supervised => GateAction::Park,
+        RuntimeMode::AutoAcceptEdits => match tool_kind {
+            Some("read") | Some("edit") => GateAction::AutoSelect,
+            _ => GateAction::Park,
+        },
+    }
+}
+
+/// Map an ACP tool-call kind onto the human-facing request taxonomy stored
+/// with a parked request (`command` / `file-read` / `file-change` / `other`).
+pub fn request_kind_for_tool(tool_kind: Option<&str>) -> &'static str {
+    match tool_kind {
+        Some("execute") => "command",
+        Some("read") => "file-read",
+        Some("edit") | Some("delete") | Some("move") => "file-change",
+        _ => "other",
+    }
+}
+
+/// Render the human-facing `detail` line for a parked request, bounded to
+/// the relay's 400-char limit.
+pub fn detail_for_tool(tool_call: Option<&ToolCallRef>, fallback: &str) -> String {
+    let raw = tool_call
+        .and_then(|tc| tc.title.as_deref())
+        .unwrap_or(fallback);
+    let mut detail: String = raw.chars().take(400).collect();
+    if detail.trim().is_empty() {
+        detail = fallback.to_owned();
+    }
+    detail
+}
+
 /// How many announced tool calls to retain for correlation.
 ///
 /// A permission request follows its announcing `tool_call` update almost
@@ -163,9 +215,43 @@ impl PermissionRequest {
         Err("no suitable permission option found (neither allow_once nor reject_once)".to_owned())
     }
 
+    /// Map a human decision (as recorded by the relay: `allow_once`,
+    /// `allow_always`, `reject_once`, `cancel`) onto the response for this
+    /// request's option set. `allow_always` degrades to `allow_once` when
+    /// the agent offered no session-scoped option; an unmappable decision
+    /// returns `None` and the caller answers `cancelled` (fail-safe: never
+    /// approve on a mapping miss).
+    pub fn response_for_decision(&self, decision: &str) -> Option<DecisionResponse<'_>> {
+        match decision {
+            "allow_once" => self
+                .find_kind("allow_once")
+                .and_then(|opt| opt.option_id.as_deref())
+                .map(DecisionResponse::Selected),
+            "allow_always" => self
+                .find_kind("allow_always")
+                .or_else(|| self.find_kind("allow_once"))
+                .and_then(|opt| opt.option_id.as_deref())
+                .map(DecisionResponse::Selected),
+            "reject_once" => self.find_kind("reject_once").map(|opt| {
+                DecisionResponse::Selected(opt.option_id.as_deref().unwrap_or("reject"))
+            }),
+            "cancel" => Some(DecisionResponse::Cancelled),
+            _ => None,
+        }
+    }
+
     fn find_kind(&self, kind: &str) -> Option<&PermissionOption> {
         self.options.iter().find(|opt| opt.kind == kind)
     }
+}
+
+/// The wire response mapped from a human decision.
+#[derive(Debug, PartialEq)]
+pub enum DecisionResponse<'a> {
+    /// Respond `outcome: selected` with this `optionId`.
+    Selected(&'a str),
+    /// Respond `outcome: cancelled`.
+    Cancelled,
 }
 
 fn str_field(value: &Value, key: &str) -> Option<String> {
@@ -319,5 +405,118 @@ mod tests {
         };
         let resolved = request_side.filled_from(&announced);
         assert_eq!(resolved.title.as_deref(), Some("cargo test -p buzz-core"));
+    }
+
+    #[test]
+    fn gate_action_full_access_never_parks() {
+        assert_eq!(
+            gate_action(RuntimeMode::FullAccess, Some("execute")),
+            GateAction::AutoSelect
+        );
+        assert_eq!(
+            gate_action(RuntimeMode::FullAccess, None),
+            GateAction::AutoSelect
+        );
+    }
+
+    #[test]
+    fn gate_action_supervised_always_parks() {
+        for kind in [Some("execute"), Some("read"), Some("edit"), None] {
+            assert_eq!(gate_action(RuntimeMode::Supervised, kind), GateAction::Park);
+        }
+    }
+
+    #[test]
+    fn gate_action_auto_accept_edits_parks_non_file_ops() {
+        assert_eq!(
+            gate_action(RuntimeMode::AutoAcceptEdits, Some("read")),
+            GateAction::AutoSelect
+        );
+        assert_eq!(
+            gate_action(RuntimeMode::AutoAcceptEdits, Some("edit")),
+            GateAction::AutoSelect
+        );
+        assert_eq!(
+            gate_action(RuntimeMode::AutoAcceptEdits, Some("execute")),
+            GateAction::Park
+        );
+        // Uncorrelated tool calls fail toward the gate, never around it.
+        assert_eq!(
+            gate_action(RuntimeMode::AutoAcceptEdits, None),
+            GateAction::Park
+        );
+    }
+
+    #[test]
+    fn request_kind_taxonomy_mapping() {
+        assert_eq!(request_kind_for_tool(Some("execute")), "command");
+        assert_eq!(request_kind_for_tool(Some("read")), "file-read");
+        assert_eq!(request_kind_for_tool(Some("edit")), "file-change");
+        assert_eq!(request_kind_for_tool(Some("delete")), "file-change");
+        assert_eq!(request_kind_for_tool(Some("move")), "file-change");
+        assert_eq!(request_kind_for_tool(Some("think")), "other");
+        assert_eq!(request_kind_for_tool(None), "other");
+    }
+
+    #[test]
+    fn detail_bounded_to_400_chars_with_fallback() {
+        let long_title = "x".repeat(1000);
+        let tc = ToolCallRef {
+            id: Some("c".into()),
+            title: Some(long_title),
+            ..Default::default()
+        };
+        assert_eq!(detail_for_tool(Some(&tc), "fallback").chars().count(), 400);
+        assert_eq!(detail_for_tool(None, "fallback"), "fallback");
+        let blank = ToolCallRef {
+            title: Some("   ".into()),
+            ..Default::default()
+        };
+        assert_eq!(detail_for_tool(Some(&blank), "fallback"), "fallback");
+    }
+
+    #[test]
+    fn response_for_decision_maps_the_acp_vocabulary() {
+        let params = params_with_options(json!([
+            { "optionId": "yes", "kind": "allow_once" },
+            { "optionId": "always", "kind": "allow_always" },
+            { "optionId": "no", "kind": "reject_once" },
+        ]));
+        let req = PermissionRequest::parse_params(json!(1), &params).expect("parse");
+        assert_eq!(
+            req.response_for_decision("allow_once"),
+            Some(DecisionResponse::Selected("yes"))
+        );
+        assert_eq!(
+            req.response_for_decision("allow_always"),
+            Some(DecisionResponse::Selected("always"))
+        );
+        assert_eq!(
+            req.response_for_decision("reject_once"),
+            Some(DecisionResponse::Selected("no"))
+        );
+        assert_eq!(
+            req.response_for_decision("cancel"),
+            Some(DecisionResponse::Cancelled)
+        );
+        assert_eq!(req.response_for_decision("bogus"), None);
+
+        // allow_always degrades to allow_once when unoffered; a mapping miss
+        // (granted but no allow option at all) yields None → cancelled.
+        let sparse = PermissionRequest::parse_params(
+            json!(2),
+            &params_with_options(json!([{ "optionId": "yes", "kind": "allow_once" }])),
+        )
+        .expect("parse");
+        assert_eq!(
+            sparse.response_for_decision("allow_always"),
+            Some(DecisionResponse::Selected("yes"))
+        );
+        let rejecting_only = PermissionRequest::parse_params(
+            json!(3),
+            &params_with_options(json!([{ "optionId": "no", "kind": "reject_once" }])),
+        )
+        .expect("parse");
+        assert_eq!(rejecting_only.response_for_decision("allow_once"), None);
     }
 }

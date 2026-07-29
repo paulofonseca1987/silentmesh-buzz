@@ -85,6 +85,37 @@ pub enum MultipleEventHandling {
     OwnerInterrupt,
 }
 
+/// Harness-side runtime mode for agent tool-call permissions.
+///
+/// - `full-access` — auto-approve every `session/request_permission`
+///   (upstream's historical behavior; the default, so the patch is
+///   behavior-preserving).
+/// - `auto-accept-edits` — auto-approve requests whose correlated tool call
+///   is a file read/edit; gate everything else through a human approval.
+/// - `supervised` — gate every permission request through a human approval
+///   (pending request on the relay, kind:46010 in the channel, decision via
+///   the kind:46030/46031 command path).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, clap::ValueEnum)]
+pub enum RuntimeMode {
+    /// Auto-approve everything (upstream default).
+    #[default]
+    FullAccess,
+    /// Auto-approve file read/edit tool calls; gate the rest.
+    AutoAcceptEdits,
+    /// Gate every permission request through a human.
+    Supervised,
+}
+
+impl std::fmt::Display for RuntimeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FullAccess => f.write_str("full-access"),
+            Self::AutoAcceptEdits => f.write_str("auto-accept-edits"),
+            Self::Supervised => f.write_str("supervised"),
+        }
+    }
+}
+
 /// Inbound author gate: which authors' events the harness forwards to the agent.
 ///
 /// - `owner-only` — only the agent's registered owner (default).
@@ -443,6 +474,24 @@ pub struct CliArgs {
     )]
     pub permission_mode: PermissionMode,
 
+    /// Runtime mode for agent tool-call permissions.
+    /// Modes: full-access (default — auto-approve, upstream behavior),
+    /// auto-accept-edits, supervised.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_RUNTIME_MODE",
+        default_value = "full-access",
+        value_enum
+    )]
+    pub runtime_mode: RuntimeMode,
+
+    /// Comma-separated list of allowed `--runtime-mode` values — the ceiling
+    /// the operator grants this harness. When set, startup is rejected if
+    /// `--runtime-mode` is not in the list.
+    /// Example: `BUZZ_ACP_ALLOWED_RUNTIME_MODES=supervised,auto-accept-edits`
+    #[arg(long, env = "BUZZ_ACP_ALLOWED_RUNTIME_MODES", value_delimiter = ',')]
+    pub allowed_runtime_modes: Option<Vec<String>>,
+
     /// Inbound author gate: which authors' events the harness forwards.
     /// Modes: owner-only (default), allowlist, anyone, nobody.
     #[arg(
@@ -533,6 +582,10 @@ pub struct Config {
     pub session_title: Option<String>,
     /// Permission mode to apply after session creation. `Default` = skip.
     pub permission_mode: PermissionMode,
+    /// Runtime mode for agent tool-call permissions.
+    pub runtime_mode: RuntimeMode,
+    /// Allowed runtime modes (ceiling). Empty = all modes allowed.
+    pub allowed_runtime_modes: Vec<String>,
     /// Inbound author gate mode.
     pub respond_to: RespondTo,
     /// Validated allowlist of pubkey hex strings (used when respond_to == Allowlist).
@@ -1011,6 +1064,49 @@ impl Config {
             Vec::new()
         };
 
+        // Validate runtime_mode against the allowed ceiling (mirrors the
+        // respond_to guard: the operator's list caps what this harness may
+        // run as; startup fails rather than silently escalating).
+        let allowed_runtime_modes = if let Some(raw) = args.allowed_runtime_modes {
+            for s in &raw {
+                RuntimeMode::from_str(s.trim(), true).map_err(|_| {
+                    ConfigError::ConfigFile(format!(
+                        "invalid value in BUZZ_ACP_ALLOWED_RUNTIME_MODES: '{s}' \
+                         (valid values: full-access, auto-accept-edits, supervised)"
+                    ))
+                })?;
+            }
+            let allowed_modes: Vec<String> = raw.iter().map(|s| s.trim().to_string()).collect();
+            if !allowed_modes.is_empty() && !allowed_modes.contains(&args.runtime_mode.to_string())
+            {
+                return Err(ConfigError::ConfigFile(format!(
+                    "runtime_mode '{}' is not permitted on this deployment \
+                     (BUZZ_ACP_ALLOWED_RUNTIME_MODES={})",
+                    args.runtime_mode,
+                    raw.join(",")
+                )));
+            }
+            allowed_modes
+        } else {
+            Vec::new()
+        };
+
+        // A gated runtime mode is inert if the agent never emits permission
+        // requests — `bypassPermissions` suppresses them at the source. Keep
+        // the two knobs consistent by downgrading the agent-side mode.
+        let permission_mode = if args.runtime_mode != RuntimeMode::FullAccess
+            && args.permission_mode == PermissionMode::BypassPermissions
+        {
+            tracing::warn!(
+                "runtime_mode={} requires the agent to emit permission requests — \
+                 overriding permission_mode=bypassPermissions to default",
+                args.runtime_mode
+            );
+            PermissionMode::Default
+        } else {
+            args.permission_mode
+        };
+
         // Spawned desktop agents now carry a complete instance snapshot. Team
         // instructions arrive independently so they can be layered at runtime.
         let mut persona_env_vars = Vec::new();
@@ -1067,7 +1163,9 @@ impl Config {
                 .session_title
                 .as_deref()
                 .and_then(sanitize_session_title),
-            permission_mode: args.permission_mode,
+            permission_mode,
+            runtime_mode: args.runtime_mode,
+            allowed_runtime_modes,
             respond_to: args.respond_to,
             respond_to_allowlist,
             allowed_respond_to,
@@ -1098,8 +1196,15 @@ impl Config {
             modes.sort();
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
+        let allowed_runtime_modes_detail = if self.allowed_runtime_modes.is_empty() {
+            String::new()
+        } else {
+            let mut modes = self.allowed_runtime_modes.clone();
+            modes.sort();
+            format!(" allowed_runtime_modes=[{}]", modes.join(","))
+        };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} runtime_mode={}{} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1120,6 +1225,8 @@ impl Config {
             self.memory_enabled,
             self.model.as_deref().unwrap_or("(agent default)"),
             self.permission_mode,
+            self.runtime_mode,
+            allowed_runtime_modes_detail,
             respond_to_detail,
             allowed_respond_to_detail,
         )
@@ -1438,6 +1545,8 @@ mod tests {
             model: None,
             session_title: None,
             permission_mode: PermissionMode::BypassPermissions,
+            runtime_mode: RuntimeMode::default(),
+            allowed_runtime_modes: Vec::new(),
             respond_to: RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
             allowed_respond_to: Vec::new(),

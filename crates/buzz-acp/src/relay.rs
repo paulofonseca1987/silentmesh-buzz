@@ -421,6 +421,76 @@ impl RestClient {
         }
         serde_json::from_str(&text).map_err(|e| RelayError::Http(e.to_string()))
     }
+
+    /// GET with NIP-98 auth and retry. `path_with_query` must be the exact
+    /// path (plus query string) requested — the signed `u` tag covers it.
+    async fn bridge_get(&self, path_with_query: &str) -> Result<reqwest::Response, RelayError> {
+        let url = format!("{}{}", self.base_url, path_with_query);
+        let auth_tag_header = self.auth_tag_json.clone();
+        self.request_with_retry("GET", path_with_query, || {
+            let auth = self.nip98_header("GET", &url, None).unwrap_or_default();
+            let mut req = self.http.get(&url).header("Authorization", auth);
+            if let Some(ref tag) = auth_tag_header {
+                req = req.header("x-auth-tag", tag);
+            }
+            req.send()
+        })
+        .await
+    }
+
+    /// Register a pending agent permission request: `POST /api/approvals`.
+    ///
+    /// `body` is the create payload (channel_id, request_kind, detail,
+    /// payload, options, ttl_secs). Returns the relay response
+    /// (`request_id`, `token_hash`, `expires_at`, `event_id`).
+    pub async fn create_permission_request(&self, body: &Value) -> Result<Value, RelayError> {
+        let body_bytes = serde_json::to_vec(body)
+            .map_err(|e| RelayError::Http(format!("body serialize error: {e}")))?;
+        let resp = self.bridge_post("/api/approvals", &body_bytes).await?;
+        resp.json()
+            .await
+            .map_err(|e| RelayError::Http(e.to_string()))
+    }
+
+    /// Fetch one permission request's current state through the
+    /// membership-scoped list read. Returns `None` when the request is not
+    /// visible (not found, or outside the newest-200 window).
+    pub async fn fetch_permission_request(
+        &self,
+        request_id: uuid::Uuid,
+    ) -> Result<Option<Value>, RelayError> {
+        let resp = self.bridge_get("/api/approvals?limit=200").await?;
+        let rows: Value = resp
+            .json()
+            .await
+            .map_err(|e| RelayError::Http(e.to_string()))?;
+        let id_json = Value::String(request_id.to_string());
+        Ok(rows
+            .as_array()
+            .and_then(|rows| rows.iter().find(|r| r["request_id"] == id_json))
+            .cloned())
+    }
+
+    /// Withdraw the caller's own pending permission request:
+    /// `POST /api/approvals/resolve` with outcome `cancelled` or `expired`.
+    ///
+    /// A 409 (already decided) surfaces as `Err` — callers polling for the
+    /// decision will observe the terminal state on their next fetch.
+    pub async fn withdraw_permission_request(
+        &self,
+        request_id: uuid::Uuid,
+        outcome: &str,
+    ) -> Result<(), RelayError> {
+        let body = serde_json::json!({
+            "request_id": request_id,
+            "outcome": outcome,
+        });
+        let body_bytes = serde_json::to_vec(&body)
+            .map_err(|e| RelayError::Http(format!("body serialize error: {e}")))?;
+        self.bridge_post("/api/approvals/resolve", &body_bytes)
+            .await?;
+        Ok(())
+    }
 }
 
 /// Events the harness cares about.

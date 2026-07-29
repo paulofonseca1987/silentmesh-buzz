@@ -1761,10 +1761,12 @@ async fn tokio_main() -> Result<()> {
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
                 let has_codex = config.has_generated_codex_config;
+                let gate = permission_gate_from_config(&config);
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+                    let result =
+                        spawn_and_init(&cmd, &args, &env, has_codex, idx, observer, gate).await;
                     guard.send(result);
                 });
             }
@@ -3509,12 +3511,13 @@ fn recover_panicked_agent(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let gate = permission_gate_from_config(config);
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer, gate).await;
         guard.send(result);
     });
 }
@@ -3687,6 +3690,7 @@ fn spawn_respawn_task(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let gate = permission_gate_from_config(config);
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -3698,7 +3702,7 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer, gate).await;
         guard.send(result);
     });
 
@@ -3744,6 +3748,7 @@ struct PoolStartup {
     has_generated_codex_config: bool,
     model: Option<String>,
     observer: Option<observer::ObserverHandle>,
+    permission_gate: Option<(config::RuntimeMode, relay::RestClient)>,
 }
 
 impl PoolStartup {
@@ -3756,8 +3761,34 @@ impl PoolStartup {
             has_generated_codex_config: config.has_generated_codex_config,
             model: config.model.clone(),
             observer,
+            permission_gate: permission_gate_from_config(config),
         }
     }
+}
+
+/// Build the permission-gate wiring for spawned agents: the runtime mode
+/// plus a [`relay::RestClient`] sharing the harness identity (keys, relay
+/// base URL, NIP-OA auth tag). `None` in full-access mode — nothing to gate.
+fn permission_gate_from_config(
+    config: &Config,
+) -> Option<(config::RuntimeMode, relay::RestClient)> {
+    if config.runtime_mode == config::RuntimeMode::FullAccess {
+        return None;
+    }
+    let auth_tag_json = std::env::var("BUZZ_AUTH_TAG")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok())
+        .and_then(|t| serde_json::to_string(t.as_slice()).ok());
+    Some((
+        config.runtime_mode,
+        relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: relay::relay_ws_to_http(&config.relay_url),
+            keys: config.keys.clone(),
+            auth_tag_json,
+        },
+    ))
 }
 
 async fn initialize_agent_pool(
@@ -3778,6 +3809,9 @@ async fn initialize_agent_pool(
         match spawn_result {
             Ok(mut acp) => {
                 acp.set_observer(startup.observer.clone(), i);
+                if let Some((mode, rest)) = &startup.permission_gate {
+                    acp.set_permission_gate(*mode, Some(rest.clone()));
+                }
                 let initialize = tokio::time::timeout(Duration::from_secs(60), acp.initialize());
                 let initialize_result = match shutdown.as_mut() {
                     Some(shutdown) => tokio::select! {
@@ -3868,6 +3902,7 @@ async fn initialize_agent_pool(
 ///
 /// Takes owned args so it can run in a background `tokio::spawn` task without
 /// borrowing `Config`. All respawn/refill paths use this.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_and_init(
     command: &str,
     args: &[String],
@@ -3875,11 +3910,15 @@ async fn spawn_and_init(
     has_generated_codex_config: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
+    permission_gate: Option<(config::RuntimeMode, relay::RestClient)>,
 ) -> Result<(AcpClient, u32, String)> {
     let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
         .await
         .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
     acp.set_observer(observer, agent_index);
+    if let Some((mode, rest)) = permission_gate {
+        acp.set_permission_gate(mode, Some(rest));
+    }
 
     match acp.initialize().await {
         Ok(init_result) => {
@@ -5010,6 +5049,8 @@ mod build_mcp_servers_tests {
             model: None,
             session_title: None,
             permission_mode: config::PermissionMode::BypassPermissions,
+            runtime_mode: config::RuntimeMode::default(),
+            allowed_runtime_modes: Vec::new(),
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: std::collections::HashSet::new(),
             allowed_respond_to: vec![],
@@ -5231,6 +5272,8 @@ mod error_outcome_emission_tests {
             model: None,
             session_title: None,
             permission_mode: config::PermissionMode::BypassPermissions,
+            runtime_mode: config::RuntimeMode::default(),
+            allowed_runtime_modes: Vec::new(),
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
             allowed_respond_to: vec![],

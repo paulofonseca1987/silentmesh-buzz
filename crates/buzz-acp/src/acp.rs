@@ -13,8 +13,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
+use crate::config::RuntimeMode;
 use crate::observer::{ObserverContext, ObserverHandle};
-use crate::permission::{AutoOption, PermissionRequest, ToolCallRef, TOOL_CALL_MEMORY};
+use crate::permission::{
+    detail_for_tool, gate_action, request_kind_for_tool, AutoOption, DecisionResponse, GateAction,
+    PermissionRequest, ToolCallRef, TOOL_CALL_MEMORY,
+};
 use crate::usage::{TurnUsage, UsageTracker};
 
 /// Maximum allowed size of a single NDJSON line from the agent's stdout.
@@ -137,6 +141,27 @@ fn build_initialize_params() -> serde_json::Value {
     })
 }
 
+/// A permission request parked for a human decision (gated runtime modes).
+///
+/// While parked, the turn's read loop polls the relay approvals surface and
+/// answers the agent when the decision (or expiry) arrives; the request row
+/// on the relay is the source of truth.
+struct ParkedPermission {
+    /// The parsed request awaiting an answer (JSON-RPC id + option set).
+    request: PermissionRequest,
+    /// Relay-side request id (`POST /api/approvals` response).
+    relay_request_id: uuid::Uuid,
+    /// When the decision window closes (relay-computed).
+    expires_at: chrono::DateTime<chrono::Utc>,
+    /// Next status poll instant.
+    next_poll_at: tokio::time::Instant,
+}
+
+/// Interval between status polls while a permission request is parked.
+const PERMISSION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+/// Decision window requested for parked permissions (relay may cap it).
+const PERMISSION_TTL_SECS: u64 = 900;
+
 /// ACP client that owns an agent subprocess and communicates over its stdio.
 ///
 /// One `AcpClient` per agent process. Multiple sessions can be created on the
@@ -169,6 +194,16 @@ pub struct AcpClient {
     /// against the announcement matched by `toolCallId` recovers the tool
     /// title/kind/input the runtime-mode policy needs.
     recent_tool_calls: std::collections::VecDeque<ToolCallRef>,
+    /// Runtime mode for tool-call permissions. `FullAccess` (the default)
+    /// preserves the historical auto-approve; gated modes park requests
+    /// through [`Self::park_permission_request`].
+    runtime_mode: RuntimeMode,
+    /// REST transport for the relay approvals surface (create / poll /
+    /// withdraw), sharing the harness identity. `None` = no gate transport;
+    /// gated modes then fail closed (reject) rather than approving.
+    permission_rest: Option<crate::relay::RestClient>,
+    /// The permission request currently parked for a human decision, if any.
+    parked_permission: Option<ParkedPermission>,
     /// The JSON-RPC id of the most recently sent `session/prompt` request.
     /// Used by [`cancel_with_cleanup`] to drain the correct response.
     /// Set in [`session_prompt_with_idle_timeout`]; consumed in [`cancel_with_cleanup`].
@@ -553,6 +588,9 @@ impl AcpClient {
             pending_permission_id: None,
             permission_responded: false,
             recent_tool_calls: std::collections::VecDeque::new(),
+            runtime_mode: RuntimeMode::default(),
+            permission_rest: None,
+            parked_permission: None,
             last_prompt_id: None,
             current_hard_deadline: None,
             observer: None,
@@ -998,6 +1036,29 @@ impl AcpClient {
             AcpError::Protocol("cancel_with_cleanup called with no in-flight prompt".into())
         })?;
 
+        // Step 0: withdraw a parked permission request on the relay
+        // (best-effort, bounded) so the pending row doesn't sit until expiry;
+        // the cancelled response to the agent is Step 1's job.
+        if let Some(parked) = self.parked_permission.take() {
+            if let Some(rest) = self.permission_rest.clone() {
+                let withdraw =
+                    rest.withdraw_permission_request(parked.relay_request_id, "cancelled");
+                if tokio::time::timeout(std::time::Duration::from_secs(5), withdraw)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        target: "acp::permission",
+                        "withdrawing parked permission {} timed out",
+                        parked.relay_request_id
+                    );
+                }
+            }
+            // Restore the pending id so Step 1 answers the agent.
+            self.pending_permission_id = Some(parked.request.id.clone());
+            self.permission_responded = false;
+        }
+
         // Step 1: respond to any pending permission request with "cancelled",
         // but only if we haven't already responded (guards against double-response race).
         if let Some(perm_id) = self.pending_permission_id.clone() {
@@ -1233,7 +1294,7 @@ impl AcpClient {
                         self.handle_goose_usage_update(&msg);
                     }
                     "session/request_permission" => {
-                        self.handle_permission_request(&msg).await?;
+                        self.handle_permission_request(&msg, false).await?;
                     }
                     other => {
                         // If the unknown message has an id, it's a request expecting a reply.
@@ -1356,6 +1417,11 @@ impl AcpClient {
                 }
             }
 
+            // While a permission request is parked for a human decision the
+            // poll arm below is armed; polls double as activity so the idle
+            // clock cannot kill a turn that is waiting on a human.
+            let park_poll_at = self.parked_permission.as_ref().map(|p| p.next_poll_at);
+
             // LinesCodec::new_with_max_length enforces MAX_LINE_SIZE at the
             // read level — the buffer never grows beyond the limit.
             let read_result = tokio::select! {
@@ -1457,6 +1523,18 @@ impl AcpClient {
                     // Loop back to the next iteration without consuming a
                     // reader line; we'll wait for either the prompt
                     // response or the steer response next.
+                    None
+                }
+                _ = async {
+                    match park_poll_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if park_poll_at.is_some() => {
+                    // Parked-permission status poll. Terminal states answer
+                    // the agent (unparking); pending re-arms the next poll.
+                    self.poll_parked_permission().await?;
+                    idle_deadline = Instant::now() + idle_timeout;
                     None
                 }
                 _ = tokio::time::sleep_until(next_deadline) => {
@@ -1677,7 +1755,7 @@ impl AcpClient {
                                 self.handle_goose_usage_update(&msg);
                             }
                             "session/request_permission" => {
-                                self.handle_permission_request(&msg).await?;
+                                self.handle_permission_request(&msg, true).await?;
                             }
                             other => {
                                 // If the unknown message has an id, it's a request expecting a reply.
@@ -1865,6 +1943,223 @@ impl AcpClient {
         }
     }
 
+    /// Arm the permission gate: the runtime mode plus the REST transport
+    /// for the relay approvals surface. Called once after spawn (pool
+    /// wiring); without it, gated modes fail closed.
+    pub fn set_permission_gate(
+        &mut self,
+        mode: RuntimeMode,
+        rest: Option<crate::relay::RestClient>,
+    ) {
+        self.runtime_mode = mode;
+        self.permission_rest = rest;
+    }
+
+    /// Park a gated permission request: register it on the relay
+    /// (`POST /api/approvals`, which stores the row and emits kind:46010
+    /// into the channel) and defer the JSON-RPC response until a decision
+    /// or expiry arrives. On failure the request is handed back so the
+    /// caller can fail closed.
+    async fn park_permission_request(
+        &mut self,
+        request: PermissionRequest,
+        tool_call: Option<ToolCallRef>,
+    ) -> Result<(), (PermissionRequest, String)> {
+        let Some(rest) = self.permission_rest.clone() else {
+            return Err((request, "no permission gate transport".into()));
+        };
+        let Some(channel_id) = self
+            .observer_context
+            .channel_id
+            .as_deref()
+            .and_then(|s| s.parse::<uuid::Uuid>().ok())
+        else {
+            return Err((request, "no channel in turn context".into()));
+        };
+
+        let tool_kind = tool_call.as_ref().and_then(|tc| tc.kind.as_deref());
+        let options_json: Vec<serde_json::Value> = request
+            .options
+            .iter()
+            .map(|opt| {
+                serde_json::json!({
+                    "optionId": opt.option_id,
+                    "kind": opt.kind,
+                    "name": opt.name,
+                })
+            })
+            .collect();
+        let session_ref = match (
+            &self.observer_context.session_id,
+            &self.observer_context.turn_id,
+        ) {
+            (Some(session), Some(turn)) => Some(format!("{session}/{turn}")),
+            (Some(session), None) => Some(session.clone()),
+            _ => None,
+        };
+        let body = serde_json::json!({
+            "channel_id": channel_id,
+            "session_ref": session_ref,
+            "request_kind": request_kind_for_tool(tool_kind),
+            "tool_name": tool_kind,
+            "detail": detail_for_tool(tool_call.as_ref(), "agent tool call"),
+            "payload": tool_call.as_ref().and_then(|tc| tc.raw_input.clone()),
+            "options": options_json,
+            "ttl_secs": PERMISSION_TTL_SECS,
+        });
+
+        let resp = match rest.create_permission_request(&body).await {
+            Ok(resp) => resp,
+            Err(e) => return Err((request, e.to_string())),
+        };
+        let Some(relay_request_id) = resp["request_id"]
+            .as_str()
+            .and_then(|s| s.parse::<uuid::Uuid>().ok())
+        else {
+            return Err((
+                request,
+                format!("create response missing request_id: {resp}"),
+            ));
+        };
+        let expires_at = resp["expires_at"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|| {
+                chrono::Utc::now() + chrono::Duration::seconds(PERMISSION_TTL_SECS as i64)
+            });
+
+        tracing::info!(
+            target: "acp::permission",
+            "permission id={} parked as request {relay_request_id} (expires {expires_at})",
+            request.id
+        );
+        self.observe(
+            "permission_parked",
+            serde_json::json!({
+                "requestId": relay_request_id.to_string(),
+                "expiresAt": expires_at.to_rfc3339(),
+            }),
+        );
+
+        self.parked_permission = Some(ParkedPermission {
+            request,
+            relay_request_id,
+            expires_at,
+            next_poll_at: tokio::time::Instant::now() + PERMISSION_POLL_INTERVAL,
+        });
+        Ok(())
+    }
+
+    /// Poll the relay for the parked permission's status; answer the agent
+    /// on a terminal state or local expiry, otherwise re-arm the next poll.
+    async fn poll_parked_permission(&mut self) -> Result<(), AcpError> {
+        let Some(parked) = &self.parked_permission else {
+            return Ok(());
+        };
+        let relay_request_id = parked.relay_request_id;
+        let expires_at = parked.expires_at;
+        let Some(rest) = self.permission_rest.clone() else {
+            // Transport vanished (never happens in practice) — cancel.
+            return self.finish_parked_permission(None).await;
+        };
+
+        let expired_locally = chrono::Utc::now() > expires_at;
+        match rest.fetch_permission_request(relay_request_id).await {
+            Ok(Some(row)) => match row["status"].as_str() {
+                Some("granted") | Some("denied") => {
+                    let decision =
+                        row["decision"]
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| {
+                                if row["status"] == "granted" {
+                                    "allow_once".to_owned()
+                                } else {
+                                    "reject_once".to_owned()
+                                }
+                            });
+                    self.finish_parked_permission(Some(&decision)).await
+                }
+                Some("cancelled") | Some("expired") => self.finish_parked_permission(None).await,
+                _ if expired_locally => {
+                    let _ = rest
+                        .withdraw_permission_request(relay_request_id, "expired")
+                        .await;
+                    self.finish_parked_permission(None).await
+                }
+                _ => {
+                    self.rearm_parked_poll();
+                    Ok(())
+                }
+            },
+            Ok(None) if expired_locally => {
+                let _ = rest
+                    .withdraw_permission_request(relay_request_id, "expired")
+                    .await;
+                self.finish_parked_permission(None).await
+            }
+            Err(_) if expired_locally => {
+                let _ = rest
+                    .withdraw_permission_request(relay_request_id, "expired")
+                    .await;
+                self.finish_parked_permission(None).await
+            }
+            Ok(None) | Err(_) => {
+                // Not visible yet / transient error — retry until expiry.
+                self.rearm_parked_poll();
+                Ok(())
+            }
+        }
+    }
+
+    fn rearm_parked_poll(&mut self) {
+        if let Some(parked) = &mut self.parked_permission {
+            parked.next_poll_at = tokio::time::Instant::now() + PERMISSION_POLL_INTERVAL;
+        }
+    }
+
+    /// Answer the agent for the parked request: a mapped decision
+    /// (`allow_once` / `allow_always` / `reject_once`) or — for `None`,
+    /// `cancel`, and unmappable decisions — a `cancelled` outcome. Never
+    /// approves on a mapping miss.
+    async fn finish_parked_permission(&mut self, decision: Option<&str>) -> Result<(), AcpError> {
+        let Some(parked) = self.parked_permission.take() else {
+            return Ok(());
+        };
+        let response = match decision.and_then(|d| parked.request.response_for_decision(d)) {
+            Some(DecisionResponse::Selected(option_id)) => {
+                tracing::info!(
+                    target: "acp::permission",
+                    "parked permission {} resolved: {} → optionId={option_id:?}",
+                    parked.relay_request_id,
+                    decision.unwrap_or("?"),
+                );
+                permission_response_selected(&parked.request.id, option_id)
+            }
+            _ => {
+                tracing::info!(
+                    target: "acp::permission",
+                    "parked permission {} resolved: cancelled (decision {:?})",
+                    parked.relay_request_id,
+                    decision,
+                );
+                permission_response_cancelled(&parked.request.id)
+            }
+        };
+        self.observe(
+            "permission_resolved",
+            serde_json::json!({
+                "requestId": parked.relay_request_id.to_string(),
+                "decision": decision,
+            }),
+        );
+        self.write_ndjson(&response).await?;
+        self.permission_responded = true;
+        self.pending_permission_id = None;
+        Ok(())
+    }
+
     /// Remember an announced tool call for permission correlation, evicting
     /// the oldest entry beyond [`TOOL_CALL_MEMORY`]. A re-announced id
     /// replaces its earlier entry (agents re-send `tool_call` on retries).
@@ -1904,7 +2199,11 @@ impl AcpClient {
     ///
     /// The request `id` is stored as `serde_json::Value` to support both numeric
     /// and string IDs per JSON-RPC 2.0.
-    async fn handle_permission_request(&mut self, msg: &serde_json::Value) -> Result<(), AcpError> {
+    async fn handle_permission_request(
+        &mut self,
+        msg: &serde_json::Value,
+        parking_armed: bool,
+    ) -> Result<(), AcpError> {
         // Extract id as a Value — JSON-RPC 2.0 allows both numeric and string IDs.
         let id = msg
             .get("id")
@@ -1927,10 +2226,10 @@ impl AcpClient {
             request.options.len()
         );
 
-        // Resolve the gated tool call. Unused by the full-access policy below,
-        // but load-bearing for supervised mode (P3): request kind, human-facing
-        // detail, and payload all come from here.
-        if let Some(tool_call) = self.resolve_tool_call(request.tool_call.as_ref()) {
+        // Resolve the gated tool call: request kind, human-facing detail, and
+        // payload for the gated modes all come from here.
+        let tool_call = self.resolve_tool_call(request.tool_call.as_ref());
+        if let Some(tool_call) = &tool_call {
             tracing::debug!(
                 target: "acp::permission",
                 "permission id={id} gates tool call {}: {} ({})",
@@ -1938,6 +2237,43 @@ impl AcpClient {
                 tool_call.title.as_deref().unwrap_or("?"),
                 tool_call.kind.as_deref().unwrap_or("?"),
             );
+        }
+
+        // Runtime-mode policy: auto-select or park for a human decision.
+        let tool_kind = tool_call.as_ref().and_then(|tc| tc.kind.as_deref());
+        if gate_action(self.runtime_mode, tool_kind) == GateAction::Park {
+            // Parking needs the turn loop's poll integration and a transport;
+            // outside them (init/drain reads, no REST client) the gate still
+            // holds — fail closed with a refusal, never an approval.
+            let request = if parking_armed && self.permission_rest.is_some() {
+                match self.park_permission_request(request, tool_call).await {
+                    Ok(()) => return Ok(()),
+                    Err((request, e)) => {
+                        tracing::warn!(
+                            target: "acp::permission",
+                            "failed to park permission id={id}: {e} — refusing tool call"
+                        );
+                        request
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    target: "acp::permission",
+                    "permission id={id} gated by runtime_mode={} but no parking available — refusing",
+                    self.runtime_mode
+                );
+                request
+            };
+            let response = match request.response_for_decision("reject_once") {
+                Some(DecisionResponse::Selected(option_id)) => {
+                    permission_response_selected(&request.id, option_id)
+                }
+                _ => permission_response_cancelled(&request.id),
+            };
+            self.write_ndjson(&response).await?;
+            self.permission_responded = true;
+            self.pending_permission_id = None;
+            return Ok(());
         }
 
         let response = match request.auto_option().map_err(AcpError::Protocol)? {
@@ -3471,6 +3807,158 @@ mod tests {
         AcpClient::spawn("cat", &[], &[], false)
             .await
             .expect("spawn cat as inert client")
+    }
+
+    // ── Runtime-mode permission gate ─────────────────────────────────────
+
+    /// Build a `session/request_permission` request with the given options
+    /// and optional `toolCall` reference.
+    fn permission_request_msg(
+        options: serde_json::Value,
+        tool_call: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut params = serde_json::json!({ "sessionId": "s", "options": options });
+        if let Some(tc) = tool_call {
+            params["toolCall"] = tc;
+        }
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "session/request_permission",
+            "params": params,
+        })
+    }
+
+    /// Read back the response the client wrote (echoed by the `cat` child).
+    async fn echoed_response(client: &mut AcpClient) -> serde_json::Value {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), client.reader.next())
+            .await
+            .expect("response within 5s")
+            .expect("stream open")
+            .expect("read ok");
+        serde_json::from_str(&line).expect("response is JSON")
+    }
+
+    fn both_options() -> serde_json::Value {
+        serde_json::json!([
+            { "optionId": "yes", "kind": "allow_once" },
+            { "optionId": "no", "kind": "reject_once" },
+        ])
+    }
+
+    fn execute_tool_call() -> serde_json::Value {
+        serde_json::json!({ "toolCallId": "c1", "title": "rm -rf /", "kind": "execute" })
+    }
+
+    #[tokio::test]
+    async fn full_access_auto_approves_permission() {
+        let mut client = spawn_inert_client().await;
+        // Default runtime mode is FullAccess — no gate call needed.
+        let msg = permission_request_msg(both_options(), Some(execute_tool_call()));
+        client
+            .handle_permission_request(&msg, true)
+            .await
+            .expect("handled");
+        let resp = echoed_response(&mut client).await;
+        assert_eq!(resp["result"]["outcome"]["outcome"], "selected");
+        assert_eq!(resp["result"]["outcome"]["optionId"], "yes");
+        assert!(client.permission_responded);
+    }
+
+    #[tokio::test]
+    async fn supervised_without_transport_fails_closed_to_reject() {
+        let mut client = spawn_inert_client().await;
+        client.set_permission_gate(crate::config::RuntimeMode::Supervised, None);
+        let msg = permission_request_msg(both_options(), Some(execute_tool_call()));
+        client
+            .handle_permission_request(&msg, true)
+            .await
+            .expect("handled");
+        let resp = echoed_response(&mut client).await;
+        assert_eq!(
+            resp["result"]["outcome"]["optionId"], "no",
+            "gated request without a parking transport must refuse, never approve"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_fail_closed_cancels_without_reject_option() {
+        let mut client = spawn_inert_client().await;
+        client.set_permission_gate(crate::config::RuntimeMode::Supervised, None);
+        let msg = permission_request_msg(
+            serde_json::json!([{ "optionId": "yes", "kind": "allow_once" }]),
+            Some(execute_tool_call()),
+        );
+        client
+            .handle_permission_request(&msg, true)
+            .await
+            .expect("handled");
+        let resp = echoed_response(&mut client).await;
+        assert_eq!(
+            resp["result"]["outcome"]["outcome"], "cancelled",
+            "no reject option offered — cancel rather than approve"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_accept_edits_approves_edits_gates_commands() {
+        let mut client = spawn_inert_client().await;
+        client.set_permission_gate(crate::config::RuntimeMode::AutoAcceptEdits, None);
+
+        // An edit-kind tool call is auto-approved.
+        let edit = permission_request_msg(
+            both_options(),
+            Some(serde_json::json!({ "toolCallId": "c2", "title": "apply patch", "kind": "edit" })),
+        );
+        client
+            .handle_permission_request(&edit, true)
+            .await
+            .expect("handled edit");
+        let resp = echoed_response(&mut client).await;
+        assert_eq!(resp["result"]["outcome"]["optionId"], "yes");
+
+        // A command is gated; without a transport it fails closed.
+        let exec = permission_request_msg(both_options(), Some(execute_tool_call()));
+        client
+            .handle_permission_request(&exec, true)
+            .await
+            .expect("handled exec");
+        let resp = echoed_response(&mut client).await;
+        assert_eq!(resp["result"]["outcome"]["optionId"], "no");
+    }
+
+    #[tokio::test]
+    async fn gate_correlates_kind_from_announced_tool_call() {
+        let mut client = spawn_inert_client().await;
+        client.set_permission_gate(crate::config::RuntimeMode::AutoAcceptEdits, None);
+
+        // The tool_call session/update announces kind=edit; the permission
+        // request itself carries only the id (claude-code-acp shape).
+        let update = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": { "sessionId": "s", "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "c3",
+                "title": "apply patch",
+                "kind": "edit",
+            }},
+        });
+        client.handle_session_update(&update);
+
+        let msg = permission_request_msg(
+            both_options(),
+            Some(serde_json::json!({ "toolCallId": "c3" })),
+        );
+        client
+            .handle_permission_request(&msg, true)
+            .await
+            .expect("handled");
+        let resp = echoed_response(&mut client).await;
+        assert_eq!(
+            resp["result"]["outcome"]["optionId"], "yes",
+            "kind resolved from the announcement must auto-approve the edit"
+        );
     }
 
     /// Build a `session/update` JSON-RPC notification carrying a
