@@ -33,6 +33,18 @@ repo (relay-signed kind:30617). Guest role disabled in depth.
 `BUZZ_WORKSPACE_CHANNEL_GATE` (default **off**) gates non-DM channel
 creation to workspace owner/admin when enabled.
 
+**Phase 2h — folder/file write ACLs (D4).** `buzz-path-acl` tags on
+kind:30617 (`buzz_core::path_acl`): path patterns → `write:<role>` /
+`write:<64-hex pubkey>` / `readonly`, most-specific-wins with ties
+unioned; opt-in per repo (no tags = upstream behavior). The pre-receive
+hook now collects changed paths (diff for updates, `rev-list --not --all`
++ diff-tree for creates, none for deletes), dedupes them, and signs them
+into the callback HMAC — a bash/Rust parity test pins the format. The
+policy endpoint enforces after `evaluate_push` and **fails closed** when
+ACLs exist but the path list is unavailable, truncated (>5000), or
+missing (older hook). `readonly` is what keeps relay-owned `canon/` and
+`promoted/` layers safe from hand-edits.
+
 **Phase 2g — personal channels + promotion.** `personal_channels`
 registry (migration 0031; one per member, created atomically with the
 channel via a `personal` tag on kind:9007 — member-creatable even under
@@ -122,19 +134,15 @@ serialize so exactly one winner survives) and emits kind:47013 notices.
 
 ## Next slices (roadmap Phase 2 remainder, then Phase 3+)
 
-1. **2h — folder/file write ACLs (D4)**: per-path rules in the pre-receive
-   policy hook (`api/git/hook.rs` / `policy.rs`) + agent tool layer. Note:
-   the hook currently sees ref updates, not changed paths — it needs the
-   pack/paths surfaced (see mapping notes in git history of this branch).
-2. **buzz-acp worktree binding**: align agent workspaces onto thread
+1. **buzz-acp worktree binding**: align agent workspaces onto thread
    worktrees; emit kind:47010 checkpoints automatically at turn end
    (today checkpoints are CLI/manual).
-3. **Command-kind timeout gate** (found in the 2f review, pre-existing
+2. **Command-kind timeout gate** (found in the 2f review, pre-existing
    since Phase 1): ingest routes command kinds (47001/47002/47021, DM,
    workflow, approval commands) to the command executor *before* the
    moderation timeout write-block, so a timed-out admin can still issue
    them. Decide intended semantics, then move or mirror the gate.
-4. Phase 2 exit-criterion dry run from buzz-cli (roadmap lines 87–100),
+3. Phase 2 exit-criterion dry run from buzz-cli (roadmap lines 87–100),
    then Phase 3 (model plane) per roadmap.
 
 ## Suggested kickoff prompt for a fresh session

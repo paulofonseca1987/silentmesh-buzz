@@ -180,9 +180,42 @@ on their next `personal` create.
   the git API); if the forge is init-on-first-push, the binding row plus a
   server-side init is used instead — resolved during implementation
   against the mapped seam.
-- File ACLs (D4, slice 2h) remain; nothing shipped so far blocks them.
-  (Forking, checkpoints, canonicalization, personal channels, and
-  promotion shipped in 2d–2g.)
+- Everything in the Phase 2 scope list has shipped (2a–2h). The agent
+  tool layer's half of D4 (binding the same path rules inside agent file
+  tools) rides with the buzz-acp worktree work rather than this slice.
+
+## 7. Folder/file write ACLs (2h, D4)
+
+`buzz-protect` tags say *which refs* a role may update; `buzz-path-acl`
+tags add the orthogonal axis — *which paths inside the tree* a member may
+write. Both ride the same kind:30617 repo announcement, so a channel's
+repo carries its own ACLs.
+
+```text
+["buzz-path-acl", "<path-pattern>", "write:<role>" | "write:<64-hex>" | "readonly", ...]
+```
+
+Patterns are the ref-pattern grammar without the `refs/` requirement
+(literal segments, `*` = one segment, trailing `**` = one or more);
+absolute paths and `..` are rejected. Matching is **most-specific-wins**
+(most literal segments); equally-specific rules union, so two rules can
+never silently disagree. `readonly` closes a path to every pusher
+including the owner — that is how the relay-owned `canon/` and
+`promoted/` layers are protected from hand-edits while the relay's own
+grafts (which bypass the hook) keep writing them. Repos with no
+`buzz-path-acl` tags behave exactly as upstream.
+
+Enforcement needs the changed paths, which the hook did not previously
+compute. The pre-receive script now collects them per ref update — `git
+diff --name-only old new` for updates, `git rev-list new --not --all` +
+`diff-tree` for creates (so a new branch reports only its own commits),
+nothing for deletes — dedupes, and sends them **inside the HMAC**
+(length-prefixed, matching `compute_hmac`), so a compromised hook cannot
+strip paths to dodge ACLs. A bash/Rust parity test pins that agreement.
+When a repo has ACLs and the path list is unusable — git failed
+(`!PATHS_UNAVAILABLE`), the push exceeds the 5000-path cap
+(`!PATHS_TRUNCATED`), or an older hook sent no list at all — the endpoint
+**fails closed** rather than guessing.
 
 Known limitations shared with upstream patterns (recorded 2f review):
 

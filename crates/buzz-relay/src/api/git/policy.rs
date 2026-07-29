@@ -43,6 +43,7 @@ use uuid::Uuid;
 
 use buzz_core::channel::MemberRole;
 use buzz_core::git_perms::{evaluate_push, parse_protection_tags, Denial, RefUpdate, UpdateKind};
+use buzz_core::path_acl::{evaluate_path_writes, parse_path_acl_tags, MAX_REPORTED_PATHS};
 use buzz_db::EventQuery;
 
 use crate::state::AppState;
@@ -64,6 +65,12 @@ pub struct HookCallbackRequest {
     pub pusher_pubkey: String,
     /// Ref updates from git stdin (old_oid, new_oid, ref_name, is_ancestor).
     pub ref_updates: Vec<HookRefUpdate>,
+    /// silent-mesh (D4): sorted-unique worktree paths this push writes, for
+    /// folder/file write ACLs. Absent on older hooks (treated as
+    /// unavailable → fail closed when the repo has ACLs); may contain the
+    /// `!PATHS_TRUNCATED` / `!PATHS_UNAVAILABLE` markers instead of paths.
+    #[serde(default)]
+    pub changed_paths: Vec<String>,
     /// Unix timestamp when the hook was invoked.
     pub timestamp: u64,
     /// HMAC-SHA256 signature over the canonical payload.
@@ -148,6 +155,15 @@ fn compute_hmac(secret: &[u8], req: &HookCallbackRequest) -> Vec<u8> {
         mac.update(b":");
         mac.update(r.ref_name.as_bytes());
         mac.update(if r.is_ancestor { b"1" } else { b"0" });
+    }
+    mac.update(b"|");
+    // silent-mesh (D4): the changed-path list is signed too, so a
+    // compromised hook cannot strip paths to dodge ACLs. The hook sends it
+    // sorted-unique; each entry is length-prefixed.
+    for p in &req.changed_paths {
+        mac.update(p.len().to_string().as_bytes());
+        mac.update(b":");
+        mac.update(p.as_bytes());
     }
     mac.update(b"|");
     mac.update(req.timestamp.to_string().as_bytes());
@@ -397,25 +413,79 @@ pub async fn hook_policy_check(
         })
         .collect();
 
-    match evaluate_push(&updates, git_role, &rules) {
-        Ok(()) => Json(HookCallbackResponse {
-            allowed: true,
-            denials: vec![],
-        })
-        .into_response(),
-        Err(denials) => {
+    if let Err(denials) = evaluate_push(&updates, git_role, &rules) {
+        let response = HookCallbackResponse {
+            allowed: false,
+            denials: denials.into_iter().map(DenialResponse::from).collect(),
+        };
+        return (StatusCode::FORBIDDEN, Json(response)).into_response();
+    }
+
+    // 10. silent-mesh (D4): folder/file write ACLs. Opt-in per repo — with
+    // no `buzz-path-acl` tags this is a no-op, preserving upstream
+    // behavior. When ACLs exist the path list must be trustworthy, so an
+    // unavailable or truncated list fails closed.
+    let path_acls = match parse_path_acl_tags(&tags) {
+        Ok(parsed) => {
+            for unknown in &parsed.unknown_rules {
+                warn!(repo = %req.repo_id, rule = %unknown, "unknown buzz-path-acl rule (skipped)");
+            }
+            parsed.rules
+        }
+        Err(e) => {
+            warn!(repo = %req.repo_id, error = %e, "hook callback: malformed path ACLs");
+            return (StatusCode::FORBIDDEN, "malformed path ACLs").into_response();
+        }
+    };
+    if !path_acls.is_empty() {
+        let deletes_only = updates.iter().all(|u| matches!(u.kind, UpdateKind::Delete));
+        let unusable = req
+            .changed_paths
+            .iter()
+            .any(|p| p == "!PATHS_UNAVAILABLE" || p == "!PATHS_TRUNCATED");
+        if unusable || (req.changed_paths.is_empty() && !deletes_only) {
+            warn!(
+                repo = %req.repo_id,
+                "hook callback: path list unusable while path ACLs are configured"
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                "changed-path list unavailable or too large to evaluate against this repo's \
+                 path ACLs — push a smaller change",
+            )
+                .into_response();
+        }
+        if req.changed_paths.len() > MAX_REPORTED_PATHS {
+            return (StatusCode::FORBIDDEN, "too many changed paths").into_response();
+        }
+        if let Err(denials) =
+            evaluate_path_writes(&req.changed_paths, git_role, &req.pusher_pubkey, &path_acls)
+        {
             let response = HookCallbackResponse {
                 allowed: false,
-                denials: denials.into_iter().map(DenialResponse::from).collect(),
+                denials: denials
+                    .into_iter()
+                    .map(|d| DenialResponse {
+                        ref_name: d.path,
+                        reason: d.reason,
+                    })
+                    .collect(),
             };
-            (StatusCode::FORBIDDEN, Json(response)).into_response()
+            return (StatusCode::FORBIDDEN, Json(response)).into_response();
         }
     }
+
+    Json(HookCallbackResponse {
+        allowed: true,
+        denials: vec![],
+    })
+    .into_response()
 }
 
 /// Generate the HMAC signature for a hook callback payload.
 ///
 /// Called by the relay when setting up the pre-receive hook environment.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_hook_hmac(
     secret: &[u8],
     repo_id: &str,
@@ -423,6 +493,7 @@ pub fn generate_hook_hmac(
     community_id: &str,
     pusher_pubkey: &str,
     ref_updates: &[HookRefUpdate],
+    changed_paths: &[String],
     timestamp: u64,
 ) -> String {
     let req = HookCallbackRequest {
@@ -431,6 +502,7 @@ pub fn generate_hook_hmac(
         community_id: community_id.to_string(),
         pusher_pubkey: pusher_pubkey.to_string(),
         ref_updates: ref_updates.to_vec(),
+        changed_paths: changed_paths.to_vec(),
         timestamp,
         signature: String::new(), // Not used in computation.
     };
@@ -454,6 +526,7 @@ mod tests {
                 ref_name: "refs/heads/main".to_string(),
                 is_ancestor: true,
             }],
+            changed_paths: vec!["src/main.rs".to_string()],
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -516,6 +589,135 @@ mod tests {
         sign_request(&mut req, secret);
         req.ref_updates[0].is_ancestor = false; // Flip FF → NFF
         assert!(!verify_hmac(secret, &req));
+    }
+
+    /// silent-mesh (D4): the endpoint's path-ACL decision surface, exercised
+    /// through the same parse → evaluate path the handler takes (the handler
+    /// itself needs live Postgres; these pin the policy logic and the
+    /// fail-closed markers).
+    #[test]
+    fn path_acl_enforcement_and_fail_closed_markers() {
+        use buzz_core::path_acl::{evaluate_path_writes, parse_path_acl_tags};
+
+        let writer = "a".repeat(64);
+        let stranger = "b".repeat(64);
+        let tags: Vec<Vec<String>> = vec![
+            vec!["d".into(), "repo".into()],
+            vec![
+                "buzz-protect".into(),
+                "refs/heads/main".into(),
+                "no-force-push".into(),
+            ],
+            vec!["buzz-path-acl".into(), "canon/**".into(), "readonly".into()],
+            vec![
+                "buzz-path-acl".into(),
+                "infra/**".into(),
+                "write:admin".into(),
+                format!("write:{writer}"),
+            ],
+        ];
+        let acls = parse_path_acl_tags(&tags).expect("parse").rules;
+        assert_eq!(acls.len(), 2, "buzz-protect tags must not become ACLs");
+
+        // Ordinary paths are unrestricted.
+        assert!(evaluate_path_writes(
+            &["src/main.rs".into()],
+            MemberRole::Member,
+            &stranger,
+            &acls
+        )
+        .is_ok());
+        // The relay-owned canon layer is closed to pushes, owner included.
+        assert!(evaluate_path_writes(
+            &["canon/abc/notes.md".into()],
+            MemberRole::Owner,
+            &stranger,
+            &acls
+        )
+        .is_err());
+        // Role gate and explicit allowlist both open infra/.
+        assert!(evaluate_path_writes(
+            &["infra/deploy.yaml".into()],
+            MemberRole::Admin,
+            &stranger,
+            &acls
+        )
+        .is_ok());
+        assert!(evaluate_path_writes(
+            &["infra/deploy.yaml".into()],
+            MemberRole::Member,
+            &writer,
+            &acls
+        )
+        .is_ok());
+        let denials = evaluate_path_writes(
+            &["infra/deploy.yaml".into(), "src/ok.rs".into()],
+            MemberRole::Member,
+            &stranger,
+            &acls,
+        )
+        .expect_err("member without allowlist is refused");
+        assert_eq!(denials.len(), 1);
+        assert_eq!(denials[0].path, "infra/deploy.yaml");
+
+        // A repo with no ACL tags keeps upstream behavior exactly.
+        let plain = parse_path_acl_tags(&[vec![
+            "buzz-protect".into(),
+            "refs/heads/*".into(),
+            "no-delete".into(),
+        ]])
+        .expect("parse")
+        .rules;
+        assert!(plain.is_empty());
+        assert!(
+            evaluate_path_writes(&["anything".into()], MemberRole::Member, &stranger, &plain)
+                .is_ok()
+        );
+
+        // The hook's fail-closed markers are recognized as unusable input.
+        for marker in ["!PATHS_UNAVAILABLE", "!PATHS_TRUNCATED"] {
+            let paths = [marker.to_string()];
+            let unusable = paths
+                .iter()
+                .any(|p| p == "!PATHS_UNAVAILABLE" || p == "!PATHS_TRUNCATED");
+            assert!(unusable, "{marker} must be treated as unusable");
+        }
+    }
+
+    /// silent-mesh (D4): the changed-path list is HMAC-bound, so a
+    /// compromised hook cannot strip or rewrite paths to dodge ACLs.
+    #[test]
+    fn hmac_tampered_changed_paths_rejected() {
+        let secret = b"test-secret";
+
+        let mut stripped = make_request();
+        sign_request(&mut stripped, secret);
+        stripped.changed_paths.clear();
+        assert!(!verify_hmac(secret, &stripped), "dropping paths must fail");
+
+        let mut rewritten = make_request();
+        sign_request(&mut rewritten, secret);
+        rewritten.changed_paths[0] = "infra/deploy.yaml".to_string();
+        assert!(
+            !verify_hmac(secret, &rewritten),
+            "rewriting a path must fail"
+        );
+
+        let mut appended = make_request();
+        sign_request(&mut appended, secret);
+        appended.changed_paths.push("extra.txt".to_string());
+        assert!(!verify_hmac(secret, &appended), "adding a path must fail");
+
+        // Length prefixing prevents concatenation ambiguity: ["ab","c"] and
+        // ["a","bc"] must not share a signature.
+        let mut a = make_request();
+        a.changed_paths = vec!["ab".into(), "c".into()];
+        sign_request(&mut a, secret);
+        let mut b = make_request();
+        b.changed_paths = vec!["a".into(), "bc".into()];
+        b.timestamp = a.timestamp;
+        b.signature = a.signature.clone();
+        assert!(!verify_hmac(secret, &b));
     }
 
     #[test]
@@ -585,6 +787,7 @@ mod tests {
             &req.community_id,
             &req.pusher_pubkey,
             &req.ref_updates,
+            &req.changed_paths,
             req.timestamp,
         );
         req.signature = sig;
@@ -621,6 +824,11 @@ mod tests {
                 is_ancestor: false,
             },
         ];
+        // silent-mesh (D4): the changed-path list rides the same signature.
+        let changed_paths = vec![
+            "docs/readme.md".to_string(),
+            "infra/deploy.yaml".to_string(),
+        ];
 
         // Compute Rust-side HMAC.
         let rust_sig = generate_hook_hmac(
@@ -630,6 +838,7 @@ mod tests {
             &community_id,
             &pusher,
             &ref_updates,
+            &changed_paths,
             timestamp,
         );
 
@@ -662,7 +871,16 @@ sort "$HMAC_FILE" | while IFS=' ' read -r ref_name old_oid new_oid is_anc; do
     REF_LEN=${{#ref_name}}
     printf '%s%s%s:%s%s' "$old_oid" "$new_oid" "$REF_LEN" "$ref_name" "$is_anc"
 done > "$HMAC_FILE.concat"
-HMAC_INPUT="${{HMAC_INPUT}}$(cat "$HMAC_FILE.concat")|${{TIMESTAMP}}"
+HMAC_INPUT="${{HMAC_INPUT}}$(cat "$HMAC_FILE.concat")|"
+
+# silent-mesh (D4): length-prefixed changed paths, sorted-unique like the hook.
+PATHS_HMAC="$WORK_DIR/paths.hmac"
+printf '%s\n' "{path1}" "{path2}" | sort -u > "$PATHS_HMAC"
+while IFS= read -r p; do
+    P_LEN=${{#p}}
+    printf '%s:%s' "$P_LEN" "$p"
+done < "$PATHS_HMAC" > "$PATHS_HMAC.concat"
+HMAC_INPUT="${{HMAC_INPUT}}$(cat "$PATHS_HMAC.concat")|${{TIMESTAMP}}"
 
 # Compute HMAC-SHA256
 printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "$BUZZ_HOOK_SECRET" -hex 2>/dev/null | sed 's/.*= //'
@@ -677,6 +895,8 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "$BUZZ_HOOK_SECRET" -hex 
             new1 = "c".repeat(40),
             old2 = "a".repeat(40),
             new2 = "d".repeat(40),
+            path1 = changed_paths[0],
+            path2 = changed_paths[1],
         );
 
         let output = std::process::Command::new("bash")
@@ -724,6 +944,7 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "$BUZZ_HOOK_SECRET" -hex 
             &community_id,
             &pusher,
             &ref_updates,
+            &[],
             timestamp,
         );
 
@@ -741,7 +962,7 @@ sort "$HMAC_FILE" | while IFS=' ' read -r ref_name old_oid new_oid is_anc; do
     REF_LEN=${{#ref_name}}
     printf '%s%s%s:%s%s' "$old_oid" "$new_oid" "$REF_LEN" "$ref_name" "$is_anc"
 done > "$HMAC_FILE.concat"
-HMAC_INPUT="${{HMAC_INPUT}}$(cat "$HMAC_FILE.concat")|{timestamp}"
+HMAC_INPUT="${{HMAC_INPUT}}$(cat "$HMAC_FILE.concat")||{timestamp}"
 printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/null | sed 's/.*= //'
 "#,
             old = "1".repeat(40),

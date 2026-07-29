@@ -59,6 +59,8 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 #   REFS_FILE: JSON entries (unsorted, for the request body)
 #   HMAC_FILE: "ref_name old_oid new_oid" lines (for sorting → HMAC input)
 REFS=""
+PATHS_FILE="$WORK_DIR/paths"
+: > "$PATHS_FILE"
 while read -r old_oid new_oid ref_name; do
     # Ancestry check for FF detection.
     # CRITICAL: GIT_OBJECT_DIRECTORY and GIT_ALTERNATE_OBJECT_DIRECTORIES are
@@ -70,6 +72,27 @@ while read -r old_oid new_oid ref_name; do
         # exit 128 = error → treat as NFF (fail-closed).
         if git merge-base --is-ancestor "$old_oid" "$new_oid" 2>/dev/null; then
             IS_ANCESTOR="true"
+        fi
+    fi
+
+    # silent-mesh (D4): collect the worktree paths this update writes, so the
+    # policy endpoint can enforce folder/file write ACLs. Deletes touch no
+    # paths. For updates we diff old..new; for creates we diff every commit
+    # reachable from new but not from any existing ref (`--not --all`), which
+    # covers a brand-new branch without walking shared history. Any git
+    # failure leaves the marker file, and the endpoint fails closed when the
+    # repo has ACLs.
+    if [ "$new_oid" != "$ZERO" ]; then
+        if [ "$old_oid" != "$ZERO" ]; then
+            git diff --name-only --no-renames "$old_oid" "$new_oid" >> "$PATHS_FILE" 2>/dev/null \
+                || echo "!PATHS_UNAVAILABLE" >> "$PATHS_FILE"
+        else
+            git rev-list "$new_oid" --not --all 2>/dev/null \
+                | while read -r commit; do
+                    git diff-tree -r --no-commit-id --name-only --no-renames "$commit" 2>/dev/null \
+                        || echo "!PATHS_UNAVAILABLE"
+                done >> "$PATHS_FILE" \
+                || echo "!PATHS_UNAVAILABLE" >> "$PATHS_FILE"
         fi
     fi
 
@@ -92,9 +115,35 @@ while read -r old_oid new_oid ref_name; do
     fi
 done
 
+# Phase 1b: Deduplicate + bound the changed-path list (silent-mesh D4).
+# Sorted-unique keeps the HMAC deterministic; the cap must match
+# MAX_REPORTED_PATHS in buzz-core::path_acl. Over the cap we send the
+# truncation marker instead of a partial list — the endpoint fails closed
+# when the repo has path ACLs.
+MAX_PATHS=5000
+PATHS_JSON=""
+PATHS_HMAC="$WORK_DIR/paths.hmac"
+: > "$PATHS_HMAC"
+if [ -s "$PATHS_FILE" ]; then
+    sort -u "$PATHS_FILE" > "$PATHS_FILE.uniq"
+    PATH_COUNT=$(wc -l < "$PATHS_FILE.uniq" | tr -d ' ')
+    if [ "$PATH_COUNT" -gt "$MAX_PATHS" ]; then
+        printf '!PATHS_TRUNCATED\n' > "$PATHS_FILE.uniq"
+    fi
+    while IFS= read -r p; do
+        SAFE_PATH=$(printf '%s' "$p" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        if [ -n "$PATHS_JSON" ]; then
+            PATHS_JSON="${PATHS_JSON},"
+        fi
+        PATHS_JSON="${PATHS_JSON}\"${SAFE_PATH}\""
+        printf '%s' "$p" >> "$PATHS_HMAC"
+        printf '\n' >> "$PATHS_HMAC"
+    done < "$PATHS_FILE.uniq"
+fi
+
 # Phase 2: Compute HMAC-SHA256 signature.
 # Payload format MUST match relay's compute_hmac() in policy.rs:
-#   repo_id | repo_owner | community_id | pusher_pubkey | (old_oid + new_oid + ref_name + is_ancestor) per ref sorted by ref_name | timestamp
+#   repo_id | repo_owner | community_id | pusher_pubkey | (old_oid + new_oid + ref_name + is_ancestor) per ref sorted by ref_name | sorted paths | timestamp
 TIMESTAMP=$(date +%s)
 
 # Structurally unambiguous HMAC format (matches Rust's compute_hmac):
@@ -110,6 +159,18 @@ if [ -f "$HMAC_FILE" ]; then
     HMAC_INPUT="${HMAC_INPUT}$(cat "$HMAC_FILE.concat")"
     rm -f "$HMAC_FILE.concat"
 fi
+# silent-mesh (D4): bind the changed-path list into the signature, so a
+# compromised hook cannot strip paths to dodge ACLs. Each path is
+# length-prefixed, matching Rust's compute_hmac.
+HMAC_INPUT="${HMAC_INPUT}|"
+if [ -s "$PATHS_HMAC" ]; then
+    while IFS= read -r p; do
+        P_LEN=${#p}
+        printf '%s:%s' "$P_LEN" "$p"
+    done < "$PATHS_HMAC" > "$PATHS_HMAC.concat"
+    HMAC_INPUT="${HMAC_INPUT}$(cat "$PATHS_HMAC.concat")"
+    rm -f "$PATHS_HMAC.concat"
+fi
 HMAC_INPUT="${HMAC_INPUT}|${TIMESTAMP}"
 
 SIGNATURE=$(printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "$BUZZ_HOOK_SECRET" -hex 2>/dev/null | sed 's/.*= //')
@@ -122,7 +183,7 @@ fi
 # repo_id is free-form (user-chosen d-tag) — must be escaped for JSON safety.
 # repo_owner, community_id, and pusher_pubkey are validated fixed-shape strings — no escaping needed.
 SAFE_REPO_ID=$(printf '%s' "$BUZZ_REPO_ID" | sed 's/\\/\\\\/g; s/"/\\"/g')
-BODY="{\"repo_id\":\"${SAFE_REPO_ID}\",\"repo_owner\":\"${BUZZ_REPO_OWNER}\",\"community_id\":\"${BUZZ_COMMUNITY_ID}\",\"pusher_pubkey\":\"${BUZZ_PUSHER_PUBKEY}\",\"ref_updates\":[${REFS}],\"timestamp\":${TIMESTAMP},\"signature\":\"${SIGNATURE}\"}"
+BODY="{\"repo_id\":\"${SAFE_REPO_ID}\",\"repo_owner\":\"${BUZZ_REPO_OWNER}\",\"community_id\":\"${BUZZ_COMMUNITY_ID}\",\"pusher_pubkey\":\"${BUZZ_PUSHER_PUBKEY}\",\"ref_updates\":[${REFS}],\"changed_paths\":[${PATHS_JSON}],\"timestamp\":${TIMESTAMP},\"signature\":\"${SIGNATURE}\"}"
 
 HTTP_CODE=$(curl --silent --max-time 10 \
     -o "$RESP_FILE" \
@@ -180,6 +241,94 @@ pub async fn install_hook(repo_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::PRE_RECEIVE_HOOK;
+
+    /// silent-mesh (D4): the hook's path-collection phase, exercised against
+    /// a real repository. Runs the extracted collection logic (the same
+    /// commands the hook issues) for an update, a create, and a delete, and
+    /// checks the sorted-unique list the policy endpoint will receive.
+    #[test]
+    fn hook_collects_changed_paths_for_updates_creates_and_deletes() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let repo = dir.path();
+        let sh = |script: &str| -> String {
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(script)
+                .current_dir(repo)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@test")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@test")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("HOME", repo)
+                .output()
+                .expect("run bash");
+            assert!(
+                out.status.success(),
+                "script failed: {script}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+
+        sh("git init -q -b main .");
+        sh(
+            "mkdir -p src infra && echo a > src/a.rs && echo b > infra/deploy.yaml \
+            && git add -A && git commit -qm one",
+        );
+        let base = sh("git rev-parse HEAD");
+        sh("echo a2 > src/a.rs && echo c > docs.md && git add -A && git commit -qm two");
+        let head = sh("git rev-parse HEAD");
+
+        // The hook's exact collection commands, extracted.
+        let collect = |old: &str, new: &str| -> Vec<String> {
+            let zero = "0".repeat(40);
+            let script = if new == zero {
+                String::from("true")
+            } else if old == zero {
+                format!(
+                    "git rev-list {new} --not --all | while read -r c; do \
+                     git diff-tree -r --no-commit-id --name-only --no-renames \"$c\"; done"
+                )
+            } else {
+                format!("git diff --name-only --no-renames {old} {new}")
+            };
+            let out = sh(&format!("{script} | sort -u"));
+            out.lines()
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+
+        // Update: only what changed between the two commits.
+        assert_eq!(
+            collect(&base, &head),
+            vec!["docs.md".to_owned(), "src/a.rs".to_owned()]
+        );
+
+        // Create of a branch whose commits are already reachable from an
+        // existing ref contributes nothing new (`--not --all`).
+        sh("git branch feature HEAD");
+        let feature = sh("git rev-parse feature");
+        assert!(collect(&"0".repeat(40), &feature).is_empty());
+
+        // Create carrying a genuinely new commit reports its paths. The
+        // incoming commit must be reachable from NO existing ref — that is
+        // what a real pre-receive sees (objects in quarantine, ref not yet
+        // created), so build it and then drop the branch that named it.
+        sh("git checkout -q -b staging && echo x > newfile.txt \
+            && git add -A && git commit -qm three");
+        let incoming = sh("git rev-parse HEAD");
+        sh("git checkout -q main && git branch -qD staging");
+        assert_eq!(
+            collect(&"0".repeat(40), &incoming),
+            vec!["newfile.txt".to_owned()],
+            "a create must report the paths of commits not reachable from any ref"
+        );
+
+        // Delete touches no paths.
+        assert!(collect(&head, &"0".repeat(40)).is_empty());
+    }
 
     #[test]
     fn runtime_image_installs_pre_receive_hook_tools() {

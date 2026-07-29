@@ -30,6 +30,8 @@ pub mod network;
 pub mod observer;
 /// NIP-AB device pairing — crypto primitives, message types, and errors.
 pub mod pairing;
+/// Folder/file write ACLs for channel repos (Silent Mesh D4).
+pub mod path_acl;
 /// Presence status types shared across crates.
 pub mod presence;
 /// Canonical relay runtime identities.
