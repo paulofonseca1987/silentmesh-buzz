@@ -1809,12 +1809,28 @@ async fn ingest_event_inner(
         // member/open gate here lets the owning human act on private agent channels
         // without being a member (OQ1 decision; see validate_edit_ownership /
         // validate_admin_event for per-kind enforcement).
-        let skip_membership = kind_u32 == KIND_NIP29_JOIN_REQUEST
+        let mut skip_membership = kind_u32 == KIND_NIP29_JOIN_REQUEST
             || kind_u32 == KIND_NIP29_CREATE_GROUP
             || kind_u32 == KIND_STREAM_MESSAGE_EDIT
             || kind_u32 == KIND_NIP29_EDIT_METADATA
             || kind_u32 == KIND_NIP29_DELETE_EVENT
             || kind_u32 == KIND_NIP29_DELETE_GROUP;
+        // silent-mesh (D42): a workspace owner/admin may administer channel
+        // membership (kind 9000) without being a member of the channel —
+        // Channel-Admin appointment is a workspace-authority action. The
+        // per-kind validator still enforces the actual grant rules.
+        if !skip_membership && kind_u32 == KIND_NIP29_PUT_USER {
+            let actor_hex = event.pubkey.to_hex();
+            if let Ok(Some(member)) = state
+                .db
+                .get_relay_member(tenant.community(), &actor_hex)
+                .await
+            {
+                if member.role == "owner" || member.role == "admin" {
+                    skip_membership = true;
+                }
+            }
+        }
         if !skip_membership {
             // Spec AuthCheck (line 794): emit the verdict at the actual
             // call site. claimed_community comes from the event's h tag
@@ -2128,6 +2144,42 @@ async fn ingest_event_inner(
             channel_type_str.parse().map_err(|_| {
                 IngestError::Rejected(format!("invalid channel_type: {channel_type_str}"))
             })?;
+        // silent-mesh: the immutable privacy tier (D24/D26) is declared at
+        // creation via a `tier` tag; absent means `open` (loosest).
+        let tier_str = event
+            .tags
+            .iter()
+            .find_map(|t| {
+                if t.kind().to_string() == "tier" {
+                    t.content().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "open".to_string());
+        let tier: buzz_db::channel::ChannelTier = tier_str
+            .parse()
+            .map_err(|_| IngestError::Rejected(format!("invalid tier: {tier_str}")))?;
+
+        // silent-mesh: team-channel creation is a workspace-authority action
+        // (D42) when the deployment enables the gate. DM channels never ride
+        // kind:9007, so this covers exactly the team surfaces.
+        if state.config.workspace_channel_gate {
+            let actor_hex = event.pubkey.to_hex();
+            let member = state
+                .db
+                .get_relay_member(tenant.community(), &actor_hex)
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: relay member lookup: {e}")))?;
+            let authorized = member
+                .map(|m| m.role == "owner" || m.role == "admin")
+                .unwrap_or(false);
+            if !authorized {
+                return Err(IngestError::Rejected(
+                    "restricted: channel creation requires workspace owner/admin".into(),
+                ));
+            }
+        }
 
         if let Some(client_uuid) = channel_id {
             let name = create_name.unwrap_or_default();
@@ -2146,12 +2198,13 @@ async fn ingest_event_inner(
             let actor_bytes = event.pubkey.to_bytes().to_vec();
             let (_, was_created) = state
                 .db
-                .create_channel_with_id(
+                .create_channel_with_id_tiered(
                     tenant.community(),
                     client_uuid,
                     name,
                     channel_type,
                     visibility,
+                    tier,
                     description.as_deref(),
                     &actor_bytes,
                     ttl_seconds,

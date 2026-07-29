@@ -511,6 +511,7 @@ fn row_to_channel_record(row: sqlx::postgres::PgRow) -> Result<ChannelRecord> {
         purpose_set_at: row.try_get("purpose_set_at").unwrap_or(None),
         ttl_seconds: row.try_get("ttl_seconds").unwrap_or(None),
         ttl_deadline: row.try_get("ttl_deadline").unwrap_or(None),
+        tier: row.try_get("tier").unwrap_or_else(|_| "open".to_owned()),
     })
 }
 

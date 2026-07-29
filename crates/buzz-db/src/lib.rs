@@ -19,6 +19,8 @@ pub mod api_token;
 pub mod archived_identities;
 /// Channel and membership persistence.
 pub mod channel;
+/// Channel-repo bindings (channel = folder = repo).
+pub mod channel_repo;
 /// Direct message channel persistence.
 pub mod dm;
 /// Database error types.
@@ -54,6 +56,7 @@ pub mod usage;
 /// User profile persistence.
 pub mod user;
 /// Workflow, run, and approval persistence.
+pub mod work_thread;
 pub mod workflow;
 
 pub use error::{DbError, Result};
@@ -2742,6 +2745,186 @@ impl Db {
             current_step,
             trace,
             error,
+        )
+        .await
+    }
+
+    /// Create a channel with an explicit privacy tier (Silent Mesh D24/D26).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_channel_tiered(
+        &self,
+        community_id: CommunityId,
+        name: &str,
+        channel_type: channel::ChannelType,
+        visibility: channel::ChannelVisibility,
+        tier: channel::ChannelTier,
+        description: Option<&str>,
+        created_by: &[u8],
+        ttl_seconds: Option<i32>,
+    ) -> Result<channel::ChannelRecord> {
+        channel::create_channel_tiered(
+            &self.pool,
+            community_id,
+            name,
+            channel_type,
+            visibility,
+            tier,
+            description,
+            created_by,
+            ttl_seconds,
+        )
+        .await
+    }
+
+    /// Create a channel with a caller-chosen id and an explicit privacy tier.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_channel_with_id_tiered(
+        &self,
+        community_id: CommunityId,
+        channel_id: uuid::Uuid,
+        name: &str,
+        channel_type: channel::ChannelType,
+        visibility: channel::ChannelVisibility,
+        tier: channel::ChannelTier,
+        description: Option<&str>,
+        created_by: &[u8],
+        ttl_seconds: Option<i32>,
+    ) -> Result<(channel::ChannelRecord, bool)> {
+        channel::create_channel_with_id_tiered(
+            &self.pool,
+            community_id,
+            channel_id,
+            name,
+            channel_type,
+            visibility,
+            tier,
+            description,
+            created_by,
+            ttl_seconds,
+        )
+        .await
+    }
+
+    /// [`Self::add_member`] under verified workspace authority (D42).
+    pub async fn add_member_as_workspace_authority(
+        &self,
+        community_id: CommunityId,
+        channel_id: uuid::Uuid,
+        pubkey: &[u8],
+        role: channel::MemberRole,
+        invited_by: Option<&[u8]>,
+    ) -> Result<channel::MemberRecord> {
+        channel::add_member_as_workspace_authority(
+            &self.pool,
+            community_id,
+            channel_id,
+            pubkey,
+            role,
+            invited_by,
+        )
+        .await
+    }
+
+    /// Record a channel-repo binding.
+    pub async fn bind_channel_repo(
+        &self,
+        community_id: CommunityId,
+        channel_id: uuid::Uuid,
+        repo_name: &str,
+        owner_pubkey: &str,
+    ) -> Result<bool> {
+        channel_repo::bind_channel_repo(
+            &self.pool,
+            community_id,
+            channel_id,
+            repo_name,
+            owner_pubkey,
+        )
+        .await
+    }
+
+    /// Fetch the repo binding for a channel.
+    pub async fn get_channel_repo(
+        &self,
+        community_id: CommunityId,
+        channel_id: uuid::Uuid,
+    ) -> Result<Option<channel_repo::ChannelRepoRecord>> {
+        channel_repo::get_channel_repo(&self.pool, community_id, channel_id).await
+    }
+
+    /// Reverse lookup: the channel bound to a repo name.
+    pub async fn get_channel_for_repo(
+        &self,
+        community_id: CommunityId,
+        repo_name: &str,
+    ) -> Result<Option<channel_repo::ChannelRepoRecord>> {
+        channel_repo::get_channel_for_repo(&self.pool, community_id, repo_name).await
+    }
+
+    /// Insert the projection row for a new work thread.
+    pub async fn create_work_thread(
+        &self,
+        params: work_thread::CreateWorkThreadParams<'_>,
+    ) -> Result<bool> {
+        work_thread::create_work_thread(&self.pool, params).await
+    }
+
+    /// Fetch a work thread by root event id.
+    pub async fn get_work_thread(
+        &self,
+        community_id: CommunityId,
+        thread_id: &[u8],
+    ) -> Result<Option<work_thread::WorkThreadRecord>> {
+        work_thread::get_work_thread(&self.pool, community_id, thread_id).await
+    }
+
+    /// List work threads in a channel.
+    pub async fn list_work_threads(
+        &self,
+        community_id: CommunityId,
+        channel_id: uuid::Uuid,
+        status: Option<work_thread::WorkThreadStatus>,
+        limit: i64,
+    ) -> Result<Vec<work_thread::WorkThreadRecord>> {
+        work_thread::list_work_threads(&self.pool, community_id, channel_id, status, limit).await
+    }
+
+    /// Update work-thread task metadata.
+    pub async fn update_work_thread_metadata(
+        &self,
+        community_id: CommunityId,
+        thread_id: &[u8],
+        goal: Option<&str>,
+        deadline: Option<Option<chrono::DateTime<chrono::Utc>>>,
+        dri_pubkey: Option<Option<&[u8]>>,
+    ) -> Result<bool> {
+        work_thread::update_work_thread_metadata(
+            &self.pool,
+            community_id,
+            thread_id,
+            goal,
+            deadline,
+            dri_pubkey,
+        )
+        .await
+    }
+
+    /// Transition a work thread (TOCTOU-safe; `Ok(false)` = conflict).
+    pub async fn transition_work_thread(
+        &self,
+        community_id: CommunityId,
+        thread_id: &[u8],
+        expected: work_thread::WorkThreadStatus,
+        next: work_thread::WorkThreadStatus,
+        canonicalize: Option<bool>,
+    ) -> Result<bool> {
+        work_thread::transition_work_thread(
+            &self.pool,
+            community_id,
+            thread_id,
+            expected,
+            next,
+            canonicalize,
         )
         .await
     }

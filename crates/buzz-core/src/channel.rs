@@ -99,6 +99,51 @@ impl FromStr for ChannelType {
     }
 }
 
+/// Channel privacy tier (Silent Mesh D21/D24/D26).
+///
+/// Declared at channel creation and immutable afterwards — the only
+/// re-tiering path is an owner-only channel clone. `open` is the loosest
+/// tier and the default for channels created without a tier tag.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChannelTier {
+    /// Client-local or server-GPU inference only; zero egress.
+    Owned,
+    /// Owned plus TEE-attested providers.
+    Private,
+    /// Members' own vendor subscriptions allowed (loosest).
+    #[default]
+    Open,
+}
+
+impl ChannelTier {
+    /// Wire/DB string for this tier.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ChannelTier::Owned => "owned",
+            ChannelTier::Private => "private",
+            ChannelTier::Open => "open",
+        }
+    }
+}
+
+impl std::fmt::Display for ChannelTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ChannelTier {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "owned" => Ok(ChannelTier::Owned),
+            "private" => Ok(ChannelTier::Private),
+            "open" => Ok(ChannelTier::Open),
+            other => Err(format!("invalid channel tier: {other}")),
+        }
+    }
+}
+
 /// A member's role within a channel.
 ///
 /// The hierarchy for permission checks is: Owner > Admin > Member > Guest.

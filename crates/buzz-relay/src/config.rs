@@ -119,6 +119,12 @@ pub struct Config {
     /// are permitted regardless of auth method (API token, NIP-42).
     pub require_relay_membership: bool,
 
+    /// silent-mesh: when true, kind:9007 channel creation requires the actor
+    /// to hold a workspace role (`relay_members` owner/admin — D42). When
+    /// false (default, upstream-preserving), anyone who can write may create
+    /// channels. The Silent Mesh deploy profile enables this.
+    pub workspace_channel_gate: bool,
+
     /// Whether this deployment can serve huddle (voice) audio.
     ///
     /// Huddle audio frames are relayed peer-to-peer *within a single pod*
@@ -495,6 +501,10 @@ impl Config {
             .unwrap_or(false);
 
         let require_relay_membership = std::env::var("BUZZ_REQUIRE_RELAY_MEMBERSHIP")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
+        let workspace_channel_gate = std::env::var("BUZZ_WORKSPACE_CHANNEL_GATE")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
 
@@ -906,6 +916,7 @@ impl Config {
             metrics_port,
             pubkey_allowlist_enabled,
             require_relay_membership,
+            workspace_channel_gate,
             huddle_audio_available,
             mesh,
             mesh_demo_echo,

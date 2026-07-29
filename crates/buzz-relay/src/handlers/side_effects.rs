@@ -349,6 +349,26 @@ pub async fn validate_admin_event(
                 },
                 None => None,
             };
+            // silent-mesh: the Guest role is disabled (D42). Reject
+            // pre-storage so the client gets a real error; add_member is the
+            // backstop for callers that skip this validator.
+            if requested_role == Some(buzz_db::channel::MemberRole::Guest) {
+                return Err(anyhow::anyhow!("the guest role is disabled"));
+            }
+
+            // silent-mesh (D42): workspace owners/admins carry channel-admin
+            // authority in every channel — Channel-Admin appointment is a
+            // workspace action. Resolved once; substitutes for in-channel
+            // elevation below.
+            let workspace_authority = {
+                let actor_hex = hex::encode(&actor_bytes);
+                state
+                    .db
+                    .get_relay_member(tenant.community(), &actor_hex)
+                    .await?
+                    .map(|m| m.role == "owner" || m.role == "admin")
+                    .unwrap_or(false)
+            };
 
             let members = state.db.get_members(tenant.community(), channel_id).await?;
             let actor_role: Option<buzz_db::channel::MemberRole> = members
@@ -357,20 +377,33 @@ pub async fn validate_admin_event(
                 .and_then(|m| m.role.parse().ok());
 
             // PUT_USER: open channels allow any authenticated user; private channels
-            // require the actor to be an existing member (any role can invite).
+            // require the actor to be an existing member (any role can invite) or
+            // a workspace owner/admin.
             if channel.visibility == "private" {
-                if actor_role.is_none() {
+                if actor_role.is_none() && !workspace_authority {
                     return Err(anyhow::anyhow!("actor not authorized"));
                 }
 
                 // Only owners/admins may grant elevated roles.
                 if requested_role.is_some_and(|r| r.is_elevated())
                     && !actor_role.is_some_and(|r| r.is_elevated())
+                    && !workspace_authority
                 {
                     return Err(anyhow::anyhow!(
                         "only owners/admins may grant elevated roles"
                     ));
                 }
+            } else if requested_role.is_some_and(|r| r.is_elevated())
+                && !actor_role.is_some_and(|r| r.is_elevated())
+                && !workspace_authority
+            {
+                // silent-mesh: open channels previously deferred this check to
+                // the post-storage add_member, where a denial is an OK to the
+                // client plus a warn log. Enforce it pre-storage too so the
+                // client sees the rejection.
+                return Err(anyhow::anyhow!(
+                    "only owners/admins may grant elevated roles"
+                ));
             }
 
             // Extract target pubkey from p tag
@@ -395,7 +428,7 @@ pub async fn validate_admin_event(
                 .zip(requested_role)
                 .filter(|(m, role)| m.role != role.as_str())
             {
-                if !actor_role.is_some_and(|r| r.is_elevated()) {
+                if !actor_role.is_some_and(|r| r.is_elevated()) && !workspace_authority {
                     return Err(anyhow::anyhow!(
                         "only owners/admins may change an active member's role"
                     ));
@@ -491,6 +524,14 @@ pub async fn validate_admin_event(
             }
         }
         9002 => {
+            // silent-mesh: the privacy tier is immutable (D26) — the only
+            // re-tiering path is an owner-only channel clone. Reject any
+            // attempt pre-storage (a DB trigger backstops this in depth).
+            if event.tags.iter().any(|t| t.kind().to_string() == "tier") {
+                return Err(anyhow::anyhow!(
+                    "the channel tier is immutable (declared at creation)"
+                ));
+            }
             // EDIT_METADATA: require at least one recognized metadata tag.
             const RECOGNIZED_TAGS: &[&str] = &[
                 "name",
@@ -1056,6 +1097,8 @@ pub async fn emit_group_discovery_events(
     {
         let mut tags: Vec<Tag> = vec![Tag::parse(["d", &group_id])?];
         tags.push(Tag::parse(["name", &channel.name])?);
+        // silent-mesh: the immutable privacy tier is channel metadata.
+        tags.push(Tag::parse(["tier", &channel.tier])?);
         if let Some(ref desc) = channel.description {
             if !desc.is_empty() {
                 tags.push(Tag::parse(["about", desc])?);
@@ -1310,16 +1353,38 @@ async fn handle_put_user(
 
     let actor_bytes = event.pubkey.to_bytes().to_vec();
 
-    state
+    // silent-mesh (D42): a workspace owner/admin acts with channel-admin
+    // authority — validated pre-storage; the DB call must agree or the grant
+    // silently no-ops for non-member workspace admins.
+    let workspace_authority = state
         .db
-        .add_member(
-            tenant.community(),
-            channel_id,
-            &target_pubkey,
-            role,
-            Some(&actor_bytes),
-        )
-        .await?;
+        .get_relay_member(tenant.community(), &hex::encode(&actor_bytes))
+        .await?
+        .map(|m| m.role == "owner" || m.role == "admin")
+        .unwrap_or(false);
+    if workspace_authority {
+        state
+            .db
+            .add_member_as_workspace_authority(
+                tenant.community(),
+                channel_id,
+                &target_pubkey,
+                role,
+                Some(&actor_bytes),
+            )
+            .await?;
+    } else {
+        state
+            .db
+            .add_member(
+                tenant.community(),
+                channel_id,
+                &target_pubkey,
+                role,
+                Some(&actor_bytes),
+            )
+            .await?;
+    }
     state.invalidate_membership(tenant, channel_id, &target_pubkey);
 
     let actor_hex = hex::encode(&actor_bytes);
@@ -1771,6 +1836,11 @@ async fn handle_create_group(
     let channel_type: buzz_db::channel::ChannelType = channel_type_str
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid channel_type: {channel_type_str}"))?;
+    // silent-mesh: immutable privacy tier (D24/D26), default open.
+    let tier: buzz_db::channel::ChannelTier = extract_tag_value(event, "tier")
+        .unwrap_or_else(|| "open".to_string())
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
 
     let actor_bytes = event.pubkey.to_bytes().to_vec();
     let description = extract_tag_value(event, "about");
@@ -1795,11 +1865,12 @@ async fn handle_create_group(
                 // but fall back to creation to stay resilient.
                 let ch = state
                     .db
-                    .create_channel(
+                    .create_channel_tiered(
                         tenant.community(),
                         &name,
                         channel_type,
                         visibility,
+                        tier,
                         description.as_deref(),
                         &actor_bytes,
                         ttl_seconds,
@@ -1817,11 +1888,12 @@ async fn handle_create_group(
     } else {
         let ch = state
             .db
-            .create_channel(
+            .create_channel_tiered(
                 tenant.community(),
                 &name,
                 channel_type,
                 visibility,
+                tier,
                 description.as_deref(),
                 &actor_bytes,
                 ttl_seconds,
@@ -1872,7 +1944,92 @@ async fn handle_create_group(
         warn!(channel = %channel.id, error = %e, "membership notification emission failed");
     }
 
+    // silent-mesh: channel = folder = repo (D5/D6) — provision and bind the
+    // forge repo. Best-effort like the other side effects: the channel is
+    // usable without it and the binding is reconcilable later.
+    if channel.channel_type == "stream" || channel.channel_type == "forum" {
+        if let Err(e) = provision_channel_repo(tenant, state, channel.id, &channel.name).await {
+            warn!(channel = %channel.id, error = %e, "channel repo provisioning failed");
+        }
+    }
+
     info!(channel_id = %channel.id, name = %name, "NIP-29 CREATE_GROUP processed");
+    Ok(())
+}
+
+/// silent-mesh: provision the forge repository bound to a freshly created
+/// channel (channel = folder = repo, D5/D6).
+///
+/// The repo is **relay-owned**: only the relay key can sign server-side, so
+/// the kind:30617 announcement author — and the `{owner}` segment of the
+/// clone URL — is the relay pubkey. All read/push authority flows through
+/// the mandatory `buzz-channel` binding tag (channel membership), exactly
+/// the model `authorize_git_read` and the push policy hook enforce; the
+/// missing owner-bypass is irrelevant because nobody holds the relay key.
+///
+/// The repo id is the channel UUID (32 lowercase hex, always a valid repo
+/// name, never recycled — a deleted channel's name cannot collide into a
+/// stale manifest pointer).
+async fn provision_channel_repo(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    channel_id: uuid::Uuid,
+    channel_name: &str,
+) -> anyhow::Result<()> {
+    let repo_id = channel_id.simple().to_string();
+    let owner_hex = state.relay_keypair.public_key().to_hex();
+
+    // Announcement: d = repo id, buzz-channel = the binding every git gate
+    // resolves, name for humans, and main protected from history rewrites.
+    let tags = vec![
+        Tag::parse(["d", &repo_id])?,
+        Tag::parse(["buzz-channel", &channel_id.to_string()])?,
+        Tag::parse(["name", channel_name])?,
+        Tag::parse([
+            "buzz-protect",
+            "refs/heads/main",
+            "no-force-push",
+            "no-delete",
+        ])?,
+    ];
+    let announcement = EventBuilder::new(
+        Kind::Custom(buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT as u16),
+        "",
+    )
+    .tags(tags)
+    .sign_with_keys(&state.relay_keypair)
+    .map_err(|e| anyhow::anyhow!("failed to sign repo announcement: {e}"))?;
+
+    // kind:30617 is parameterized-replaceable and global-only: store keyed on
+    // (kind, pubkey, d), channel_id = None. Direct DB writes do not dispatch
+    // side effects, so run the provisioning handler explicitly afterwards.
+    state
+        .db
+        .replace_parameterized_event(tenant.community(), &announcement, &repo_id, None)
+        .await?;
+
+    // Record the relay-side binding before the object-store seeding: the
+    // binding is the durable intent, and a seeding failure (store outage)
+    // stays repairable by reconciliation without losing which repo belongs
+    // to which channel.
+    buzz_db::channel_repo::validate_binding(&repo_id, &owner_hex)
+        .map_err(|e| anyhow::anyhow!("invalid binding: {e}"))?;
+    let bound = state
+        .db
+        .bind_channel_repo(tenant.community(), channel_id, &repo_id, &owner_hex)
+        .await?;
+    if bound {
+        info!(channel = %channel_id, repo = %repo_id, "channel repo bound");
+    } else {
+        // Already bound (replay) — fine.
+        info!(channel = %channel_id, repo = %repo_id, "channel repo binding already present");
+    }
+
+    // Reserve the name and seed the empty manifest pointer (makes the repo
+    // clone-able). Runs the announce side effect directly — DB writes do not
+    // dispatch side effects.
+    handle_git_repo_announcement(tenant, &announcement, state).await?;
+    info!(channel = %channel_id, repo = %repo_id, "channel repo provisioned");
     Ok(())
 }
 
@@ -2581,7 +2738,14 @@ async fn handle_git_repo_announcement(
             // `Reserved` means *this attempt* won the insert, `AlreadyOwned` means
             // a same-owner sibling won it, `TakenByOther` is a cross-owner
             // collision.
-            let limit = state.config.git_max_repos_per_pubkey as i64;
+            // silent-mesh: the relay provisioning its own channel repos is
+            // not subject to the per-user quota — every channel gets one.
+            let is_relay_self = owner_hex == state.relay_keypair.public_key().to_hex();
+            let limit = if is_relay_self {
+                i64::MAX
+            } else {
+                state.config.git_max_repos_per_pubkey as i64
+            };
             let owned = state
                 .db
                 .count_repos_for_owner(community, &owner_hex)

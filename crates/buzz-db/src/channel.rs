@@ -14,7 +14,7 @@ use buzz_core::CommunityId;
 // Re-export the canonical enum definitions from buzz-core.
 // These live in core (zero I/O deps) so the SDK can share them
 // without pulling in sqlx/tokio.
-pub use buzz_core::channel::{ChannelType, ChannelVisibility, MemberRole};
+pub use buzz_core::channel::{ChannelTier, ChannelType, ChannelVisibility, MemberRole};
 
 /// A channel row as returned from the database.
 #[derive(Debug, Clone)]
@@ -63,6 +63,8 @@ pub struct ChannelRecord {
     pub ttl_seconds: Option<i32>,
     /// Deadline by which a new message must arrive or the channel is auto-archived.
     pub ttl_deadline: Option<DateTime<Utc>>,
+    /// Immutable channel privacy tier (`"owned"`, `"private"`, `"open"`).
+    pub tier: String,
 }
 
 /// A channel membership row as returned from the database.
@@ -94,6 +96,37 @@ pub async fn create_channel(
     created_by: &[u8],
     ttl_seconds: Option<i32>,
 ) -> Result<ChannelRecord> {
+    create_channel_tiered(
+        pool,
+        community_id,
+        name,
+        channel_type,
+        visibility,
+        ChannelTier::default(),
+        description,
+        created_by,
+        ttl_seconds,
+    )
+    .await
+}
+
+/// Create a channel with an explicit privacy tier (Silent Mesh D24/D26).
+///
+/// The tier is written at INSERT time and is immutable afterwards — a
+/// `BEFORE UPDATE` trigger raises on any change, and no update path exists
+/// in this crate.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_channel_tiered(
+    pool: &PgPool,
+    community_id: CommunityId,
+    name: &str,
+    channel_type: ChannelType,
+    visibility: ChannelVisibility,
+    tier: ChannelTier,
+    description: Option<&str>,
+    created_by: &[u8],
+    ttl_seconds: Option<i32>,
+) -> Result<ChannelRecord> {
     if created_by.len() != 32 {
         return Err(DbError::InvalidData(format!(
             "pubkey must be 32 bytes, got {}",
@@ -112,9 +145,10 @@ pub async fn create_channel(
 
     sqlx::query(
         r#"
-        INSERT INTO channels (id, community_id, name, channel_type, visibility, description, created_by, ttl_seconds, ttl_deadline)
+        INSERT INTO channels (id, community_id, name, channel_type, visibility, description, created_by, ttl_seconds, ttl_deadline, tier)
         VALUES ($1, $2, $3, $4::channel_type, $5::channel_visibility, $6, $7, $8,
-                CASE WHEN $8 IS NOT NULL THEN NOW() + ($8 || ' seconds')::interval ELSE NULL END)
+                CASE WHEN $8 IS NOT NULL THEN NOW() + ($8 || ' seconds')::interval ELSE NULL END,
+                $9::channel_tier)
         "#,
     )
     .bind(id)
@@ -125,6 +159,7 @@ pub async fn create_channel(
     .bind(description)
     .bind(created_by)
     .bind(ttl_seconds)
+    .bind(tier.as_str())
     .execute(&mut *tx)
     .await?;
 
@@ -153,7 +188,7 @@ pub async fn create_channel(
                nip29_group_id, topic_required, max_members,
                topic, topic_set_by, topic_set_at,
                purpose, purpose_set_by, purpose_set_at,
-               ttl_seconds, ttl_deadline
+               ttl_seconds, ttl_deadline, tier::text AS tier
         FROM channels WHERE community_id = $1 AND id = $2
         "#,
     )
@@ -183,6 +218,36 @@ pub async fn create_channel_with_id(
     created_by: &[u8],
     ttl_seconds: Option<i32>,
 ) -> Result<(ChannelRecord, bool)> {
+    create_channel_with_id_tiered(
+        pool,
+        community_id,
+        channel_id,
+        name,
+        channel_type,
+        visibility,
+        ChannelTier::default(),
+        description,
+        created_by,
+        ttl_seconds,
+    )
+    .await
+}
+
+/// [`create_channel_with_id`] with an explicit privacy tier (Silent Mesh
+/// D24/D26). See [`create_channel_tiered`] for the immutability contract.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_channel_with_id_tiered(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    name: &str,
+    channel_type: ChannelType,
+    visibility: ChannelVisibility,
+    tier: ChannelTier,
+    description: Option<&str>,
+    created_by: &[u8],
+    ttl_seconds: Option<i32>,
+) -> Result<(ChannelRecord, bool)> {
     if created_by.len() != 32 {
         return Err(DbError::InvalidData(format!(
             "pubkey must be 32 bytes, got {}",
@@ -205,9 +270,10 @@ pub async fn create_channel_with_id(
 
     let rows_affected = sqlx::query(
         r#"
-        INSERT INTO channels (id, community_id, name, channel_type, visibility, description, created_by, ttl_seconds, ttl_deadline)
+        INSERT INTO channels (id, community_id, name, channel_type, visibility, description, created_by, ttl_seconds, ttl_deadline, tier)
         VALUES ($1, $2, $3, $4::channel_type, $5::channel_visibility, $6, $7, $8,
-                CASE WHEN $8 IS NOT NULL THEN NOW() + ($8 || ' seconds')::interval ELSE NULL END)
+                CASE WHEN $8 IS NOT NULL THEN NOW() + ($8 || ' seconds')::interval ELSE NULL END,
+                $9::channel_tier)
         ON CONFLICT (community_id, id) DO NOTHING
         "#,
     )
@@ -219,6 +285,7 @@ pub async fn create_channel_with_id(
     .bind(description)
     .bind(created_by)
     .bind(ttl_seconds)
+    .bind(tier.as_str())
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -253,7 +320,7 @@ pub async fn create_channel_with_id(
                nip29_group_id, topic_required, max_members,
                topic, topic_set_by, topic_set_at,
                purpose, purpose_set_by, purpose_set_at,
-               ttl_seconds, ttl_deadline
+               ttl_seconds, ttl_deadline, tier::text AS tier
         FROM channels WHERE community_id = $1 AND id = $2
         "#,
     )
@@ -281,7 +348,7 @@ pub async fn get_channel(
                nip29_group_id, topic_required, max_members,
                topic, topic_set_by, topic_set_at,
                purpose, purpose_set_by, purpose_set_at,
-               ttl_seconds, ttl_deadline
+               ttl_seconds, ttl_deadline, tier::text AS tier
         FROM channels WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL
         "#,
     )
@@ -385,6 +452,59 @@ pub async fn add_member(
     role: MemberRole,
     invited_by: Option<&[u8]>,
 ) -> Result<MemberRecord> {
+    add_member_inner(
+        pool,
+        community_id,
+        channel_id,
+        pubkey,
+        role,
+        invited_by,
+        false,
+    )
+    .await
+}
+
+/// [`add_member`] invoked under **workspace authority** (Silent Mesh D42):
+/// the granter is a community owner/workspace admin whose authority was
+/// verified by the caller, so the in-channel inviter-membership and
+/// elevation checks are bypassed. The last-owner demotion guard still
+/// applies — workspace authority cannot strip a channel of its final owner.
+pub async fn add_member_as_workspace_authority(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    pubkey: &[u8],
+    role: MemberRole,
+    invited_by: Option<&[u8]>,
+) -> Result<MemberRecord> {
+    add_member_inner(
+        pool,
+        community_id,
+        channel_id,
+        pubkey,
+        role,
+        invited_by,
+        true,
+    )
+    .await
+}
+
+async fn add_member_inner(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    pubkey: &[u8],
+    role: MemberRole,
+    invited_by: Option<&[u8]>,
+    workspace_authority: bool,
+) -> Result<MemberRecord> {
+    // silent-mesh: the Guest role is disabled (D42) — rejected at the single
+    // membership choke point so every caller is covered.
+    if role == MemberRole::Guest {
+        return Err(DbError::InvalidData(
+            "the guest role is disabled on this deployment".into(),
+        ));
+    }
     if pubkey.len() != 32 {
         return Err(DbError::InvalidData(format!(
             "pubkey must be 32 bytes, got {}",
@@ -400,7 +520,11 @@ pub async fn add_member(
 
     let channel = get_channel_tx(&mut tx, community_id, channel_id).await?;
 
-    let effective_role = if channel.visibility == "private" {
+    let effective_role = if workspace_authority {
+        // Workspace authority (verified by the caller) substitutes for
+        // in-channel elevation on both channel visibilities.
+        role
+    } else if channel.visibility == "private" {
         let inviter = invited_by.ok_or_else(|| {
             DbError::AccessDenied("private channel requires an invite".to_string())
         })?;
@@ -472,7 +596,7 @@ pub async fn add_member(
             None => None,
         };
         let actor_role: Option<MemberRole> = actor_role.and_then(|r| r.parse().ok());
-        if !actor_role.is_some_and(|r| r.is_elevated()) {
+        if !workspace_authority && !actor_role.is_some_and(|r| r.is_elevated()) {
             return Err(DbError::AccessDenied(
                 "only owners/admins may change an active member's role".to_string(),
             ));
@@ -788,7 +912,7 @@ pub async fn list_channels(
                    nip29_group_id, topic_required, max_members,
                    topic, topic_set_by, topic_set_at,
                    purpose, purpose_set_by, purpose_set_at,
-                   ttl_seconds, ttl_deadline
+                   ttl_seconds, ttl_deadline, tier::text AS tier
             FROM channels
             WHERE community_id = $1 AND deleted_at IS NULL AND visibility::text = $2
             ORDER BY created_at DESC
@@ -808,7 +932,7 @@ pub async fn list_channels(
                    nip29_group_id, topic_required, max_members,
                    topic, topic_set_by, topic_set_at,
                    purpose, purpose_set_by, purpose_set_at,
-                   ttl_seconds, ttl_deadline
+                   ttl_seconds, ttl_deadline, tier::text AS tier
             FROM channels
             WHERE community_id = $1 AND deleted_at IS NULL
             ORDER BY created_at DESC
@@ -856,7 +980,7 @@ async fn get_channel_tx(
                nip29_group_id, topic_required, max_members,
                topic, topic_set_by, topic_set_at,
                purpose, purpose_set_by, purpose_set_at,
-               ttl_seconds, ttl_deadline
+               ttl_seconds, ttl_deadline, tier::text AS tier
         FROM channels WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL
         "#,
     )
@@ -958,7 +1082,7 @@ pub async fn get_accessible_channels(
                c.nip29_group_id, c.topic_required, c.max_members,
                c.topic, c.topic_set_by, c.topic_set_at,
                c.purpose, c.purpose_set_by, c.purpose_set_at,
-               c.ttl_seconds, c.ttl_deadline,
+               c.ttl_seconds, c.ttl_deadline, c.tier::text AS tier,
                (cm.channel_id IS NOT NULL) AS is_member
         FROM channels c
         LEFT JOIN channel_members cm
@@ -1095,6 +1219,8 @@ fn row_to_channel_record(row: sqlx::postgres::PgRow) -> Result<ChannelRecord> {
     let purpose_set_at: Option<DateTime<Utc>> = row.try_get("purpose_set_at").unwrap_or(None);
     let ttl_seconds: Option<i32> = row.try_get("ttl_seconds").unwrap_or(None);
     let ttl_deadline: Option<DateTime<Utc>> = row.try_get("ttl_deadline").unwrap_or(None);
+    // tier is new — queries that don't SELECT it yet degrade to the default.
+    let tier: String = row.try_get("tier").unwrap_or_else(|_| "open".to_owned());
 
     Ok(ChannelRecord {
         id,
@@ -1119,6 +1245,7 @@ fn row_to_channel_record(row: sqlx::postgres::PgRow) -> Result<ChannelRecord> {
         purpose_set_at,
         ttl_seconds,
         ttl_deadline,
+        tier,
     })
 }
 

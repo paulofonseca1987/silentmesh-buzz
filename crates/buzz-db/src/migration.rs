@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 26);
+        assert_eq!(migrations.len(), 27);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -921,6 +921,30 @@ mod tests {
         );
         assert!(!agent_permissions.contains("_operator_global_tables"));
 
+        // Phase 2 work threads: immutable channel tier (+ BEFORE UPDATE
+        // guard mirroring the community_id idiom), channel-repo bindings,
+        // and the work-thread projection. Community-prefixed keys; legacy
+        // guest memberships retired; never operator-global.
+        assert_eq!(migrations[26].version, 27);
+        let work_threads = migrations[26].sql.as_str();
+        assert!(
+            work_threads.contains("CREATE TYPE channel_tier AS ENUM ('owned', 'private', 'open')")
+        );
+        assert!(work_threads
+            .contains("ALTER TABLE channels ADD COLUMN tier channel_tier NOT NULL DEFAULT 'open'"));
+        assert!(work_threads.contains("CREATE TRIGGER trg_channels_tier_immutable"));
+        assert!(work_threads.contains("CREATE TABLE channel_repos"));
+        assert!(work_threads.contains("PRIMARY KEY (community_id, channel_id)"));
+        assert!(work_threads.contains("UNIQUE (community_id, repo_name)"));
+        assert!(work_threads.contains("CREATE TYPE work_thread_status AS ENUM"));
+        assert!(work_threads.contains("CREATE TABLE work_threads"));
+        assert!(work_threads.contains("PRIMARY KEY (community_id, thread_id)"));
+        assert!(work_threads.contains("REFERENCES channels (community_id, id) ON DELETE CASCADE"));
+        assert!(work_threads
+            .contains("UPDATE channel_members SET role = 'member' WHERE role = 'guest'"));
+        assert!(!work_threads.contains("_operator_global_tables"));
+        assert!(!migrations[0].sql.as_str().contains("channel_tier"));
+
         let desired_schema = include_str!("../../../schema/schema.sql");
         assert!(
             desired_schema.contains("CREATE TABLE join_policy_acceptances"),
@@ -929,6 +953,18 @@ mod tests {
         assert!(
             desired_schema.contains("CREATE TABLE agent_permission_requests"),
             "desired-state schema must include agent permission requests",
+        );
+        assert!(
+            desired_schema.contains("CREATE TABLE channel_repos"),
+            "desired-state schema must include channel repo bindings",
+        );
+        assert!(
+            desired_schema.contains("CREATE TABLE work_threads"),
+            "desired-state schema must include the work-thread projection",
+        );
+        assert!(
+            desired_schema.contains("tier            channel_tier NOT NULL DEFAULT 'open'"),
+            "desired-state schema must carry the immutable channel tier column",
         );
     }
 
@@ -1172,7 +1208,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(25));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(27));
     }
 
     #[tokio::test]

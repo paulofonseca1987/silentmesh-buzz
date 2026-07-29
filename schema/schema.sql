@@ -35,6 +35,8 @@ CREATE TYPE delivery_method AS ENUM ('webhook', 'websocket');
 CREATE TYPE subscription_status AS ENUM ('active', 'paused', 'deleted');
 CREATE TYPE pause_reason AS ENUM ('user', 'system', 'rate_limit');
 CREATE TYPE channel_add_policy AS ENUM ('anyone', 'owner_only', 'nobody');
+CREATE TYPE channel_tier AS ENUM ('owned', 'private', 'open');
+CREATE TYPE work_thread_status AS ENUM ('open', 'snoozed', 'ready', 'closed', 'archived');
 
 -- ── Communities ───────────────────────────────────────────────────────────────
 -- Conformance: row zero (host binding). The host map. `resolve_host(host)`
@@ -95,6 +97,7 @@ CREATE TABLE channels (
     participant_hash BYTEA,
     ttl_seconds     INT,
     ttl_deadline    TIMESTAMPTZ,
+    tier            channel_tier NOT NULL DEFAULT 'open',
     PRIMARY KEY (community_id, id),
     CONSTRAINT chk_channels_id_not_nil CHECK (id <> '00000000-0000-0000-0000-000000000000'::uuid)
 );
@@ -126,6 +129,71 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER trg_channels_community_id_immutable
     BEFORE UPDATE ON channels
     FOR EACH ROW EXECUTE FUNCTION channels_community_id_immutable();
+
+-- channels.tier is immutable: the privacy tier is declared at creation and
+-- never changes (the only re-tiering path is an owner-only channel clone).
+-- Keep in sync with migrations/0027.
+CREATE FUNCTION channels_tier_immutable() RETURNS trigger AS $$
+BEGIN
+    IF NEW.tier IS DISTINCT FROM OLD.tier THEN
+        RAISE EXCEPTION 'channels.tier is immutable (declared at creation)';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_channels_tier_immutable
+    BEFORE UPDATE ON channels
+    FOR EACH ROW EXECUTE FUNCTION channels_tier_immutable();
+
+-- ── Channel repos ─────────────────────────────────────────────────────────────
+-- The forge repository bound to a channel at creation (channel = folder =
+-- repo). Relay-owned; owner_pubkey records the announcement author. Keep in
+-- sync with migrations/0027.
+
+CREATE TABLE channel_repos (
+    community_id UUID NOT NULL REFERENCES communities(id),
+    channel_id   UUID NOT NULL,
+    repo_name    TEXT NOT NULL CHECK (char_length(repo_name) BETWEEN 1 AND 64),
+    owner_pubkey TEXT NOT NULL CHECK (length(owner_pubkey) = 64),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (community_id, channel_id),
+    UNIQUE (community_id, repo_name),
+    FOREIGN KEY (community_id, channel_id)
+        REFERENCES channels (community_id, id) ON DELETE CASCADE
+);
+
+-- ── Work threads ──────────────────────────────────────────────────────────────
+-- Relay-side projection of the 47xxx work-thread events: the signed events
+-- are the truth; the row makes reads cheap and state transitions TOCTOU-safe
+-- (UPDATE ... WHERE status = expected). thread_id = 32-byte root event id.
+-- Keep in sync with migrations/0027.
+
+CREATE TABLE work_threads (
+    community_id UUID NOT NULL REFERENCES communities(id),
+    thread_id    BYTEA NOT NULL CHECK (length(thread_id) = 32),
+    channel_id   UUID NOT NULL,
+    goal         TEXT NOT NULL,
+    deadline     TIMESTAMPTZ,
+    dri_pubkey   BYTEA CHECK (dri_pubkey IS NULL OR length(dri_pubkey) = 32),
+    status       work_thread_status NOT NULL DEFAULT 'open',
+    canonicalize_on_close BOOLEAN NOT NULL DEFAULT FALSE,
+    created_by   BYTEA NOT NULL CHECK (length(created_by) = 32),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    closed_at    TIMESTAMPTZ,
+    PRIMARY KEY (community_id, thread_id),
+    FOREIGN KEY (community_id, channel_id)
+        REFERENCES channels (community_id, id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_work_threads_channel
+    ON work_threads (community_id, channel_id, status);
+CREATE INDEX idx_work_threads_status
+    ON work_threads (community_id, status, created_at DESC);
+CREATE INDEX idx_work_threads_overdue
+    ON work_threads (deadline)
+    WHERE status IN ('open', 'snoozed', 'ready') AND deadline IS NOT NULL;
 
 -- ── Channel members ───────────────────────────────────────────────────────────
 -- Conformance: "Channels and channel membership". PK leads with community_id.
