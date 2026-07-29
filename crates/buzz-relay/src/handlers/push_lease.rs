@@ -13,7 +13,9 @@ use serde_json::{Map, Number, Value};
 use sha2::Digest as _;
 
 pub(crate) const PUSH_KINDS: &[u64] = &[7, 9, 1059, 40007, 46010];
-pub(crate) const URGENT_KINDS: &[u64] = &[];
+// silent-mesh: approval requests (kind 46010) are urgent-classified so a
+// supervised agent blocked on a human reaches that human's device promptly.
+pub(crate) const URGENT_KINDS: &[u64] = &[46010];
 
 /// NIP-PL addressable push-lease event kind.
 pub const KIND_PUSH_LEASE: u32 = 30_350;

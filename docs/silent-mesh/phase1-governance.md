@@ -5,6 +5,20 @@ both codebases on 2026-07-29: this fork at `90e058e`, and T3 Code (the design
 blueprint, decision D33) at `887dd6e4`. File:line references below are real;
 re-verify line numbers after upstream merges.
 
+> **Status (2026-07-29): P1–P6 landed** on this fork. P1 (WF-08 workflow
+> gate), P2 (typed PermissionRequest + correlation), P4 (relay:
+> `agent_permission_requests` migration/CRUD, `/api/approvals`
+> create/list/resolve, 46030/46031 agent-domain dispatch, 46011/46012 +
+> 24200 decision frame), P3 (runtime-mode policy, parking with
+> poll-until-decision, fail-closed everywhere), P5 (`buzz approvals`
+> family), P6 (supervised deploy defaults + urgent 46010). Deviations from
+> §3: decision delivery is poll-first (the 24200 frame is emitted but the
+> harness treats the authenticated read as the authority; the mpsc frame
+> lane remains a fast-path follow-up), and the harness registers requests
+> before its own turn-loop poller rather than a separate parking table.
+> Remaining from §5: the stub-ACP-agent e2e and flipping the conformance
+> pending lanes (needs the two-host docker harness).
+
 **Goal.** Replace auto-approval of agent actions with a policy-gated,
 human-in-the-loop flow whose grants are signed events — "who approved what" is
 provable. Exit criterion (roadmap): a supervised claude-code agent blocks on a
