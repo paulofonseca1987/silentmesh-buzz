@@ -33,6 +33,27 @@ repo (relay-signed kind:30617). Guest role disabled in depth.
 `BUZZ_WORKSPACE_CHANNEL_GATE` (default **off**) gates non-DM channel
 creation to workspace owner/admin when enabled.
 
+**Phase 2g — personal channels + promotion.** `personal_channels`
+registry (migration 0031; one per member, created atomically with the
+channel via a `personal` tag on kind:9007 — member-creatable even under
+the workspace gate, visibility forced private and locked, membership
+restricted to the member + their own bots at the `add_member` choke
+point). Kind 47021 promotion command (target-channel root; summary =
+content; strict tag allowlist) runs the D30 Privacy Gate scaffold
+(`buzz_core::secret_scan`, deterministic prefix/shape rules over summary
++ every text blob; fail-closed on unscannable text, bounded head-sniff
+for big binaries) and a cross-repo graft (`api/git/promote.rs`: local
+push into a temp ref → read-tree graft under `promoted/<short>/` → CAS
+publish; the graft commit parents **only the target tip** — no source
+parent edge, or the personal repo's entire unscanned history would
+publish) **before** the event persists — a refused promotion stores and
+transfers nothing. Closed (non-archived) sources stay promotable so
+crash retries converge and re-promotion is possible; archived targets
+are refused. Source thread closes with a relay-only
+kind:47014 notice in the source channel. `buzz channels create-personal`
++ `buzz threads promote`. Exit-criterion behavior covered by the S3-gated
+`promote::s3_probe_tests` (ran green on live MinIO 2026-07-29).
+
 **Phase 2b–2f — work threads.** Kinds 47000 (root/task), 47001 (metadata
 cmd), 47002 (state cmd), 47003 (agent recommendation, inert), 47010
 (checkpoint), 47011 (overdue notice, relay-only), 47012 (canonicalization
@@ -101,22 +122,19 @@ serialize so exactly one winner survives) and emits kind:47013 notices.
 
 ## Next slices (roadmap Phase 2 remainder, then Phase 3+)
 
-1. **2g — personal channels + promotion (D29) with Privacy Gate scaffold
-   (D30)**: command kind 47021; member-written summary + deterministic
-   secret scan; files + summary transfer, conversation does not.
-2. **2h — folder/file write ACLs (D4)**: per-path rules in the pre-receive
+1. **2h — folder/file write ACLs (D4)**: per-path rules in the pre-receive
    policy hook (`api/git/hook.rs` / `policy.rs`) + agent tool layer. Note:
    the hook currently sees ref updates, not changed paths — it needs the
    pack/paths surfaced (see mapping notes in git history of this branch).
-3. **buzz-acp worktree binding**: align agent workspaces onto thread
+2. **buzz-acp worktree binding**: align agent workspaces onto thread
    worktrees; emit kind:47010 checkpoints automatically at turn end
    (today checkpoints are CLI/manual).
-4. **Command-kind timeout gate** (found in the 2f review, pre-existing
-   since Phase 1): ingest routes command kinds (47001/47002, DM,
+3. **Command-kind timeout gate** (found in the 2f review, pre-existing
+   since Phase 1): ingest routes command kinds (47001/47002/47021, DM,
    workflow, approval commands) to the command executor *before* the
    moderation timeout write-block, so a timed-out admin can still issue
    them. Decide intended semantics, then move or mirror the gate.
-5. Phase 2 exit-criterion dry run from buzz-cli (roadmap lines 87–100),
+4. Phase 2 exit-criterion dry run from buzz-cli (roadmap lines 87–100),
    then Phase 3 (model plane) per roadmap.
 
 ## Suggested kickoff prompt for a fresh session

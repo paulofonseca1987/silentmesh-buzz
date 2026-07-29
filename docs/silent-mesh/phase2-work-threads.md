@@ -36,8 +36,9 @@ courtesy split in case upstream lands something.
 | 47011 | `KIND_WORK_THREAD_OVERDUE` | **relay-only** | Overdue notice from the leader-elected deadline sweep — tags the DRI (`p`; fallback: opener), `e` (root), `h`. At-most-once per deadline (`overdue_notified_at` claim); a 47001 deadline edit re-arms it. Client submissions rejected. |
 | 47012 | `KIND_WORK_THREAD_CANON` | **relay-only** | Canonicalization outcome from the close-with-canonicalize job — tags `e` (root), `h`, optional `commit` (new main tip); content JSON `{outcome, prefix}`. The job grafts the thread's latest 47010 checkpoint under `canon/<thread-short>/` on the default branch via hydrate → plumbing → pointer-CAS publish (bounded rehydrate-retry on conflict; `canonicalized_at` claim is once-only, re-armed by re-close; leader sweep recovers crashed jobs). Never fails the close. |
 | 47013 | `KIND_WORK_THREAD_SIBLING_ARCHIVED` | **relay-only** | Sibling-archive notice — one per losing fork archived by a winner's close-with-`archive-siblings` (D28). Tags `e` (the archived thread's root), `h`, `winner` (winner root hex); content JSON `{winner}`. Lets event-folding clients see the batch archive; the projection batch is the authority. |
+| 47014 | `KIND_WORK_THREAD_PROMOTED` | **relay-only** | Promotion notice in the **source** personal channel (D29) — records the relay-side close when a thread promotes. Tags `e` (source root), `h` (source channel), `to` (target channel UUID), `thread` (new target root hex); content JSON `{to, thread}`. |
 | 47020 | `KIND_WORK_THREAD_FORK` | regular (append-only) | Thread fork (D27): the fork event **is the new thread's root** (its id = new thread id) — shipped as a root-like regular event, not a command, since the new root must be client-signed anyway. Content = the variation's goal; tags: exactly one **unmarked** `e` (parent root — `["e", <id>]` only, so a fork can't double-register as a NIP-10 reply), `h` (same channel), optional `commit` (fork point — must be a kind:47010 checkpoint the parent recorded; the check pages through the full checkpoint history; absent = head), optional `deadline`/`dri` as on 47000. All hex tag values lowercase (one canonical case for byte-exact `#e`/`commit` matching; 47010's `e`/`commit` tags share the rule). Any full member; parent forkable from any state. Conversation inherited by reference; projection row carries `forked_from`/`fork_commit`. |
-| 47021 | `KIND_WORK_THREAD_PROMOTE` | command | Personal-channel promotion through the gate — later slice. |
+| 47021 | `KIND_WORK_THREAD_PROMOTE` | command | Promotion out of a personal channel (D29/D30): stored in the **target** channel and **is the new thread's root** (its id = new thread id; goal = the member-written summary). Tags: **strict allowlist** — `h` (target), exactly one unmarked lowercase `e` (source root), `from` (source channel UUID), optional lowercase `commit` (a recorded source checkpoint; absent = latest); any other tag is rejected (extra tags would be an unscanned channel across the privacy boundary). Authority: author owns the source personal channel + full member of the live (non-archived) target — never a DM or another personal channel. Source may be open/snoozed/ready **or closed** (crash-retry convergence; re-promotion into another team channel is legitimate and each is gated + audited); only archived sources are refused. The Privacy Gate scaffold and the git graft run **before** the event persists — a refused promotion stores and transfers nothing. Files graft under `promoted/<new-short>/` on the target default branch (object transfer via a local push into a temp ref, deleted before CAS publish). **The graft commit parents only the target tip** — a parent edge to the source checkpoint would publish the personal repo's entire unscanned history (deleted secrets, commit messages, author identities); provenance lives in this event's tags, not the git graph. Source thread closes (the kind:47014 notice is emitted only when the close actually happened); conversation stays behind. |
 
 All are channel-scoped (`h` tag) and ride the existing membership-checked
 delivery. Threads thread: replies to the root use the ordinary kind-9 +
@@ -122,6 +123,38 @@ Later additive migrations on `work_threads`: 0028 `overdue_notified_at`
 `forked_from` + `fork_commit` with a partial index on
 `(community_id, forked_from)` for the sibling-family walk (2f).
 
+**Personal channels (2g, D29)** live in the additive `personal_channels`
+registry (migration 0031): `(community_id, owner_pubkey)` PK — one per
+member — with a channel-side UNIQUE for the reverse lookup; rows are
+written in the same transaction as the channel (`create_personal_channel`,
+which forces visibility `private` and bootstraps the member as channel
+owner = implicit Channel Admin). A `personal` tag on kind:9007 takes this
+path — member-creatable even under `BUZZ_WORKSPACE_CHANNEL_GATE`.
+Enforcement in depth: membership is restricted to the member plus bots
+they own (`users.agent_owner_pubkey`), checked pre-storage in the 9000
+validator and at the `add_member` choke point (covers invites, templates,
+and workspace authority — even workspace admins cannot join); kind:9002
+visibility edits are rejected on personal channels (privacy is permanent,
+which also keeps kind:9021 self-joins closed); the Privacy-Gated
+promotion path (47021) is the only sanctioned way work leaves.
+
+**The Privacy Gate scaffold (2g, D30)** is `buzz_core::secret_scan`:
+deterministic, dependency-free prefix/shape rules (AWS/GitHub/Slack/
+Stripe/Google/Anthropic/OpenAI/npm token shapes, PEM private-key blocks,
+JWTs) over the member-written summary and every text blob in the promoted
+checkpoint tree. Findings carry rule name + path only — never the matched
+value. Binary blobs (NUL sniff; oversized blobs are head-sniffed with a
+bounded read) are skipped by design; text blobs over 5 MiB are refused as
+unscannable (fail closed). The gate's blast radius is exactly the
+promoted snapshot: the graft never links source history into the target
+(no checkpoint parent edge), so ancestor commits the gate never saw can
+never be fetched from the target repo. Model-assisted review arrives in
+Phase 3; the scanners stay as the hard backstop underneath.
+
+Registry hygiene: soft-deleting a personal channel frees the member's
+slot — the stale registry row stops answering lookups and is reclaimed
+on their next `personal` create.
+
 ## 5. Authority enforcement points (2a)
 
 - **Team-channel creation** (kind 9007): behind `BUZZ_WORKSPACE_CHANNEL_GATE`
@@ -147,9 +180,9 @@ Later additive migrations on `work_threads`: 0028 `overdue_notified_at`
   the git API); if the forge is init-on-first-push, the binding row plus a
   server-side init is used instead — resolved during implementation
   against the mapped seam.
-- Personal channels (D29), implicit Channel-Admin in them, promotion,
-  and file ACLs are later Phase 2 slices; nothing in this slice blocks
-  them. (Forking, checkpoints, and canonicalization shipped in 2d–2f.)
+- File ACLs (D4, slice 2h) remain; nothing shipped so far blocks them.
+  (Forking, checkpoints, canonicalization, personal channels, and
+  promotion shipped in 2d–2g.)
 
 Known limitations shared with upstream patterns (recorded 2f review):
 
