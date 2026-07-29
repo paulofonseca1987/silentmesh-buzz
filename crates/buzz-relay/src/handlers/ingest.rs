@@ -32,8 +32,9 @@ use buzz_core::kind::{
     KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF,
     KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED,
     KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM, KIND_TEXT_NOTE, KIND_USER_STATUS,
-    KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE,
-    RELAY_ADMIN_REMOVE_MEMBER, RELAY_ADMIN_SET_WORKSPACE_PROFILE,
+    KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, KIND_WORK_THREAD_METADATA, KIND_WORK_THREAD_OPEN,
+    KIND_WORK_THREAD_RECOMMEND, KIND_WORK_THREAD_STATE, RELAY_ADMIN_ADD_MEMBER,
+    RELAY_ADMIN_CHANGE_ROLE, RELAY_ADMIN_REMOVE_MEMBER, RELAY_ADMIN_SET_WORKSPACE_PROFILE,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_core::verification::verify_event;
@@ -313,6 +314,10 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         KIND_DM_OPEN | KIND_DM_ADD_MEMBER | KIND_DM_HIDE => Ok(Scope::MessagesWrite),
         KIND_WORKFLOW_DEF | KIND_WORKFLOW_TRIGGER => Ok(Scope::MessagesWrite),
         KIND_APPROVAL_GRANT | KIND_APPROVAL_DENY => Ok(Scope::MessagesWrite),
+        // silent-mesh: work-thread events (47000/47003 stored, 47001/47002
+        // commands). Scope only proves the transport can write messages; the
+        // D41 authority checks live in the validators / command handlers.
+        k if buzz_core::kind::is_work_thread_kind(k) => Ok(Scope::MessagesWrite),
         _ => Err("restricted: unknown event kind"),
     }
 }
@@ -493,6 +498,13 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
             | KIND_HUDDLE_PARTICIPANT_LEFT
             | KIND_HUDDLE_ENDED
             | KIND_HUDDLE_GUIDELINES
+            // silent-mesh: work threads live in a channel. 47001/47002 are
+            // command kinds (routed before the channel gate) — listed anyway
+            // so the intent is pinned by the disjointness test.
+            | KIND_WORK_THREAD_OPEN
+            | KIND_WORK_THREAD_METADATA
+            | KIND_WORK_THREAD_STATE
+            | KIND_WORK_THREAD_RECOMMEND
     )
 }
 
@@ -1359,6 +1371,74 @@ fn validate_event_reminder(event: &Event) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Validate a kind:47000 work-thread root (Silent Mesh Phase 2, D40).
+///
+/// Content is the task goal (non-empty). The optional `deadline` tag must be
+/// unix seconds in chrono's representable range; the optional `dri` tag must
+/// be a 64-hex pubkey. Duplicates of either tag are rejected — the root is
+/// append-only and the projection stores one value per field.
+fn validate_work_thread_open(event: &Event) -> Result<(), String> {
+    if event.content.trim().is_empty() {
+        return Err("work thread goal (content) must not be empty".into());
+    }
+    let mut deadline_seen = false;
+    let mut dri_seen = false;
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        if parts.len() < 2 {
+            continue;
+        }
+        match parts[0].as_str() {
+            "deadline" => {
+                if deadline_seen {
+                    return Err("duplicate deadline tag".into());
+                }
+                deadline_seen = true;
+                let secs: i64 = parts[1]
+                    .parse()
+                    .map_err(|_| "deadline must be unix seconds".to_string())?;
+                if chrono::DateTime::from_timestamp(secs, 0).is_none() {
+                    return Err("deadline out of range".into());
+                }
+            }
+            "dri" => {
+                if dri_seen {
+                    return Err("duplicate dri tag".into());
+                }
+                dri_seen = true;
+                let ok = parts[1].len() == 64 && parts[1].chars().all(|c| c.is_ascii_hexdigit());
+                if !ok {
+                    return Err("dri must be a 64-hex pubkey".into());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Validate a kind:47003 agent recommendation (Silent Mesh Phase 2, D41).
+///
+/// Exactly one `e` tag naming the thread root (64-hex event id). The event
+/// is stored append-only and is inert — it never touches the work-thread
+/// projection; a human confirms it with a real 47001/47002 command.
+fn validate_work_thread_recommend(event: &Event) -> Result<(), String> {
+    let mut e_tags = event.tags.iter().filter_map(|t| {
+        let parts = t.as_slice();
+        (parts.len() >= 2 && parts[0].as_str() == "e").then(|| parts[1].as_str())
+    });
+    let Some(root) = e_tags.next() else {
+        return Err("recommendation must reference the thread root via an e tag".into());
+    };
+    if e_tags.next().is_some() {
+        return Err("recommendation must reference exactly one e tag".into());
+    }
+    if root.len() != 64 || !root.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("thread root reference must be a 64-hex event id".into());
+    }
+    Ok(())
+}
+
 /// Resolve the `author_type` metric label (`"agent"` / `"human"`) for an
 /// event author, from `users.agent_owner_pubkey IS NOT NULL` via a
 /// per-community cache. Metric-labeling only — never used for authorization.
@@ -2084,6 +2164,50 @@ async fn ingest_event_inner(
     if kind_u32 == KIND_PERSONA {
         validate_persona_envelope(&event)
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+    }
+
+    // silent-mesh: work-thread roots are opened by full channel members —
+    // humans decide; agents (bot role), guests, and non-members recommend via
+    // kind:47003 instead. `channel_id` is always Some here (the kind is in
+    // `requires_h_channel_scope`); the role check fails closed.
+    if kind_u32 == KIND_WORK_THREAD_OPEN {
+        validate_work_thread_open(&event)
+            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+        if let Some(ch_id) = channel_id {
+            let role = state
+                .db
+                .get_member_role(tenant.community(), ch_id, &event.pubkey.to_bytes())
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: member role lookup: {e}")))?;
+            if !matches!(
+                role.as_deref(),
+                Some("owner") | Some("admin") | Some("member")
+            ) {
+                return Err(IngestError::Rejected(
+                    "forbidden: only a full channel member may open a work thread".into(),
+                ));
+            }
+        }
+    }
+
+    // silent-mesh: recommendations come from channel participants (any role,
+    // bots included) — never from outside the channel, even when the channel
+    // has open visibility.
+    if kind_u32 == KIND_WORK_THREAD_RECOMMEND {
+        validate_work_thread_recommend(&event)
+            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+        if let Some(ch_id) = channel_id {
+            let role = state
+                .db
+                .get_member_role(tenant.community(), ch_id, &event.pubkey.to_bytes())
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: member role lookup: {e}")))?;
+            if role.is_none() {
+                return Err(IngestError::Rejected(
+                    "forbidden: only channel members may post work-thread recommendations".into(),
+                ));
+            }
+        }
     }
 
     // Track pre-created channel UUID for compensation on insert failure.
@@ -3214,6 +3338,93 @@ mod tests {
             .tags(nostr_tags)
             .sign_with_keys(&keys)
             .unwrap()
+    }
+
+    /// silent-mesh: work-thread kinds are channel-scoped MessagesWrite events;
+    /// 47001/47002 route through the command executor, 47000/47003 are stored.
+    #[test]
+    fn work_thread_kinds_scope_and_channel_requirements() {
+        let dummy = make_dummy_event();
+        for kind in [
+            KIND_WORK_THREAD_OPEN,
+            KIND_WORK_THREAD_METADATA,
+            KIND_WORK_THREAD_STATE,
+            KIND_WORK_THREAD_RECOMMEND,
+        ] {
+            assert_eq!(
+                required_scope_for_kind(kind, &dummy).unwrap(),
+                Scope::MessagesWrite,
+                "kind {kind}"
+            );
+            assert!(requires_h_channel_scope(kind), "kind {kind}");
+            assert!(!is_global_only_kind(kind), "kind {kind}");
+        }
+        assert!(buzz_core::kind::is_command_kind(KIND_WORK_THREAD_METADATA));
+        assert!(buzz_core::kind::is_command_kind(KIND_WORK_THREAD_STATE));
+        assert!(!buzz_core::kind::is_command_kind(KIND_WORK_THREAD_OPEN));
+        assert!(!buzz_core::kind::is_command_kind(
+            KIND_WORK_THREAD_RECOMMEND
+        ));
+    }
+
+    #[test]
+    fn work_thread_open_validation() {
+        let empty = make_event_with_tags(KIND_WORK_THREAD_OPEN, "  ", &[]);
+        assert!(validate_work_thread_open(&empty).is_err());
+
+        let bare = make_event_with_tags(KIND_WORK_THREAD_OPEN, "ship the fix", &[]);
+        assert!(validate_work_thread_open(&bare).is_ok());
+
+        let dri = "a".repeat(64);
+        let full = make_event_with_tags(
+            KIND_WORK_THREAD_OPEN,
+            "ship the fix",
+            &[&["deadline", "1900000000"], &["dri", &dri]],
+        );
+        assert!(validate_work_thread_open(&full).is_ok());
+
+        let bad_deadline =
+            make_event_with_tags(KIND_WORK_THREAD_OPEN, "goal", &[&["deadline", "soon"]]);
+        assert!(validate_work_thread_open(&bad_deadline).is_err());
+
+        let dup_deadline = make_event_with_tags(
+            KIND_WORK_THREAD_OPEN,
+            "goal",
+            &[&["deadline", "1900000000"], &["deadline", "1900000001"]],
+        );
+        assert!(validate_work_thread_open(&dup_deadline).is_err());
+
+        let bad_dri = make_event_with_tags(KIND_WORK_THREAD_OPEN, "goal", &[&["dri", "abc"]]);
+        assert!(validate_work_thread_open(&bad_dri).is_err());
+
+        let dup_dri = make_event_with_tags(
+            KIND_WORK_THREAD_OPEN,
+            "goal",
+            &[&["dri", &dri], &["dri", &dri]],
+        );
+        assert!(validate_work_thread_open(&dup_dri).is_err());
+    }
+
+    #[test]
+    fn work_thread_recommend_validation() {
+        let root = "b".repeat(64);
+
+        let none = make_event_with_tags(KIND_WORK_THREAD_RECOMMEND, "do X next", &[]);
+        assert!(validate_work_thread_recommend(&none).is_err());
+
+        let good = make_event_with_tags(KIND_WORK_THREAD_RECOMMEND, "do X next", &[&["e", &root]]);
+        assert!(validate_work_thread_recommend(&good).is_ok());
+
+        let two = make_event_with_tags(
+            KIND_WORK_THREAD_RECOMMEND,
+            "do X next",
+            &[&["e", &root], &["e", &root]],
+        );
+        assert!(validate_work_thread_recommend(&two).is_err());
+
+        let malformed =
+            make_event_with_tags(KIND_WORK_THREAD_RECOMMEND, "do X next", &[&["e", "nothex"]]);
+        assert!(validate_work_thread_recommend(&malformed).is_err());
     }
 
     #[test]

@@ -11,7 +11,7 @@ use buzz_core::kind::{
     KIND_GIT_REPO_ANNOUNCEMENT, KIND_IA_ARCHIVED, KIND_IA_ARCHIVED_LIST, KIND_IA_UNARCHIVED,
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_NIP29_GROUP_ADMINS,
     KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA, KIND_NIP43_MEMBERSHIP_LIST, KIND_REACTION,
-    KIND_THREAD_SUMMARY,
+    KIND_THREAD_SUMMARY, KIND_WORK_THREAD_OPEN,
 };
 use buzz_core::StoredEvent;
 use buzz_db::channel::{MemberRecord, MemberRole};
@@ -33,7 +33,16 @@ pub fn is_admin_kind(kind: u32) -> bool {
 /// handled in `ingest_event()` before storage so we can short-circuit on
 /// duplicates without storing the event at all.
 pub fn is_side_effect_kind(kind: u32) -> bool {
-    matches!(kind, 0 | 5 | 9000..=9022 | KIND_GIT_REPO_ANNOUNCEMENT | KIND_AGENT_PROFILE | 41001..=41003 | 40099)
+    matches!(
+        kind,
+        0 | 5
+            | 9000..=9022
+            | KIND_GIT_REPO_ANNOUNCEMENT
+            | KIND_AGENT_PROFILE
+            | 41001..=41003
+            | 40099
+            | KIND_WORK_THREAD_OPEN
+    )
 }
 
 async fn evict_live_channel_subscriptions(
@@ -212,6 +221,8 @@ pub async fn handle_side_effects(
         // NIP-34: Git repo announcement → reserve name + seed manifest pointer.
         KIND_GIT_REPO_ANNOUNCEMENT => handle_git_repo_announcement(tenant, event, state).await,
         KIND_AGENT_PROFILE => handle_agent_profile(tenant, event, state).await,
+        // silent-mesh: work-thread root → create the projection row.
+        KIND_WORK_THREAD_OPEN => handle_work_thread_open(tenant, event, state).await,
         // kind:7 (reaction) handled inline in ingest_event() before storage.
         _ => Ok(()),
     }
@@ -1232,6 +1243,77 @@ async fn handle_agent_profile(
         .await?;
 
     info!(pubkey = %hex::encode(&pubkey_bytes), policy, "kind:10100 channel_add_policy updated");
+    Ok(())
+}
+
+/// silent-mesh: kind:47000 (work-thread root) side effect — create the
+/// `work_threads` projection row from the stored root event.
+///
+/// The signed event is the truth; the row makes reads cheap and gives the
+/// 47001/47002 command handlers a TOCTOU-safe state to check against. The
+/// tags were validated pre-storage (`validate_work_thread_open`), so parse
+/// failures here mean a code drift bug, not bad client input.
+async fn handle_work_thread_open(
+    tenant: &TenantContext,
+    event: &Event,
+    state: &Arc<AppState>,
+) -> anyhow::Result<()> {
+    let channel_id = event
+        .tags
+        .iter()
+        .find_map(|t| {
+            let parts = t.as_slice();
+            (parts.len() >= 2 && parts[0].as_str() == "h")
+                .then(|| parts[1].parse::<Uuid>().ok())
+                .flatten()
+        })
+        .ok_or_else(|| anyhow::anyhow!("kind:47000 missing h tag"))?;
+
+    let deadline = event
+        .tags
+        .iter()
+        .find_map(|t| {
+            let parts = t.as_slice();
+            (parts.len() >= 2 && parts[0].as_str() == "deadline")
+                .then(|| parts[1].parse::<i64>().ok())
+                .flatten()
+        })
+        .map(|secs| {
+            chrono::DateTime::from_timestamp(secs, 0)
+                .ok_or_else(|| anyhow::anyhow!("kind:47000 deadline out of range"))
+        })
+        .transpose()?;
+
+    let dri_pubkey = event.tags.iter().find_map(|t| {
+        let parts = t.as_slice();
+        (parts.len() >= 2 && parts[0].as_str() == "dri")
+            .then(|| {
+                hex::decode(parts[1].as_str())
+                    .ok()
+                    .filter(|b| b.len() == 32)
+            })
+            .flatten()
+    });
+
+    let created = state
+        .db
+        .create_work_thread(buzz_db::work_thread::CreateWorkThreadParams {
+            community_id: tenant.community(),
+            thread_id: event.id.as_bytes(),
+            channel_id,
+            goal: event.content.trim(),
+            deadline,
+            dri_pubkey: dri_pubkey.as_deref(),
+            created_by: &event.pubkey.to_bytes(),
+        })
+        .await?;
+    if created {
+        info!(
+            thread = %event.id.to_hex(),
+            channel = %channel_id,
+            "work thread opened"
+        );
+    }
     Ok(())
 }
 

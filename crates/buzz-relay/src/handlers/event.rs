@@ -46,6 +46,7 @@ pub(crate) fn bounded_kind_label(kind: u32) -> String {
         44200 => kind.to_string(),
         45001..=45003 => kind.to_string(),
         46001..=46012 | 46020 | 46030..=46031 => kind.to_string(),
+        47000..=47003 => kind.to_string(),
         48001 | 48100..=48103 | 48106 => kind.to_string(),
         49001 => kind.to_string(),
         _ => "other".to_string(),
@@ -525,8 +526,13 @@ async fn dispatch_persistent_event_inner(
             .iter()
             .any(|t| t.as_slice().first().map(|s| s.as_str()) == Some("buzz:workflow"));
 
+    // silent-mesh: work-thread events (47000/47003) never fire workflows —
+    // agents recommend, humans decide; automation must not act on thread
+    // lifecycle with a workflow owner's standing authority (47001/47002 are
+    // command kinds, already excluded).
     if !buzz_core::kind::is_workflow_execution_kind(kind_u32)
         && !buzz_core::kind::is_command_kind(kind_u32)
+        && !buzz_core::kind::is_work_thread_kind(kind_u32)
         && !is_relay_workflow_msg
         && kind_u32 != KIND_GIFT_WRAP
     {

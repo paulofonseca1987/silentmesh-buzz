@@ -34,6 +34,8 @@ pub mod report;
 pub mod req;
 /// NIP-29 and NIP-25 side-effect handlers.
 pub mod side_effects;
+/// Work-thread command handlers — D41 state machine (kinds 47001–47002).
+pub mod work_thread;
 
 /// Extract an optional TTL (in seconds) from a Nostr event's `ttl` tag,
 /// applying the server-side override when configured.

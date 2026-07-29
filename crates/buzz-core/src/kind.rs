@@ -521,7 +521,25 @@ pub const KIND_WORKFLOW_APPROVAL_GRANTED: u32 = 46011;
 /// A pending workflow approval was denied.
 pub const KIND_WORKFLOW_APPROVAL_DENIED: u32 = 46012;
 
-// User groups (47000–47999)
+// Work threads (47000–47499 — Silent Mesh; 47500+ left free for upstream)
+/// Work-thread root: launches a thread **as a task** (Silent Mesh D40).
+/// Regular stored event, channel-scoped (`h` tag); content = the task goal;
+/// optional `deadline` (unix seconds) and `dri` (pubkey hex) tags. The root
+/// event id is the thread id; replies thread to it via ordinary NIP-10.
+pub const KIND_WORK_THREAD_OPEN: u32 = 47000;
+/// Work-thread task-metadata edit (goal / deadline / DRI) — command kind,
+/// relay-validated: any full channel member; agents only recommend. Tags:
+/// `e` = thread root, `h` = channel; content = JSON with changed fields.
+pub const KIND_WORK_THREAD_METADATA: u32 = 47001;
+/// Work-thread state transition (the D41 machine) — command kind,
+/// relay-validated for both transition legality and author authority.
+/// Tags: `e` = thread root, `h` = channel, `state` = target state,
+/// optional `canonicalize` on close.
+pub const KIND_WORK_THREAD_STATE: u32 = 47002;
+/// Agent recommendation (open / metadata / done) — regular stored event,
+/// **inert until a human confirms** by sending the real kind:47001/47002.
+/// Never touches the projection. Tags: `e` = thread root, `h` = channel.
+pub const KIND_WORK_THREAD_RECOMMEND: u32 = 47003;
 
 // System / admin custom range (48000–48999)
 /// An audit log entry was recorded.
@@ -653,6 +671,10 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_JOB_ERROR,
     KIND_MEMBER_ADDED_NOTIFICATION,
     KIND_MEMBER_REMOVED_NOTIFICATION,
+    KIND_WORK_THREAD_OPEN,
+    KIND_WORK_THREAD_METADATA,
+    KIND_WORK_THREAD_STATE,
+    KIND_WORK_THREAD_RECOMMEND,
     KIND_AGENT_TURN_METRIC,
     KIND_WORKFLOW_DEF,
     KIND_LONG_FORM,
@@ -739,6 +761,20 @@ pub const fn is_identity_archive_request_kind(kind: u32) -> bool {
     matches!(kind, KIND_IA_ARCHIVE_REQUEST | KIND_IA_UNARCHIVE_REQUEST)
 }
 
+/// Returns `true` if `kind` is a Silent Mesh work-thread kind (47000–47003).
+///
+/// The canonical route check — use this instead of scattering `47000..`
+/// matches across ingest/dispatch.
+pub const fn is_work_thread_kind(kind: u32) -> bool {
+    matches!(
+        kind,
+        KIND_WORK_THREAD_OPEN
+            | KIND_WORK_THREAD_METADATA
+            | KIND_WORK_THREAD_STATE
+            | KIND_WORK_THREAD_RECOMMEND
+    )
+}
+
 /// Returns `true` if `kind` is a Buzz command kind that requires transactional execution.
 pub const fn is_command_kind(kind: u32) -> bool {
     matches!(
@@ -750,6 +786,8 @@ pub const fn is_command_kind(kind: u32) -> bool {
             | KIND_WORKFLOW_TRIGGER
             | KIND_APPROVAL_GRANT
             | KIND_APPROVAL_DENY
+            | KIND_WORK_THREAD_METADATA
+            | KIND_WORK_THREAD_STATE
     )
 }
 
@@ -789,6 +827,23 @@ const _: () = assert!(is_parameterized_replaceable(KIND_EVENT_REMINDER)); // 303
 const _: () = assert!(is_parameterized_replaceable(KIND_DM_VISIBILITY)); // 30622 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_THREAD_SUMMARY)); // 39005 ∈ 30000–39999
 const _: () = assert!(is_parameterized_replaceable(KIND_WINDOW_BOUNDS)); // 39006 ∈ 30000–39999
+
+// Compile-time: work-thread kinds (47xxx) are append-only regular events —
+// deliberately OUTSIDE every replaceable range. Latest-state-wins lives in
+// the `work_threads` projection, not the event layer.
+const _: () = assert!(!is_replaceable(KIND_WORK_THREAD_OPEN));
+const _: () = assert!(!is_parameterized_replaceable(KIND_WORK_THREAD_OPEN));
+const _: () = assert!(!is_ephemeral(KIND_WORK_THREAD_OPEN));
+const _: () = assert!(!is_replaceable(KIND_WORK_THREAD_METADATA));
+const _: () = assert!(!is_parameterized_replaceable(KIND_WORK_THREAD_METADATA));
+const _: () = assert!(!is_ephemeral(KIND_WORK_THREAD_METADATA));
+const _: () = assert!(!is_replaceable(KIND_WORK_THREAD_STATE));
+const _: () = assert!(!is_parameterized_replaceable(KIND_WORK_THREAD_STATE));
+const _: () = assert!(!is_ephemeral(KIND_WORK_THREAD_STATE));
+const _: () = assert!(!is_replaceable(KIND_WORK_THREAD_RECOMMEND));
+const _: () = assert!(!is_parameterized_replaceable(KIND_WORK_THREAD_RECOMMEND));
+const _: () = assert!(!is_ephemeral(KIND_WORK_THREAD_RECOMMEND));
+const _: () = assert!(KIND_WORK_THREAD_RECOMMEND <= u16::MAX as u32);
 
 // Compile-time: NIP-34 parameterized replaceable kinds are in the correct range.
 const _: () = assert!(

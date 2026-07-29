@@ -70,6 +70,13 @@ pub async fn handle_command(
         KIND_WORKFLOW_TRIGGER => handle_workflow_trigger(tenant, state, &event, &auth).await,
         KIND_APPROVAL_GRANT => handle_approval_grant(tenant, state, &event, &auth).await,
         KIND_APPROVAL_DENY => handle_approval_deny(tenant, state, &event, &auth).await,
+        // silent-mesh: work-thread task metadata + D41 state transitions.
+        KIND_WORK_THREAD_METADATA => {
+            super::work_thread::handle_thread_metadata(tenant, state, &event, &auth).await
+        }
+        KIND_WORK_THREAD_STATE => {
+            super::work_thread::handle_thread_state(tenant, state, &event, &auth).await
+        }
         _ => Err(IngestError::Rejected(format!(
             "unknown command kind: {kind}"
         ))),
@@ -78,7 +85,7 @@ pub async fn handle_command(
 
 /// Result of persisting a command event: either a duplicate (already processed)
 /// or an open transaction that the handler must commit after executing mutations.
-enum PersistResult {
+pub(crate) enum PersistResult {
     /// Event was already processed — return idempotent success.
     Duplicate,
     /// Event inserted — transaction is open, handler must commit after mutations.
@@ -98,7 +105,7 @@ enum PersistResult {
 /// persists without the event record. On retry, the event INSERT succeeds
 /// (no conflict), and the mutation re-executes — which is safe for idempotent
 /// operations (open_dm, hide_dm, update_approval, upsert_workflow).
-async fn persist_command_event(
+pub(crate) async fn persist_command_event(
     state: &Arc<AppState>,
     tenant: &TenantContext,
     event: &Event,

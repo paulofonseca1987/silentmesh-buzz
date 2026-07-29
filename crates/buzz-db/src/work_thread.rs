@@ -296,3 +296,254 @@ mod tests {
         assert!("done".parse::<WorkThreadStatus>().is_err());
     }
 }
+
+#[cfg(test)]
+mod pg_tests {
+    //! Postgres-gated tests for the work-thread projection: create/read,
+    //! metadata edits with clearable fields, and TOCTOU-safe transitions.
+    //! Run with:
+    //!   `cargo test -p buzz-db --lib work_thread -- --ignored`
+    use super::*;
+    use crate::channel::{ChannelType, ChannelVisibility};
+
+    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
+
+    async fn setup_pool() -> PgPool {
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        PgPool::connect(&database_url)
+            .await
+            .expect("connect to test DB")
+    }
+
+    async fn make_community(pool: &PgPool) -> CommunityId {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(id)
+            .bind(format!("test-{}.example", id.simple()))
+            .execute(pool)
+            .await
+            .expect("insert community");
+        CommunityId::from_uuid(id)
+    }
+
+    async fn make_channel(pool: &PgPool, community: CommunityId) -> Uuid {
+        let creator = vec![0xc7u8; 32];
+        crate::channel::create_channel(
+            pool,
+            community,
+            "threads",
+            ChannelType::Stream,
+            ChannelVisibility::Open,
+            None,
+            &creator,
+            None,
+        )
+        .await
+        .expect("create channel")
+        .id
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn projection_round_trip_and_metadata() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let channel_id = make_channel(&pool, community).await;
+        let thread_id = vec![0x11u8; 32];
+        let created_by = vec![0xaau8; 32];
+
+        let created = create_work_thread(
+            &pool,
+            CreateWorkThreadParams {
+                community_id: community,
+                thread_id: &thread_id,
+                channel_id,
+                goal: "ship the fix",
+                deadline: None,
+                dri_pubkey: None,
+                created_by: &created_by,
+            },
+        )
+        .await
+        .expect("create thread");
+        assert!(created);
+
+        // Duplicate root replay is a no-op.
+        let replayed = create_work_thread(
+            &pool,
+            CreateWorkThreadParams {
+                community_id: community,
+                thread_id: &thread_id,
+                channel_id,
+                goal: "ship the fix",
+                deadline: None,
+                dri_pubkey: None,
+                created_by: &created_by,
+            },
+        )
+        .await
+        .expect("replay create");
+        assert!(!replayed);
+
+        let thread = get_work_thread(&pool, community, &thread_id)
+            .await
+            .expect("get thread")
+            .expect("thread exists");
+        assert_eq!(thread.status, WorkThreadStatus::Open);
+        assert_eq!(thread.goal, "ship the fix");
+        assert!(thread.deadline.is_none() && thread.dri_pubkey.is_none());
+
+        let listed = list_work_threads(&pool, community, channel_id, None, 10)
+            .await
+            .expect("list threads");
+        assert_eq!(listed.len(), 1);
+        let ready_only = list_work_threads(
+            &pool,
+            community,
+            channel_id,
+            Some(WorkThreadStatus::Ready),
+            10,
+        )
+        .await
+        .expect("list ready");
+        assert!(ready_only.is_empty());
+
+        // Set goal + deadline + DRI, then clear the clearable fields.
+        let deadline = DateTime::from_timestamp(1_900_000_000, 0).expect("valid ts");
+        let dri = vec![0xbbu8; 32];
+        let updated = update_work_thread_metadata(
+            &pool,
+            community,
+            &thread_id,
+            Some("ship the fix, tested"),
+            Some(Some(deadline)),
+            Some(Some(&dri)),
+        )
+        .await
+        .expect("update metadata");
+        assert!(updated);
+        let thread = get_work_thread(&pool, community, &thread_id)
+            .await
+            .expect("get thread")
+            .expect("thread exists");
+        assert_eq!(thread.goal, "ship the fix, tested");
+        assert_eq!(thread.deadline, Some(deadline));
+        assert_eq!(thread.dri_pubkey.as_deref(), Some(dri.as_slice()));
+
+        let cleared =
+            update_work_thread_metadata(&pool, community, &thread_id, None, Some(None), Some(None))
+                .await
+                .expect("clear metadata");
+        assert!(cleared);
+        let thread = get_work_thread(&pool, community, &thread_id)
+            .await
+            .expect("get thread")
+            .expect("thread exists");
+        assert_eq!(thread.goal, "ship the fix, tested");
+        assert!(thread.deadline.is_none() && thread.dri_pubkey.is_none());
+
+        // Unknown thread ids update nothing.
+        let missing =
+            update_work_thread_metadata(&pool, community, &[0x99u8; 32], Some("nope"), None, None)
+                .await
+                .expect("update unknown");
+        assert!(!missing);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn transitions_are_toctou_safe() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let channel_id = make_channel(&pool, community).await;
+        let thread_id = vec![0x22u8; 32];
+        let created_by = vec![0xaau8; 32];
+
+        assert!(create_work_thread(
+            &pool,
+            CreateWorkThreadParams {
+                community_id: community,
+                thread_id: &thread_id,
+                channel_id,
+                goal: "close me",
+                deadline: None,
+                dri_pubkey: None,
+                created_by: &created_by,
+            },
+        )
+        .await
+        .expect("create thread"));
+
+        // open → ready succeeds once; the losing replay (still expecting
+        // `open`) is refused — the WHERE status = expected guard.
+        assert!(transition_work_thread(
+            &pool,
+            community,
+            &thread_id,
+            WorkThreadStatus::Open,
+            WorkThreadStatus::Ready,
+            None,
+        )
+        .await
+        .expect("open → ready"));
+        assert!(!transition_work_thread(
+            &pool,
+            community,
+            &thread_id,
+            WorkThreadStatus::Open,
+            WorkThreadStatus::Ready,
+            None,
+        )
+        .await
+        .expect("stale transition"));
+
+        // ready → closed stamps closed_at and records canonicalize.
+        assert!(transition_work_thread(
+            &pool,
+            community,
+            &thread_id,
+            WorkThreadStatus::Ready,
+            WorkThreadStatus::Closed,
+            Some(true),
+        )
+        .await
+        .expect("ready → closed"));
+        let thread = get_work_thread(&pool, community, &thread_id)
+            .await
+            .expect("get thread")
+            .expect("thread exists");
+        assert_eq!(thread.status, WorkThreadStatus::Closed);
+        assert!(thread.canonicalize_on_close);
+        assert!(thread.closed_at.is_some());
+
+        // closed → archived → open (the Owner-only reopen path at the DB
+        // layer; authority is enforced above in the relay handler).
+        assert!(transition_work_thread(
+            &pool,
+            community,
+            &thread_id,
+            WorkThreadStatus::Closed,
+            WorkThreadStatus::Archived,
+            None,
+        )
+        .await
+        .expect("closed → archived"));
+        assert!(transition_work_thread(
+            &pool,
+            community,
+            &thread_id,
+            WorkThreadStatus::Archived,
+            WorkThreadStatus::Open,
+            None,
+        )
+        .await
+        .expect("archived → open"));
+        let thread = get_work_thread(&pool, community, &thread_id)
+            .await
+            .expect("get thread")
+            .expect("thread exists");
+        assert_eq!(thread.status, WorkThreadStatus::Open);
+    }
+}
