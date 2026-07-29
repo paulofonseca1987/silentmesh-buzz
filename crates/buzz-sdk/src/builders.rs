@@ -12,8 +12,9 @@ use buzz_core::{
         KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
         KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
         KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_USER_STATUS,
-        KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, KIND_WORK_THREAD_METADATA, KIND_WORK_THREAD_OPEN,
-        KIND_WORK_THREAD_RECOMMEND, KIND_WORK_THREAD_STATE,
+        KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, KIND_WORK_THREAD_CHECKPOINT,
+        KIND_WORK_THREAD_METADATA, KIND_WORK_THREAD_OPEN, KIND_WORK_THREAD_RECOMMEND,
+        KIND_WORK_THREAD_STATE,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -1651,6 +1652,46 @@ pub fn build_thread_state(
         tags.push(tag(&["canonicalize", if c { "true" } else { "false" }])?);
     }
     Ok(EventBuilder::new(Kind::Custom(KIND_WORK_THREAD_STATE as u16), "").tags(tags))
+}
+
+/// Build a per-turn checkpoint (kind 47010) — records a worktree commit for
+/// a thread (diff/revert anchor).
+///
+/// - `commit`: full git object id — 40-hex SHA-1 or 64-hex SHA-256.
+/// - `branch`: optional ref name (no whitespace, ≤ 255 chars).
+/// - `turn`: optional turn ordinal.
+/// - `note`: optional free-text note (event content).
+pub fn build_thread_checkpoint(
+    channel_id: Uuid,
+    thread_root: &str,
+    commit: &str,
+    branch: Option<&str>,
+    turn: Option<u32>,
+    note: &str,
+) -> Result<EventBuilder, SdkError> {
+    let root = check_hex_exact(thread_root, 64, "thread_root")?;
+    check_commit_hex(commit, "commit")?;
+    check_content(note, 16 * 1024)?;
+    let mut tags = vec![
+        tag(&["e", &root])?,
+        tag(&["h", &channel_id.to_string()])?,
+        tag(&["commit", commit])?,
+    ];
+    if let Some(branch) = branch {
+        let ok = !branch.is_empty()
+            && branch.len() <= 255
+            && !branch.chars().any(|c| c.is_whitespace() || c.is_control());
+        if !ok {
+            return Err(SdkError::InvalidInput(
+                "branch must be a sane ref name (no whitespace, ≤255 chars)".into(),
+            ));
+        }
+        tags.push(tag(&["branch", branch])?);
+    }
+    if let Some(turn) = turn {
+        tags.push(tag(&["turn", &turn.to_string()])?);
+    }
+    Ok(EventBuilder::new(Kind::Custom(KIND_WORK_THREAD_CHECKPOINT as u16), note).tags(tags))
 }
 
 /// Build a work-thread recommendation (kind 47003) — the agent-authored,

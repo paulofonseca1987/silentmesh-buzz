@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 27);
+        assert_eq!(migrations.len(), 28);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -945,6 +945,16 @@ mod tests {
         assert!(!work_threads.contains("_operator_global_tables"));
         assert!(!migrations[0].sql.as_str().contains("channel_tier"));
 
+        // Phase 2d: overdue-notice bookkeeping — a nullable timestamp on the
+        // existing tenant-scoped projection; no new tables.
+        assert_eq!(migrations[27].version, 28);
+        let overdue = migrations[27].sql.as_str();
+        assert!(
+            overdue.contains("ALTER TABLE work_threads ADD COLUMN overdue_notified_at TIMESTAMPTZ")
+        );
+        assert!(!overdue.contains("CREATE TABLE"));
+        assert!(!overdue.contains("_operator_global_tables"));
+
         let desired_schema = include_str!("../../../schema/schema.sql");
         assert!(
             desired_schema.contains("CREATE TABLE join_policy_acceptances"),
@@ -965,6 +975,10 @@ mod tests {
         assert!(
             desired_schema.contains("tier            channel_tier NOT NULL DEFAULT 'open'"),
             "desired-state schema must carry the immutable channel tier column",
+        );
+        assert!(
+            desired_schema.contains("overdue_notified_at TIMESTAMPTZ"),
+            "desired-state schema must carry the overdue-notice bookkeeping column",
         );
     }
 
@@ -1208,7 +1222,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(27));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(28));
     }
 
     #[tokio::test]

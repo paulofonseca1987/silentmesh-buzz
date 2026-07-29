@@ -32,7 +32,8 @@ use buzz_core::kind::{
     KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF,
     KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED,
     KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM, KIND_TEXT_NOTE, KIND_USER_STATUS,
-    KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, KIND_WORK_THREAD_METADATA, KIND_WORK_THREAD_OPEN,
+    KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, KIND_WORK_THREAD_CHECKPOINT,
+    KIND_WORK_THREAD_METADATA, KIND_WORK_THREAD_OPEN, KIND_WORK_THREAD_OVERDUE,
     KIND_WORK_THREAD_RECOMMEND, KIND_WORK_THREAD_STATE, RELAY_ADMIN_ADD_MEMBER,
     RELAY_ADMIN_CHANGE_ROLE, RELAY_ADMIN_REMOVE_MEMBER, RELAY_ADMIN_SET_WORKSPACE_PROFILE,
 };
@@ -499,12 +500,15 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
             | KIND_HUDDLE_ENDED
             | KIND_HUDDLE_GUIDELINES
             // silent-mesh: work threads live in a channel. 47001/47002 are
-            // command kinds (routed before the channel gate) — listed anyway
-            // so the intent is pinned by the disjointness test.
+            // command kinds (routed before the channel gate) and 47011 is
+            // relay-only — listed anyway so the intent is pinned by the
+            // disjointness test.
             | KIND_WORK_THREAD_OPEN
             | KIND_WORK_THREAD_METADATA
             | KIND_WORK_THREAD_STATE
             | KIND_WORK_THREAD_RECOMMEND
+            | KIND_WORK_THREAD_CHECKPOINT
+            | KIND_WORK_THREAD_OVERDUE
     )
 }
 
@@ -1417,6 +1421,76 @@ fn validate_work_thread_open(event: &Event) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate a kind:47010 per-turn checkpoint (Silent Mesh Phase 2).
+///
+/// Exactly one `e` tag naming the thread root (64-hex event id); a required
+/// `commit` tag with a full git object id (40-hex SHA-1 or 64-hex SHA-256);
+/// optional `branch` (sane ref name) and `turn` (u32 ordinal) tags, each at
+/// most once. Content is an optional free-text note.
+fn validate_work_thread_checkpoint(event: &Event) -> Result<(), String> {
+    let mut root_seen = 0usize;
+    let mut commit_seen = false;
+    let mut branch_seen = false;
+    let mut turn_seen = false;
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        if parts.len() < 2 {
+            continue;
+        }
+        match parts[0].as_str() {
+            "e" => {
+                root_seen += 1;
+                let v = parts[1].as_str();
+                if v.len() != 64 || !v.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err("thread root reference must be a 64-hex event id".into());
+                }
+            }
+            "commit" => {
+                if commit_seen {
+                    return Err("duplicate commit tag".into());
+                }
+                commit_seen = true;
+                let v = parts[1].as_str();
+                let ok =
+                    (v.len() == 40 || v.len() == 64) && v.chars().all(|c| c.is_ascii_hexdigit());
+                if !ok {
+                    return Err("commit must be a full 40- or 64-hex git object id".into());
+                }
+            }
+            "branch" => {
+                if branch_seen {
+                    return Err("duplicate branch tag".into());
+                }
+                branch_seen = true;
+                let v = parts[1].as_str();
+                let ok = !v.is_empty()
+                    && v.len() <= 255
+                    && !v.chars().any(|c| c.is_whitespace() || c.is_control());
+                if !ok {
+                    return Err("branch must be a sane ref name (no whitespace, ≤255 chars)".into());
+                }
+            }
+            "turn" => {
+                if turn_seen {
+                    return Err("duplicate turn tag".into());
+                }
+                turn_seen = true;
+                if parts[1].parse::<u32>().is_err() {
+                    return Err("turn must be an unsigned integer".into());
+                }
+            }
+            _ => {}
+        }
+    }
+    if root_seen != 1 {
+        return Err("checkpoint must reference exactly one thread root (e tag)".into());
+    }
+    if !commit_seen {
+        return Err("checkpoint must carry a commit tag".into());
+    }
+    Ok(())
+}
+
 /// Validate a kind:47003 agent recommendation (Silent Mesh Phase 2, D41).
 ///
 /// Exactly one `e` tag naming the thread root (64-hex event id). The event
@@ -2190,12 +2264,18 @@ async fn ingest_event_inner(
         }
     }
 
-    // silent-mesh: recommendations come from channel participants (any role,
-    // bots included) — never from outside the channel, even when the channel
-    // has open visibility.
-    if kind_u32 == KIND_WORK_THREAD_RECOMMEND {
-        validate_work_thread_recommend(&event)
-            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+    // silent-mesh: recommendations (47003) and checkpoints (47010) come from
+    // channel participants (any role, bots included) — never from outside
+    // the channel, even when the channel has open visibility — and must
+    // reference a thread that actually exists in this channel.
+    if kind_u32 == KIND_WORK_THREAD_RECOMMEND || kind_u32 == KIND_WORK_THREAD_CHECKPOINT {
+        if kind_u32 == KIND_WORK_THREAD_RECOMMEND {
+            validate_work_thread_recommend(&event)
+                .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+        } else {
+            validate_work_thread_checkpoint(&event)
+                .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+        }
         if let Some(ch_id) = channel_id {
             let role = state
                 .db
@@ -2204,8 +2284,36 @@ async fn ingest_event_inner(
                 .map_err(|e| IngestError::Internal(format!("error: member role lookup: {e}")))?;
             if role.is_none() {
                 return Err(IngestError::Rejected(
-                    "forbidden: only channel members may post work-thread recommendations".into(),
+                    "forbidden: only channel members may post work-thread events".into(),
                 ));
+            }
+            // The validators above guarantee exactly one well-formed e tag.
+            let root_bytes = event
+                .tags
+                .iter()
+                .find_map(|t| {
+                    let parts = t.as_slice();
+                    (parts.len() >= 2 && parts[0].as_str() == "e")
+                        .then(|| hex::decode(parts[1].as_str()).ok())
+                        .flatten()
+                })
+                .filter(|b| b.len() == 32)
+                .ok_or_else(|| IngestError::Rejected("invalid: bad thread root id".into()))?;
+            let thread = state
+                .db
+                .get_work_thread(tenant.community(), &root_bytes)
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: thread lookup: {e}")))?;
+            match thread {
+                Some(t) if t.channel_id == ch_id => {}
+                Some(_) => {
+                    return Err(IngestError::Rejected(
+                        "invalid: thread does not belong to this channel".into(),
+                    ));
+                }
+                None => {
+                    return Err(IngestError::Rejected("invalid: unknown work thread".into()));
+                }
             }
         }
     }
@@ -3341,7 +3449,8 @@ mod tests {
     }
 
     /// silent-mesh: work-thread kinds are channel-scoped MessagesWrite events;
-    /// 47001/47002 route through the command executor, 47000/47003 are stored.
+    /// 47001/47002 route through the command executor, 47000/47003/47010 are
+    /// stored, and 47011 is relay-only (never client-submittable).
     #[test]
     fn work_thread_kinds_scope_and_channel_requirements() {
         let dummy = make_dummy_event();
@@ -3350,6 +3459,8 @@ mod tests {
             KIND_WORK_THREAD_METADATA,
             KIND_WORK_THREAD_STATE,
             KIND_WORK_THREAD_RECOMMEND,
+            KIND_WORK_THREAD_CHECKPOINT,
+            KIND_WORK_THREAD_OVERDUE,
         ] {
             assert_eq!(
                 required_scope_for_kind(kind, &dummy).unwrap(),
@@ -3365,6 +3476,77 @@ mod tests {
         assert!(!buzz_core::kind::is_command_kind(
             KIND_WORK_THREAD_RECOMMEND
         ));
+        assert!(!buzz_core::kind::is_command_kind(
+            KIND_WORK_THREAD_CHECKPOINT
+        ));
+        // The overdue notice is emitted only by the deadline sweep — the
+        // relay-only gate rejects client submissions before storage.
+        assert!(buzz_core::kind::is_relay_only_kind(
+            KIND_WORK_THREAD_OVERDUE
+        ));
+        assert!(!buzz_core::kind::is_relay_only_kind(
+            KIND_WORK_THREAD_CHECKPOINT
+        ));
+    }
+
+    #[test]
+    fn work_thread_checkpoint_validation() {
+        let root = "b".repeat(64);
+        let sha1 = "c".repeat(40);
+        let sha256 = "d".repeat(64);
+
+        let good = make_event_with_tags(
+            KIND_WORK_THREAD_CHECKPOINT,
+            "turn 3: parser fix",
+            &[&["e", &root], &["commit", &sha1]],
+        );
+        assert!(validate_work_thread_checkpoint(&good).is_ok());
+
+        let full = make_event_with_tags(
+            KIND_WORK_THREAD_CHECKPOINT,
+            "",
+            &[
+                &["e", &root],
+                &["commit", &sha256],
+                &["branch", "silent-mesh/thread-1"],
+                &["turn", "3"],
+            ],
+        );
+        assert!(validate_work_thread_checkpoint(&full).is_ok());
+
+        let no_commit = make_event_with_tags(KIND_WORK_THREAD_CHECKPOINT, "", &[&["e", &root]]);
+        assert!(validate_work_thread_checkpoint(&no_commit).is_err());
+
+        let no_root = make_event_with_tags(KIND_WORK_THREAD_CHECKPOINT, "", &[&["commit", &sha1]]);
+        assert!(validate_work_thread_checkpoint(&no_root).is_err());
+
+        let two_roots = make_event_with_tags(
+            KIND_WORK_THREAD_CHECKPOINT,
+            "",
+            &[&["e", &root], &["e", &root], &["commit", &sha1]],
+        );
+        assert!(validate_work_thread_checkpoint(&two_roots).is_err());
+
+        let short_commit = make_event_with_tags(
+            KIND_WORK_THREAD_CHECKPOINT,
+            "",
+            &[&["e", &root], &["commit", "abc123"]],
+        );
+        assert!(validate_work_thread_checkpoint(&short_commit).is_err());
+
+        let bad_branch = make_event_with_tags(
+            KIND_WORK_THREAD_CHECKPOINT,
+            "",
+            &[&["e", &root], &["commit", &sha1], &["branch", "has space"]],
+        );
+        assert!(validate_work_thread_checkpoint(&bad_branch).is_err());
+
+        let bad_turn = make_event_with_tags(
+            KIND_WORK_THREAD_CHECKPOINT,
+            "",
+            &[&["e", &root], &["commit", &sha1], &["turn", "-1"]],
+        );
+        assert!(validate_work_thread_checkpoint(&bad_turn).is_err());
     }
 
     #[test]

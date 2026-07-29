@@ -540,6 +540,16 @@ pub const KIND_WORK_THREAD_STATE: u32 = 47002;
 /// **inert until a human confirms** by sending the real kind:47001/47002.
 /// Never touches the projection. Tags: `e` = thread root, `h` = channel.
 pub const KIND_WORK_THREAD_RECOMMEND: u32 = 47003;
+/// Per-turn checkpoint ref — regular stored event recording a worktree
+/// commit for a thread (the agent's turn trail; diff/revert anchors).
+/// Tags: `e` = thread root, `h` = channel, `commit` = git object id
+/// (40/64 hex), optional `branch` (ref name) and `turn` (ordinal).
+pub const KIND_WORK_THREAD_CHECKPOINT: u32 = 47010;
+/// Relay-signed overdue notice — emitted by the deadline sweep when a live
+/// thread passes its deadline (Silent Mesh D40), tagging the DRI (`p`;
+/// falls back to the opener). Clients cannot submit this kind — the scope
+/// gate rejects it; only the relay's own signer inserts it.
+pub const KIND_WORK_THREAD_OVERDUE: u32 = 47011;
 
 // System / admin custom range (48000–48999)
 /// An audit log entry was recorded.
@@ -675,6 +685,8 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_WORK_THREAD_METADATA,
     KIND_WORK_THREAD_STATE,
     KIND_WORK_THREAD_RECOMMEND,
+    KIND_WORK_THREAD_CHECKPOINT,
+    KIND_WORK_THREAD_OVERDUE,
     KIND_AGENT_TURN_METRIC,
     KIND_WORKFLOW_DEF,
     KIND_LONG_FORM,
@@ -761,10 +773,13 @@ pub const fn is_identity_archive_request_kind(kind: u32) -> bool {
     matches!(kind, KIND_IA_ARCHIVE_REQUEST | KIND_IA_UNARCHIVE_REQUEST)
 }
 
-/// Returns `true` if `kind` is a Silent Mesh work-thread kind (47000–47003).
+/// Returns `true` if `kind` is a Silent Mesh work-thread kind
+/// (47000–47003, 47010–47011).
 ///
 /// The canonical route check — use this instead of scattering `47000..`
-/// matches across ingest/dispatch.
+/// matches across ingest/dispatch. Note 47011 (overdue notice) is also
+/// relay-only ([`is_relay_only_kind`]) — part of the family for dispatch
+/// and workflow-exclusion purposes, but never client-submittable.
 pub const fn is_work_thread_kind(kind: u32) -> bool {
     matches!(
         kind,
@@ -772,6 +787,8 @@ pub const fn is_work_thread_kind(kind: u32) -> bool {
             | KIND_WORK_THREAD_METADATA
             | KIND_WORK_THREAD_STATE
             | KIND_WORK_THREAD_RECOMMEND
+            | KIND_WORK_THREAD_CHECKPOINT
+            | KIND_WORK_THREAD_OVERDUE
     )
 }
 
@@ -802,6 +819,8 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
             | KIND_DM_VISIBILITY
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
+            // silent-mesh: overdue notices come only from the deadline sweep.
+            | KIND_WORK_THREAD_OVERDUE
     )
 }
 
@@ -844,6 +863,15 @@ const _: () = assert!(!is_replaceable(KIND_WORK_THREAD_RECOMMEND));
 const _: () = assert!(!is_parameterized_replaceable(KIND_WORK_THREAD_RECOMMEND));
 const _: () = assert!(!is_ephemeral(KIND_WORK_THREAD_RECOMMEND));
 const _: () = assert!(KIND_WORK_THREAD_RECOMMEND <= u16::MAX as u32);
+const _: () = assert!(!is_replaceable(KIND_WORK_THREAD_CHECKPOINT));
+const _: () = assert!(!is_parameterized_replaceable(KIND_WORK_THREAD_CHECKPOINT));
+const _: () = assert!(!is_ephemeral(KIND_WORK_THREAD_CHECKPOINT));
+const _: () = assert!(!is_replaceable(KIND_WORK_THREAD_OVERDUE));
+const _: () = assert!(!is_parameterized_replaceable(KIND_WORK_THREAD_OVERDUE));
+const _: () = assert!(!is_ephemeral(KIND_WORK_THREAD_OVERDUE));
+const _: () = assert!(is_relay_only_kind(KIND_WORK_THREAD_OVERDUE));
+const _: () = assert!(!is_relay_only_kind(KIND_WORK_THREAD_CHECKPOINT));
+const _: () = assert!(KIND_WORK_THREAD_OVERDUE <= u16::MAX as u32);
 
 // Compile-time: NIP-34 parameterized replaceable kinds are in the correct range.
 const _: () = assert!(

@@ -762,4 +762,131 @@ mod pg_tests {
             .expect("thread exists");
         assert_eq!(thread.status, WorkThreadStatus::Open);
     }
+
+    /// Phase 2d: the overdue sweep emits exactly one relay-signed kind:47011
+    /// notice per passed deadline, tagging the DRI, and never repeats.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn overdue_sweep_emits_one_dri_tagged_notice() {
+        use buzz_core::kind::KIND_WORK_THREAD_OVERDUE;
+
+        let state = test_state().await;
+        let ws_owner = nostr::Keys::generate();
+        let opener = nostr::Keys::generate();
+        let dri = nostr::Keys::generate();
+
+        let host = format!("overdue-{}.example", Uuid::new_v4().simple());
+        let community = match state
+            .db
+            .create_community_with_owner(&host, &ws_owner.public_key().to_hex())
+            .await
+            .expect("create community")
+        {
+            CreateCommunityWithOwnerResult::Created(rec) => rec.id,
+            other => panic!("expected fresh community, got {other:?}"),
+        };
+        state
+            .db
+            .ensure_user(community, opener.public_key().to_bytes().as_ref())
+            .await
+            .expect("ensure opener");
+        let channel = state
+            .db
+            .create_channel(
+                community,
+                "overdue",
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                None,
+                &opener.public_key().to_bytes(),
+                None,
+            )
+            .await
+            .expect("create channel");
+
+        // Past-deadline thread with a DRI, projected directly.
+        let thread_id = nostr::Keys::generate().public_key().to_bytes().to_vec();
+        let past = chrono::DateTime::from_timestamp(1_600_000_000, 0).expect("ts");
+        assert!(state
+            .db
+            .create_work_thread(buzz_db::work_thread::CreateWorkThreadParams {
+                community_id: community,
+                thread_id: &thread_id,
+                channel_id: channel.id,
+                goal: "overdue task",
+                deadline: Some(past),
+                dri_pubkey: Some(&dri.public_key().to_bytes()),
+                created_by: &opener.public_key().to_bytes(),
+            })
+            .await
+            .expect("create thread"));
+
+        let host_map: std::collections::HashMap<Uuid, String> =
+            [(*community.as_uuid(), host.clone())].into_iter().collect();
+        let emitted = crate::overdue_sweep::run_overdue_sweep(&state, &host_map).await;
+        assert!(emitted >= 1, "sweep must emit the notice");
+
+        // The stored notice is relay-signed and carries e/h/p correlation tags.
+        let pool = sqlx::PgPool::connect(&state.config.database_url)
+            .await
+            .expect("pg pool");
+        let fetch_notices = |pool: sqlx::PgPool| async move {
+            let rows: Vec<(Vec<u8>, serde_json::Value, String)> = sqlx::query_as(
+                "SELECT pubkey, tags, content FROM events \
+                 WHERE community_id = $1 AND kind = $2 AND deleted_at IS NULL",
+            )
+            .bind(community.as_uuid())
+            .bind(KIND_WORK_THREAD_OVERDUE as i32)
+            .fetch_all(&pool)
+            .await
+            .expect("query notices");
+            rows
+        };
+        let notices = fetch_notices(pool.clone()).await;
+        let thread_hex = hex::encode(&thread_id);
+        let tag_of = |tags: &serde_json::Value, name: &str| -> Option<String> {
+            tags.as_array()?.iter().find_map(|t| {
+                let t = t.as_array()?;
+                (t.first()?.as_str()? == name).then(|| t.get(1)?.as_str().map(str::to_owned))?
+            })
+        };
+        let notice = notices
+            .iter()
+            .find(|(_, tags, _)| tag_of(tags, "e").as_deref() == Some(thread_hex.as_str()))
+            .expect("notice stored for the thread");
+        assert_eq!(
+            notice.0,
+            state.relay_keypair.public_key().to_bytes().to_vec(),
+            "notice must be relay-signed"
+        );
+        assert_eq!(
+            tag_of(&notice.1, "h").as_deref(),
+            Some(channel.id.to_string().as_str())
+        );
+        assert_eq!(
+            tag_of(&notice.1, "p").as_deref(),
+            Some(dri.public_key().to_hex().as_str()),
+            "notice must tag the DRI"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&notice.2).expect("notice content is JSON");
+        assert_eq!(body["goal"].as_str(), Some("overdue task"));
+        assert_eq!(body["status"].as_str(), Some("open"));
+
+        // A second sweep pass emits nothing new — the claim is once-per-deadline.
+        let _ = crate::overdue_sweep::run_overdue_sweep(&state, &host_map).await;
+        let thread = state
+            .db
+            .get_work_thread(community, &thread_id)
+            .await
+            .expect("get thread")
+            .expect("exists");
+        assert!(thread.overdue_notified_at.is_some());
+        let notices_after = fetch_notices(pool).await;
+        assert_eq!(
+            notices_after.len(),
+            notices.len(),
+            "second sweep must not add a notice in this community"
+        );
+    }
 }

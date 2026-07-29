@@ -1003,6 +1003,30 @@ pub enum ThreadsCmd {
         #[arg(long)]
         note: String,
     },
+    /// Record a per-turn checkpoint ref on a thread (signs a kind:47010 event)
+    #[command(
+        after_help = "Examples:\n  buzz threads checkpoint --channel <UUID> --thread <64-hex> --commit <40-or-64-hex>\n  buzz threads checkpoint --channel <UUID> --thread <64-hex> --commit <hex> --branch threads/t1 --turn 3 --note 'parser fix'"
+    )]
+    Checkpoint {
+        /// Channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Thread root event id (64-char hex)
+        #[arg(long)]
+        thread: String,
+        /// Full git object id (40-hex SHA-1 or 64-hex SHA-256)
+        #[arg(long)]
+        commit: String,
+        /// Optional branch/ref name
+        #[arg(long)]
+        branch: Option<String>,
+        /// Optional turn ordinal
+        #[arg(long)]
+        turn: Option<u32>,
+        /// Optional free-text note (event content)
+        #[arg(long)]
+        note: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2077,7 +2101,15 @@ mod tests {
         );
         assert_eq!(
             names(&cmd, "threads"),
-            vec!["list", "open", "recommend", "set", "show", "state"]
+            vec![
+                "checkpoint",
+                "list",
+                "open",
+                "recommend",
+                "set",
+                "show",
+                "state"
+            ]
         );
         assert_eq!(
             names(&cmd, "messages"),

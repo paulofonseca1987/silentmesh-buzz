@@ -288,8 +288,33 @@ pub async fn cmd_show_thread(
         })
         .collect();
 
+    let cp_filter = serde_json::json!({
+        "kinds": [47010],
+        "#h": [channel],
+        "#e": [thread_id],
+    });
+    let cp_resp = client.query(&cp_filter).await?;
+    let mut checkpoints: Vec<serde_json::Value> =
+        serde_json::from_str(&cp_resp).unwrap_or_default();
+    checkpoints.sort_by_key(fold_key);
+    let checkpoints: Vec<serde_json::Value> = checkpoints
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": c.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                "author": c.get("pubkey").and_then(|v| v.as_str()).unwrap_or_default(),
+                "commit": tag_value(c, "commit").unwrap_or_default(),
+                "branch": tag_value(c, "branch"),
+                "turn": tag_value(c, "turn").and_then(|v| v.parse::<u32>().ok()),
+                "note": c.get("content").and_then(|v| v.as_str()).unwrap_or_default(),
+                "created_at": c.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0),
+            })
+        })
+        .collect();
+
     let mut view = folded.to_json();
     view["recommendations"] = serde_json::Value::Array(recommendations);
+    view["checkpoints"] = serde_json::Value::Array(checkpoints);
     println!("{view}");
     Ok(())
 }
@@ -373,6 +398,35 @@ pub async fn cmd_recommend(
     Ok(())
 }
 
+/// Record a per-turn checkpoint (kind 47010).
+pub async fn cmd_checkpoint(
+    client: &BuzzClient,
+    channel: &str,
+    thread: &str,
+    commit: &str,
+    branch: Option<&str>,
+    turn: Option<u32>,
+    note: Option<&str>,
+) -> Result<(), CliError> {
+    crate::validate::validate_uuid(channel)?;
+    let channel_id = uuid::Uuid::parse_str(channel)
+        .map_err(|_| CliError::Usage("channel must be a UUID".into()))?;
+    let thread_id = validate_thread_id(thread)?;
+    let builder = buzz_sdk::build_thread_checkpoint(
+        channel_id,
+        &thread_id,
+        commit,
+        branch,
+        turn,
+        note.unwrap_or(""),
+    )
+    .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let resp = client.submit_event(event).await?;
+    println!("{}", crate::client::normalize_write_response(&resp));
+    Ok(())
+}
+
 pub async fn dispatch(cmd: crate::ThreadsCmd, client: &BuzzClient) -> Result<(), CliError> {
     use crate::ThreadsCmd;
     match cmd {
@@ -420,6 +474,25 @@ pub async fn dispatch(cmd: crate::ThreadsCmd, client: &BuzzClient) -> Result<(),
             thread,
             note,
         } => cmd_recommend(client, &channel, &thread, &note).await,
+        ThreadsCmd::Checkpoint {
+            channel,
+            thread,
+            commit,
+            branch,
+            turn,
+            note,
+        } => {
+            cmd_checkpoint(
+                client,
+                &channel,
+                &thread,
+                &commit,
+                branch.as_deref(),
+                turn,
+                note.as_deref(),
+            )
+            .await
+        }
     }
 }
 

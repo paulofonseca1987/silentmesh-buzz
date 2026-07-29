@@ -19,6 +19,7 @@ use buzz_search::SearchService;
 
 use buzz_relay::config::Config;
 use buzz_relay::metrics as relay_metrics;
+use buzz_relay::overdue_sweep;
 use buzz_relay::router::{build_health_router, build_router};
 use buzz_relay::state::AppState;
 use buzz_relay::storage_sweep;
@@ -1441,7 +1442,7 @@ fn dropped_in_memory_keys(
 /// Run one usage-metrics tick. Every pod emits its own in-memory gauges, while
 /// one leader owns the heavier database-derived snapshot.
 async fn run_usage_metrics_tick(
-    state: &AppState,
+    state: &Arc<AppState>,
     emission_scope: &EmissionScope,
     leader: &mut Option<buzz_db::UsageMetricsLeader>,
     emitted_in_memory: &mut HashSet<InMemoryMetricKey>,
@@ -1500,6 +1501,15 @@ async fn run_usage_metrics_tick(
             }
         }
         run_storage_sweep_tick(state, emission_scope, &host_map).await;
+
+        // silent-mesh: leader-only overdue-deadline sweep — relay-signed
+        // kind:47011 notices for live threads past their deadline (D40).
+        // The overdue_notified_at claim is TOCTOU-safe, so a demotion race
+        // between two leaders cannot double-notify.
+        let overdue_notices = overdue_sweep::run_overdue_sweep(state, &host_map).await;
+        if overdue_notices > 0 {
+            info!(overdue_notices, "work-thread overdue notices emitted");
+        }
     }
 
     Ok(())

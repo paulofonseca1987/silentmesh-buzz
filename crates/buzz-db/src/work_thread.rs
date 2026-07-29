@@ -90,6 +90,9 @@ pub struct WorkThreadRecord {
     pub updated_at: DateTime<Utc>,
     /// When the thread was closed, if it has been.
     pub closed_at: Option<DateTime<Utc>>,
+    /// When the overdue sweep last emitted a kind:47011 notice, if it has.
+    /// Cleared when the deadline is edited so a new deadline can go overdue.
+    pub overdue_notified_at: Option<DateTime<Utc>>,
 }
 
 /// Parameters for creating a work-thread projection row.
@@ -144,7 +147,7 @@ pub async fn get_work_thread(
         r#"
         SELECT community_id, thread_id, channel_id, goal, deadline, dri_pubkey,
                status::text AS status, canonicalize_on_close, created_by,
-               created_at, updated_at, closed_at
+               created_at, updated_at, closed_at, overdue_notified_at
         FROM work_threads
         WHERE community_id = $1 AND thread_id = $2
         "#,
@@ -169,7 +172,7 @@ pub async fn list_work_threads(
         r#"
         SELECT community_id, thread_id, channel_id, goal, deadline, dri_pubkey,
                status::text AS status, canonicalize_on_close, created_by,
-               created_at, updated_at, closed_at
+               created_at, updated_at, closed_at, overdue_notified_at
         FROM work_threads
         WHERE community_id = $1 AND channel_id = $2
           AND ($3::text IS NULL OR status = $3::work_thread_status)
@@ -189,6 +192,9 @@ pub async fn list_work_threads(
 /// Update task metadata (goal / deadline / DRI). `None` leaves a field
 /// untouched; `deadline`/`dri` use double-`Option` so `Some(None)` clears.
 /// Returns `false` when the thread does not exist.
+///
+/// Editing the deadline resets `overdue_notified_at`, so an extended
+/// deadline can trigger a fresh overdue notice when it passes.
 pub async fn update_work_thread_metadata(
     pool: &PgPool,
     community_id: CommunityId,
@@ -202,6 +208,7 @@ pub async fn update_work_thread_metadata(
         UPDATE work_threads
         SET goal       = COALESCE($3, goal),
             deadline   = CASE WHEN $4 THEN $5 ELSE deadline END,
+            overdue_notified_at = CASE WHEN $4 THEN NULL ELSE overdue_notified_at END,
             dri_pubkey = CASE WHEN $6 THEN $7 ELSE dri_pubkey END,
             updated_at = NOW()
         WHERE community_id = $1 AND thread_id = $2
@@ -256,6 +263,59 @@ pub async fn transition_work_thread(
     Ok(updated > 0)
 }
 
+/// List live threads whose deadline has passed and which have not yet been
+/// notified — the overdue sweep's work list, across all communities.
+pub async fn list_overdue_work_threads(pool: &PgPool, limit: i64) -> Result<Vec<WorkThreadRecord>> {
+    let limit = limit.clamp(1, 1000);
+    let rows = sqlx::query(
+        r#"
+        SELECT community_id, thread_id, channel_id, goal, deadline, dri_pubkey,
+               status::text AS status, canonicalize_on_close, created_by,
+               created_at, updated_at, closed_at, overdue_notified_at
+        FROM work_threads
+        WHERE deadline IS NOT NULL
+          AND deadline < NOW()
+          AND status IN ('open', 'snoozed', 'ready')
+          AND overdue_notified_at IS NULL
+        ORDER BY deadline ASC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(row_to_record).collect()
+}
+
+/// Claim the overdue notification for a thread (TOCTOU-safe): stamps
+/// `overdue_notified_at` only if it is still unset and the thread is still
+/// live and overdue. Returns `false` when another sweep won the race, the
+/// deadline moved, or the thread left a live state — the caller must not
+/// emit a notice in that case.
+pub async fn claim_overdue_notification(
+    pool: &PgPool,
+    community_id: CommunityId,
+    thread_id: &[u8],
+) -> Result<bool> {
+    let claimed = sqlx::query(
+        r#"
+        UPDATE work_threads
+        SET overdue_notified_at = NOW()
+        WHERE community_id = $1 AND thread_id = $2
+          AND overdue_notified_at IS NULL
+          AND deadline IS NOT NULL
+          AND deadline < NOW()
+          AND status IN ('open', 'snoozed', 'ready')
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(thread_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(claimed > 0)
+}
+
 fn row_to_record(row: sqlx::postgres::PgRow) -> Result<WorkThreadRecord> {
     let community_id: Uuid = row.try_get("community_id")?;
     let status_str: String = row.try_get("status")?;
@@ -272,6 +332,7 @@ fn row_to_record(row: sqlx::postgres::PgRow) -> Result<WorkThreadRecord> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         closed_at: row.try_get("closed_at")?,
+        overdue_notified_at: row.try_get("overdue_notified_at")?,
     })
 }
 
@@ -545,5 +606,110 @@ mod pg_tests {
             .expect("get thread")
             .expect("thread exists");
         assert_eq!(thread.status, WorkThreadStatus::Open);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn overdue_claim_is_once_and_resets_on_deadline_edit() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let channel_id = make_channel(&pool, community).await;
+        let thread_id = vec![0x33u8; 32];
+        let created_by = vec![0xaau8; 32];
+
+        // Past-deadline live thread → appears in the sweep list.
+        let past = DateTime::from_timestamp(1_600_000_000, 0).expect("valid ts");
+        assert!(create_work_thread(
+            &pool,
+            CreateWorkThreadParams {
+                community_id: community,
+                thread_id: &thread_id,
+                channel_id,
+                goal: "overdue task",
+                deadline: Some(past),
+                dri_pubkey: None,
+                created_by: &created_by,
+            },
+        )
+        .await
+        .expect("create thread"));
+        let overdue = list_overdue_work_threads(&pool, 100).await.expect("list");
+        assert!(
+            overdue
+                .iter()
+                .any(|t| t.community_id == community && t.thread_id == thread_id),
+            "past-deadline live thread must be listed"
+        );
+
+        // First claim wins; the replay loses (at-most-once notice).
+        assert!(claim_overdue_notification(&pool, community, &thread_id)
+            .await
+            .expect("first claim"));
+        assert!(!claim_overdue_notification(&pool, community, &thread_id)
+            .await
+            .expect("second claim"));
+        let overdue = list_overdue_work_threads(&pool, 100).await.expect("list");
+        assert!(
+            !overdue
+                .iter()
+                .any(|t| t.community_id == community && t.thread_id == thread_id),
+            "claimed thread must leave the sweep list"
+        );
+
+        // Editing the deadline re-arms the notice.
+        let new_past = DateTime::from_timestamp(1_650_000_000, 0).expect("valid ts");
+        assert!(update_work_thread_metadata(
+            &pool,
+            community,
+            &thread_id,
+            None,
+            Some(Some(new_past)),
+            None,
+        )
+        .await
+        .expect("edit deadline"));
+        let thread = get_work_thread(&pool, community, &thread_id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert!(thread.overdue_notified_at.is_none(), "deadline edit resets");
+        assert!(claim_overdue_notification(&pool, community, &thread_id)
+            .await
+            .expect("re-armed claim"));
+
+        // Closed threads never claim, even when overdue again.
+        assert!(update_work_thread_metadata(
+            &pool,
+            community,
+            &thread_id,
+            None,
+            Some(Some(past)),
+            None,
+        )
+        .await
+        .expect("re-arm again"));
+        assert!(transition_work_thread(
+            &pool,
+            community,
+            &thread_id,
+            WorkThreadStatus::Open,
+            WorkThreadStatus::Ready,
+            None,
+        )
+        .await
+        .expect("open → ready"));
+        assert!(transition_work_thread(
+            &pool,
+            community,
+            &thread_id,
+            WorkThreadStatus::Ready,
+            WorkThreadStatus::Closed,
+            None,
+        )
+        .await
+        .expect("ready → closed"));
+        assert!(!claim_overdue_notification(&pool, community, &thread_id)
+            .await
+            .expect("closed thread must not claim"));
     }
 }

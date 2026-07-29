@@ -2929,6 +2929,25 @@ impl Db {
         .await
     }
 
+    /// List live, past-deadline threads not yet notified (the overdue sweep's
+    /// work list, across all communities).
+    pub async fn list_overdue_work_threads(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<work_thread::WorkThreadRecord>> {
+        work_thread::list_overdue_work_threads(&self.pool, limit).await
+    }
+
+    /// Claim a thread's overdue notification (TOCTOU-safe; `Ok(false)` = lost
+    /// the race, deadline moved, or the thread left a live state).
+    pub async fn claim_overdue_notification(
+        &self,
+        community_id: CommunityId,
+        thread_id: &[u8],
+    ) -> Result<bool> {
+        work_thread::claim_overdue_notification(&self.pool, community_id, thread_id).await
+    }
+
     /// Create an approval request.
     pub async fn create_approval(&self, params: workflow::CreateApprovalParams<'_>) -> Result<()> {
         workflow::create_approval(&self.pool, params).await
