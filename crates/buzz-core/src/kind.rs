@@ -555,6 +555,20 @@ pub const KIND_WORK_THREAD_OVERDUE: u32 = 47011;
 /// into the channel repo's `canon/` layer (or fails to). Tags: `e` = root,
 /// `h` = channel, optional `commit` = new main tip. Relay-only.
 pub const KIND_WORK_THREAD_CANON: u32 = 47012;
+/// Relay-signed sibling-archive notice (Silent Mesh D28) — emitted for each
+/// losing fork archived by a winner's close-with-`archive-siblings` flow.
+/// Tags: `e` = the archived thread's root, `h` = channel, `winner` = the
+/// winning thread's root (hex). Content JSON `{"winner": "<hex>"}`.
+/// Relay-only: the batch runs under the closer's admin authority.
+pub const KIND_WORK_THREAD_SIBLING_ARCHIVED: u32 = 47013;
+/// Work-thread fork (Silent Mesh D27) — a regular stored root event, like
+/// kind:47000, whose id is the **new** thread's id. Provenance tags:
+/// exactly one `e` = parent thread root, `h` = channel (same channel as the
+/// parent), optional `commit` = fork point (a recorded kind:47010
+/// checkpoint commit of the parent; absent = fork at head). Content = the
+/// variation's goal; optional `deadline`/`dri` tags as on kind:47000.
+/// Conversation is inherited by reference (the `e` tag), never copied.
+pub const KIND_WORK_THREAD_FORK: u32 = 47020;
 
 // System / admin custom range (48000–48999)
 /// An audit log entry was recorded.
@@ -693,6 +707,8 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_WORK_THREAD_CHECKPOINT,
     KIND_WORK_THREAD_OVERDUE,
     KIND_WORK_THREAD_CANON,
+    KIND_WORK_THREAD_SIBLING_ARCHIVED,
+    KIND_WORK_THREAD_FORK,
     KIND_AGENT_TURN_METRIC,
     KIND_WORKFLOW_DEF,
     KIND_LONG_FORM,
@@ -780,12 +796,13 @@ pub const fn is_identity_archive_request_kind(kind: u32) -> bool {
 }
 
 /// Returns `true` if `kind` is a Silent Mesh work-thread kind
-/// (47000–47003, 47010–47011).
+/// (47000–47003, 47010–47013, 47020).
 ///
 /// The canonical route check — use this instead of scattering `47000..`
-/// matches across ingest/dispatch. Note 47011 (overdue notice) is also
-/// relay-only ([`is_relay_only_kind`]) — part of the family for dispatch
-/// and workflow-exclusion purposes, but never client-submittable.
+/// matches across ingest/dispatch. Note 47011/47012/47013 (overdue, canon,
+/// and sibling-archive notices) are also relay-only
+/// ([`is_relay_only_kind`]) — part of the family for dispatch and
+/// workflow-exclusion purposes, but never client-submittable.
 pub const fn is_work_thread_kind(kind: u32) -> bool {
     matches!(
         kind,
@@ -796,6 +813,8 @@ pub const fn is_work_thread_kind(kind: u32) -> bool {
             | KIND_WORK_THREAD_CHECKPOINT
             | KIND_WORK_THREAD_OVERDUE
             | KIND_WORK_THREAD_CANON
+            | KIND_WORK_THREAD_SIBLING_ARCHIVED
+            | KIND_WORK_THREAD_FORK
     )
 }
 
@@ -826,10 +845,11 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
             | KIND_DM_VISIBILITY
             | KIND_THREAD_SUMMARY
             | KIND_WINDOW_BOUNDS
-            // silent-mesh: overdue + canonicalization notices come only
-            // from the relay's own sweeps/jobs.
+            // silent-mesh: overdue, canonicalization, and sibling-archive
+            // notices come only from the relay's own sweeps/jobs.
             | KIND_WORK_THREAD_OVERDUE
             | KIND_WORK_THREAD_CANON
+            | KIND_WORK_THREAD_SIBLING_ARCHIVED
     )
 }
 
@@ -886,6 +906,18 @@ const _: () = assert!(!is_parameterized_replaceable(KIND_WORK_THREAD_CANON));
 const _: () = assert!(!is_ephemeral(KIND_WORK_THREAD_CANON));
 const _: () = assert!(is_relay_only_kind(KIND_WORK_THREAD_CANON));
 const _: () = assert!(KIND_WORK_THREAD_CANON <= u16::MAX as u32);
+const _: () = assert!(!is_replaceable(KIND_WORK_THREAD_SIBLING_ARCHIVED));
+const _: () = assert!(!is_parameterized_replaceable(
+    KIND_WORK_THREAD_SIBLING_ARCHIVED
+));
+const _: () = assert!(!is_ephemeral(KIND_WORK_THREAD_SIBLING_ARCHIVED));
+const _: () = assert!(is_relay_only_kind(KIND_WORK_THREAD_SIBLING_ARCHIVED));
+const _: () = assert!(KIND_WORK_THREAD_SIBLING_ARCHIVED <= u16::MAX as u32);
+const _: () = assert!(!is_replaceable(KIND_WORK_THREAD_FORK));
+const _: () = assert!(!is_parameterized_replaceable(KIND_WORK_THREAD_FORK));
+const _: () = assert!(!is_ephemeral(KIND_WORK_THREAD_FORK));
+const _: () = assert!(!is_relay_only_kind(KIND_WORK_THREAD_FORK));
+const _: () = assert!(KIND_WORK_THREAD_FORK <= u16::MAX as u32);
 
 // Compile-time: NIP-34 parameterized replaceable kinds are in the correct range.
 const _: () = assert!(

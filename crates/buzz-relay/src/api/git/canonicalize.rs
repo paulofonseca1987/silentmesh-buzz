@@ -888,6 +888,8 @@ mod s3_probe_tests {
                 deadline: None,
                 dri_pubkey: None,
                 created_by: &member.public_key().to_bytes(),
+                forked_from: None,
+                fork_commit: None,
             })
             .await
             .expect("create thread"));

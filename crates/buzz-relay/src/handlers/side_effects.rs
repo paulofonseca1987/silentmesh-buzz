@@ -11,7 +11,7 @@ use buzz_core::kind::{
     KIND_GIT_REPO_ANNOUNCEMENT, KIND_IA_ARCHIVED, KIND_IA_ARCHIVED_LIST, KIND_IA_UNARCHIVED,
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_NIP29_GROUP_ADMINS,
     KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA, KIND_NIP43_MEMBERSHIP_LIST, KIND_REACTION,
-    KIND_THREAD_SUMMARY, KIND_WORK_THREAD_OPEN,
+    KIND_THREAD_SUMMARY, KIND_WORK_THREAD_FORK, KIND_WORK_THREAD_OPEN,
 };
 use buzz_core::StoredEvent;
 use buzz_db::channel::{MemberRecord, MemberRole};
@@ -42,6 +42,7 @@ pub fn is_side_effect_kind(kind: u32) -> bool {
             | 41001..=41003
             | 40099
             | KIND_WORK_THREAD_OPEN
+            | KIND_WORK_THREAD_FORK
     )
 }
 
@@ -223,6 +224,8 @@ pub async fn handle_side_effects(
         KIND_AGENT_PROFILE => handle_agent_profile(tenant, event, state).await,
         // silent-mesh: work-thread root → create the projection row.
         KIND_WORK_THREAD_OPEN => handle_work_thread_open(tenant, event, state).await,
+        // silent-mesh: thread fork → create the projection row with provenance.
+        KIND_WORK_THREAD_FORK => handle_work_thread_fork(tenant, event, state).await,
         // kind:7 (reaction) handled inline in ingest_event() before storage.
         _ => Ok(()),
     }
@@ -1305,6 +1308,8 @@ async fn handle_work_thread_open(
             deadline,
             dri_pubkey: dri_pubkey.as_deref(),
             created_by: &event.pubkey.to_bytes(),
+            forked_from: None,
+            fork_commit: None,
         })
         .await?;
     if created {
@@ -1312,6 +1317,102 @@ async fn handle_work_thread_open(
             thread = %event.id.to_hex(),
             channel = %channel_id,
             "work thread opened"
+        );
+    }
+    Ok(())
+}
+
+/// silent-mesh: kind:47020 (thread fork, D27) side effect — create the
+/// `work_threads` projection row for the **new** thread, carrying fork
+/// provenance (parent root + optional fork-point commit).
+///
+/// The tags were validated pre-storage (`validate_work_thread_fork` plus
+/// the parent-existence and checkpoint-commit checks in the ingest
+/// pipeline), so parse failures here mean a code drift bug, not bad client
+/// input. Conversation is inherited by reference (the `e` tag) — nothing
+/// is copied.
+async fn handle_work_thread_fork(
+    tenant: &TenantContext,
+    event: &Event,
+    state: &Arc<AppState>,
+) -> anyhow::Result<()> {
+    let channel_id = event
+        .tags
+        .iter()
+        .find_map(|t| {
+            let parts = t.as_slice();
+            (parts.len() >= 2 && parts[0].as_str() == "h")
+                .then(|| parts[1].parse::<Uuid>().ok())
+                .flatten()
+        })
+        .ok_or_else(|| anyhow::anyhow!("kind:47020 missing h tag"))?;
+
+    let forked_from = event
+        .tags
+        .iter()
+        .find_map(|t| {
+            let parts = t.as_slice();
+            (parts.len() >= 2 && parts[0].as_str() == "e")
+                .then(|| {
+                    hex::decode(parts[1].as_str())
+                        .ok()
+                        .filter(|b| b.len() == 32)
+                })
+                .flatten()
+        })
+        .ok_or_else(|| anyhow::anyhow!("kind:47020 missing parent e tag"))?;
+
+    let fork_commit = event.tags.iter().find_map(|t| {
+        let parts = t.as_slice();
+        (parts.len() >= 2 && parts[0].as_str() == "commit").then(|| parts[1].to_ascii_lowercase())
+    });
+
+    let deadline = event
+        .tags
+        .iter()
+        .find_map(|t| {
+            let parts = t.as_slice();
+            (parts.len() >= 2 && parts[0].as_str() == "deadline")
+                .then(|| parts[1].parse::<i64>().ok())
+                .flatten()
+        })
+        .map(|secs| {
+            chrono::DateTime::from_timestamp(secs, 0)
+                .ok_or_else(|| anyhow::anyhow!("kind:47020 deadline out of range"))
+        })
+        .transpose()?;
+
+    let dri_pubkey = event.tags.iter().find_map(|t| {
+        let parts = t.as_slice();
+        (parts.len() >= 2 && parts[0].as_str() == "dri")
+            .then(|| {
+                hex::decode(parts[1].as_str())
+                    .ok()
+                    .filter(|b| b.len() == 32)
+            })
+            .flatten()
+    });
+
+    let created = state
+        .db
+        .create_work_thread(buzz_db::work_thread::CreateWorkThreadParams {
+            community_id: tenant.community(),
+            thread_id: event.id.as_bytes(),
+            channel_id,
+            goal: event.content.trim(),
+            deadline,
+            dri_pubkey: dri_pubkey.as_deref(),
+            created_by: &event.pubkey.to_bytes(),
+            forked_from: Some(&forked_from),
+            fork_commit: fork_commit.as_deref(),
+        })
+        .await?;
+    if created {
+        info!(
+            thread = %event.id.to_hex(),
+            parent = %hex::encode(&forked_from),
+            channel = %channel_id,
+            "work thread forked"
         );
     }
     Ok(())

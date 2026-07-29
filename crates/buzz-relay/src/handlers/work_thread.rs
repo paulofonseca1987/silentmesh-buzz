@@ -24,12 +24,17 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use nostr::Event;
+use nostr::{Event, EventBuilder, Kind, Tag};
+use tracing::warn;
 use uuid::Uuid;
 
-use buzz_core::kind::{KIND_WORK_THREAD_METADATA, KIND_WORK_THREAD_STATE};
+use buzz_core::kind::{
+    KIND_WORK_THREAD_CHECKPOINT, KIND_WORK_THREAD_METADATA, KIND_WORK_THREAD_SIBLING_ARCHIVED,
+    KIND_WORK_THREAD_STATE,
+};
 use buzz_core::tenant::TenantContext;
 use buzz_db::work_thread::WorkThreadStatus;
+use buzz_db::EventQuery;
 
 use crate::state::AppState;
 
@@ -166,6 +171,68 @@ async fn replayed_command(
         accepted: true,
         message: "duplicate: already processed".into(),
     }))
+}
+
+/// Page size for the fork-point checkpoint scan.
+const FORK_CHECKPOINT_PAGE: i64 = 500;
+
+/// Is `commit` a checkpoint commit the parent thread actually recorded?
+///
+/// Walks the thread's kind:47010 events newest-first with a keyset cursor
+/// (`until` + `before_id`), page by page until a matching `commit` tag is
+/// found or the history is exhausted — the pre-storage validation behind a
+/// kind:47020 fork's named fork point (D27: fork at head or *any*
+/// checkpoint, not just the newest N).
+pub(crate) async fn fork_point_is_recorded_checkpoint(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    channel_id: Uuid,
+    parent_thread_id: &[u8],
+    commit: &str,
+) -> Result<bool, IngestError> {
+    let commit_lower = commit.to_ascii_lowercase();
+    let mut until: Option<DateTime<Utc>> = None;
+    let mut before_id: Option<Vec<u8>> = None;
+    loop {
+        let mut query = EventQuery::for_community(tenant.community());
+        query.channel_id = Some(channel_id);
+        query.kinds = Some(vec![KIND_WORK_THREAD_CHECKPOINT as i32]);
+        query.e_tags = Some(vec![hex::encode(parent_thread_id)]);
+        query.limit = Some(FORK_CHECKPOINT_PAGE);
+        query.until = until;
+        query.before_id = before_id.clone();
+        let events = state
+            .db
+            .query_events(&query)
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: checkpoint query: {e}")))?;
+        let found = events.iter().any(|stored| {
+            stored.event.tags.iter().any(|t| {
+                let s = t.as_slice();
+                s.first().map(|v| v.as_str()) == Some("commit")
+                    && s.get(1)
+                        .is_some_and(|v| v.eq_ignore_ascii_case(&commit_lower))
+            })
+        });
+        if found {
+            return Ok(true);
+        }
+        if (events.len() as i64) < FORK_CHECKPOINT_PAGE {
+            return Ok(false);
+        }
+        // Advance the keyset cursor past the oldest event of this page; the
+        // cursor is strictly monotonic, so the loop terminates.
+        let Some(last) = events.last() else {
+            return Ok(false);
+        };
+        until = DateTime::from_timestamp(last.event.created_at.as_secs() as i64, 0);
+        before_id = Some(last.event.id.as_bytes().to_vec());
+        if until.is_none() {
+            return Err(IngestError::Internal(
+                "error: checkpoint cursor timestamp out of range".into(),
+            ));
+        }
+    }
 }
 
 /// Handle kind:47001 — task-metadata edit (goal / deadline / DRI).
@@ -308,6 +375,13 @@ pub(crate) async fn handle_thread_metadata(
 /// expected source. Both transition legality and author authority are
 /// validated, then the projection update is TOCTOU-safe (`WHERE status =
 /// expected`) so two concurrent commands cannot both win.
+///
+/// Two close-only flags ride the event: `canonicalize` fires the Phase 2e
+/// canon/ merge job, and `archive-siblings` (D28) archives every losing
+/// thread in the winner's fork family in one atomic batch — under the
+/// closer's admin authority, spanning `snoozed` (a parked loser still
+/// loses) — and emits a relay-signed kind:47013 notice per archived
+/// sibling.
 pub(crate) async fn handle_thread_state(
     tenant: &TenantContext,
     state: &Arc<AppState>,
@@ -344,6 +418,16 @@ pub(crate) async fn handle_thread_state(
             "invalid: canonicalize only applies to close".into(),
         ));
     }
+    let archive_siblings = event.tags.iter().find_map(|t| {
+        let s = t.as_slice();
+        (s.first().map(|v| v.as_str()) == Some("archive-siblings"))
+            .then(|| s.get(1).map(|v| v.as_str() == "true").unwrap_or(true))
+    });
+    if archive_siblings.is_some() && target != WorkThreadStatus::Closed {
+        return Err(IngestError::Rejected(
+            "invalid: archive-siblings only applies to close".into(),
+        ));
+    }
 
     let thread = state
         .db
@@ -376,17 +460,43 @@ pub(crate) async fn handle_thread_state(
         PersistResult::Inserted(tx) => tx,
     };
 
-    let transitioned = state
-        .db
-        .transition_work_thread(
-            tenant.community(),
-            &thread_id,
-            thread.status,
-            target,
-            canonicalize,
-        )
-        .await
-        .map_err(|e| IngestError::Internal(format!("error: transition: {e}")))?;
+    // silent-mesh: a close with archive-siblings runs the winner's TOCTOU
+    // close and the D28 family batch in ONE family-locked DB transaction
+    // (`close_thread_archiving_siblings`) — the close and the batch commit
+    // or roll back together, and concurrent family closes serialize so
+    // exactly one winner survives. Every other transition keeps the plain
+    // single-row TOCTOU update.
+    let (transitioned, archived_siblings) =
+        if target == WorkThreadStatus::Closed && archive_siblings == Some(true) {
+            match state
+                .db
+                .close_work_thread_archiving_siblings(
+                    tenant.community(),
+                    channel_id,
+                    &thread_id,
+                    thread.status,
+                    canonicalize,
+                )
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: close with siblings: {e}")))?
+            {
+                Some(archived) => (true, archived),
+                None => (false, Vec::new()),
+            }
+        } else {
+            let ok = state
+                .db
+                .transition_work_thread(
+                    tenant.community(),
+                    &thread_id,
+                    thread.status,
+                    target,
+                    canonicalize,
+                )
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: transition: {e}")))?;
+            (ok, Vec::new())
+        };
     if !transitioned {
         return Err(IngestError::Rejected(
             "invalid: thread state changed concurrently (race)".into(),
@@ -413,6 +523,15 @@ pub(crate) async fn handle_thread_state(
         .await;
     }
 
+    // silent-mesh: the kind:47013 notices make the batch archive visible in
+    // the event stream (the signed events are the truth clients fold).
+    // Best-effort after the commit — the projection batch above is the
+    // authority; a lost notice degrades the fold, not the state.
+    if !archived_siblings.is_empty() {
+        emit_sibling_archived_notices(tenant, state, channel_id, &thread_id, &archived_siblings)
+            .await;
+    }
+
     // silent-mesh: close-with-canonicalize fires the canon/ merge job
     // (Phase 2e, D38/D40) after the close has committed. Best-effort — the
     // job claims via `canonicalized_at` and the leader sweep recovers jobs
@@ -426,17 +545,84 @@ pub(crate) async fn handle_thread_state(
         });
     }
 
+    let mut response = serde_json::json!({
+        "thread_id": hex::encode(&thread_id),
+        "status": target.to_string(),
+    });
+    if archive_siblings == Some(true) {
+        response["archived_siblings"] = serde_json::Value::from(archived_siblings.len());
+    }
     Ok(IngestResult {
         event_id: event.id.to_hex(),
         accepted: true,
-        message: format!(
-            "response:{}",
-            serde_json::json!({
-                "thread_id": hex::encode(&thread_id),
-                "status": target.to_string(),
-            })
-        ),
+        message: format!("response:{response}"),
     })
+}
+
+/// Relay-signed kind:47013 sibling-archive notices — one per losing fork
+/// archived by the winner's close (D28). Best-effort: failures are logged,
+/// never propagated — the projection batch is already committed.
+async fn emit_sibling_archived_notices(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    channel_id: Uuid,
+    winner_thread_id: &[u8],
+    archived: &[Vec<u8>],
+) {
+    let winner_hex = hex::encode(winner_thread_id);
+    let channel_str = channel_id.to_string();
+    for sibling in archived {
+        let sibling_hex = hex::encode(sibling);
+        let tag_rows = [
+            vec!["e".to_owned(), sibling_hex.clone()],
+            vec!["h".to_owned(), channel_str.clone()],
+            vec!["winner".to_owned(), winner_hex.clone()],
+        ];
+        let tags: Result<Vec<Tag>, _> = tag_rows
+            .iter()
+            .map(|t| Tag::parse(t.iter().map(String::as_str)))
+            .collect();
+        let tags = match tags {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(thread = %sibling_hex, "sibling-archive notice: tag build failed: {e}");
+                continue;
+            }
+        };
+        let content = serde_json::json!({ "winner": winner_hex }).to_string();
+        let signed = match EventBuilder::new(
+            Kind::Custom(KIND_WORK_THREAD_SIBLING_ARCHIVED as u16),
+            content,
+        )
+        .tags(tags)
+        .sign_with_keys(&state.relay_keypair)
+        {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(thread = %sibling_hex, "sibling-archive notice: signing failed: {e}");
+                continue;
+            }
+        };
+        match state
+            .db
+            .insert_event(tenant.community(), &signed, Some(channel_id))
+            .await
+        {
+            Ok((stored, true)) => {
+                let _ = dispatch_persistent_event(
+                    tenant,
+                    state,
+                    &stored,
+                    KIND_WORK_THREAD_SIBLING_ARCHIVED,
+                    &state.relay_keypair.public_key().to_hex(),
+                    None,
+                )
+                .await;
+            }
+            Ok((_, false)) => {}
+            Err(e) => warn!(thread = %sibling_hex, "sibling-archive notice: persist failed: {e}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -887,6 +1073,8 @@ mod pg_tests {
                 deadline: Some(past),
                 dri_pubkey: Some(&dri.public_key().to_bytes()),
                 created_by: &opener.public_key().to_bytes(),
+                forked_from: None,
+                fork_commit: None,
             })
             .await
             .expect("create thread"));
@@ -958,5 +1146,289 @@ mod pg_tests {
             notices.len(),
             "second sweep must not add a notice in this community"
         );
+    }
+
+    /// Phase 2f: forks project with provenance, fork points must be
+    /// recorded checkpoints, and the winner's close-with-`archive-siblings`
+    /// archives the losing family members and emits relay-signed kind:47013
+    /// notices.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn fork_family_archives_with_the_winners_close() {
+        use buzz_core::kind::{
+            KIND_WORK_THREAD_CHECKPOINT, KIND_WORK_THREAD_FORK, KIND_WORK_THREAD_SIBLING_ARCHIVED,
+        };
+
+        let state = test_state().await;
+        let ws_owner = nostr::Keys::generate();
+        let ch_admin = nostr::Keys::generate();
+        let member = nostr::Keys::generate();
+
+        let host = format!("fork-{}.example", Uuid::new_v4().simple());
+        let community = match state
+            .db
+            .create_community_with_owner(&host, &ws_owner.public_key().to_hex())
+            .await
+            .expect("create community")
+        {
+            CreateCommunityWithOwnerResult::Created(rec) => rec.id,
+            other => panic!("expected fresh community, got {other:?}"),
+        };
+        let tenant = TenantContext::resolved(community, host);
+        for keys in [&ws_owner, &ch_admin, &member] {
+            state
+                .db
+                .ensure_user(community, keys.public_key().to_bytes().as_ref())
+                .await
+                .expect("ensure user");
+        }
+        let channel = state
+            .db
+            .create_channel(
+                community,
+                "forks",
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                None,
+                &ch_admin.public_key().to_bytes(),
+                None,
+            )
+            .await
+            .expect("create channel");
+        let admin_bytes = ch_admin.public_key().to_bytes();
+        state
+            .db
+            .add_member(
+                community,
+                channel.id,
+                &member.public_key().to_bytes(),
+                MemberRole::Member,
+                Some(&admin_bytes),
+            )
+            .await
+            .expect("add member");
+        let channel_hex = channel.id.to_string();
+
+        // Original thread, opened by the member.
+        let root = signed_event(
+            &member,
+            KIND_WORK_THREAD_OPEN,
+            "original approach",
+            &[tag(&["h", &channel_hex])],
+        );
+        crate::handlers::side_effects::handle_side_effects(
+            &tenant,
+            KIND_WORK_THREAD_OPEN,
+            &root,
+            &state,
+        )
+        .await
+        .expect("47000 side effect");
+        let root_hex = root.id.to_hex();
+
+        // A recorded checkpoint on the original thread.
+        let sha1 = "c".repeat(40);
+        let checkpoint = signed_event(
+            &member,
+            KIND_WORK_THREAD_CHECKPOINT,
+            "turn 1",
+            &[
+                tag(&["e", &root_hex]),
+                tag(&["h", &channel_hex]),
+                tag(&["commit", &sha1]),
+            ],
+        );
+        state
+            .db
+            .insert_event(community, &checkpoint, Some(channel.id))
+            .await
+            .expect("store checkpoint");
+        assert!(fork_point_is_recorded_checkpoint(
+            &state,
+            &tenant,
+            channel.id,
+            root.id.as_bytes(),
+            &sha1
+        )
+        .await
+        .expect("checkpoint lookup"));
+        assert!(!fork_point_is_recorded_checkpoint(
+            &state,
+            &tenant,
+            channel.id,
+            root.id.as_bytes(),
+            &"d".repeat(40)
+        )
+        .await
+        .expect("unknown commit lookup"));
+
+        // Two variations: the eventual winner forks at the checkpoint, the
+        // loser forks at head.
+        let winner = signed_event(
+            &member,
+            KIND_WORK_THREAD_FORK,
+            "try approach B",
+            &[
+                tag(&["e", &root_hex]),
+                tag(&["h", &channel_hex]),
+                tag(&["commit", &sha1]),
+            ],
+        );
+        crate::handlers::side_effects::handle_side_effects(
+            &tenant,
+            KIND_WORK_THREAD_FORK,
+            &winner,
+            &state,
+        )
+        .await
+        .expect("47020 side effect (winner)");
+        let loser = signed_event(
+            &member,
+            KIND_WORK_THREAD_FORK,
+            "try approach C",
+            &[tag(&["e", &root_hex]), tag(&["h", &channel_hex])],
+        );
+        crate::handlers::side_effects::handle_side_effects(
+            &tenant,
+            KIND_WORK_THREAD_FORK,
+            &loser,
+            &state,
+        )
+        .await
+        .expect("47020 side effect (loser)");
+
+        let winner_rec = state
+            .db
+            .get_work_thread(community, winner.id.as_bytes())
+            .await
+            .expect("get winner")
+            .expect("winner projected");
+        assert_eq!(
+            winner_rec.forked_from.as_deref(),
+            Some(root.id.as_bytes().as_slice())
+        );
+        assert_eq!(winner_rec.fork_commit.as_deref(), Some(sha1.as_str()));
+        let loser_rec = state
+            .db
+            .get_work_thread(community, loser.id.as_bytes())
+            .await
+            .expect("get loser")
+            .expect("loser projected");
+        assert!(loser_rec.fork_commit.is_none());
+
+        // Member proposes done on the winner; the Channel Admin closes it
+        // with archive-siblings — the batch archives the original and the
+        // losing fork under the closer's authority.
+        let winner_hex = winner.id.to_hex();
+        let propose = signed_event(
+            &member,
+            KIND_WORK_THREAD_STATE,
+            "",
+            &[
+                tag(&["e", &winner_hex]),
+                tag(&["h", &channel_hex]),
+                tag(&["state", "ready"]),
+            ],
+        );
+        handle_thread_state(&tenant, &state, &propose, &http_auth(&member))
+            .await
+            .expect("member open → ready");
+        let close = signed_event(
+            &ch_admin,
+            KIND_WORK_THREAD_STATE,
+            "",
+            &[
+                tag(&["e", &winner_hex]),
+                tag(&["h", &channel_hex]),
+                tag(&["state", "closed"]),
+                tag(&["archive-siblings", "true"]),
+            ],
+        );
+        let result = handle_thread_state(&tenant, &state, &close, &http_auth(&ch_admin))
+            .await
+            .expect("admin close with archive-siblings");
+        assert!(
+            result.message.contains("\"archived_siblings\":2"),
+            "close response must report the batch size: {}",
+            result.message
+        );
+
+        for (id, expected) in [
+            (winner.id.as_bytes().to_vec(), WorkThreadStatus::Closed),
+            (root.id.as_bytes().to_vec(), WorkThreadStatus::Archived),
+            (loser.id.as_bytes().to_vec(), WorkThreadStatus::Archived),
+        ] {
+            let rec = state
+                .db
+                .get_work_thread(community, &id)
+                .await
+                .expect("get thread")
+                .expect("thread exists");
+            assert_eq!(rec.status, expected);
+        }
+
+        // One relay-signed kind:47013 notice per archived sibling, tagging
+        // the winner.
+        let pool = sqlx::PgPool::connect(&state.config.database_url)
+            .await
+            .expect("pg pool");
+        let notices: Vec<(Vec<u8>, serde_json::Value, String)> = sqlx::query_as(
+            "SELECT pubkey, tags, content FROM events \
+             WHERE community_id = $1 AND kind = $2 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(KIND_WORK_THREAD_SIBLING_ARCHIVED as i32)
+        .fetch_all(&pool)
+        .await
+        .expect("query notices");
+        assert_eq!(notices.len(), 2, "one notice per archived sibling");
+        let tag_of = |tags: &serde_json::Value, name: &str| -> Option<String> {
+            tags.as_array()?.iter().find_map(|t| {
+                let t = t.as_array()?;
+                (t.first()?.as_str()? == name).then(|| t.get(1)?.as_str().map(str::to_owned))?
+            })
+        };
+        let mut noticed: Vec<String> = Vec::new();
+        for (pubkey, tags, content) in &notices {
+            assert_eq!(
+                pubkey,
+                &state.relay_keypair.public_key().to_bytes().to_vec(),
+                "notice must be relay-signed"
+            );
+            assert_eq!(
+                tag_of(tags, "winner").as_deref(),
+                Some(winner_hex.as_str()),
+                "notice must reference the winner"
+            );
+            assert_eq!(
+                tag_of(tags, "h").as_deref(),
+                Some(channel_hex.as_str()),
+                "notice must be channel-scoped"
+            );
+            let body: serde_json::Value = serde_json::from_str(content).expect("notice JSON");
+            assert_eq!(body["winner"].as_str(), Some(winner_hex.as_str()));
+            noticed.push(tag_of(tags, "e").expect("notice e tag"));
+        }
+        noticed.sort();
+        let mut expected = vec![root.id.to_hex(), loser.id.to_hex()];
+        expected.sort();
+        assert_eq!(noticed, expected);
+
+        // Replaying the winner's close is an idempotent duplicate — no
+        // second batch, no extra notices.
+        let replay = handle_thread_state(&tenant, &state, &close, &http_auth(&ch_admin))
+            .await
+            .expect("replayed close");
+        assert!(replay.message.contains("duplicate"));
+        let notices_after: Vec<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT pubkey FROM events \
+             WHERE community_id = $1 AND kind = $2 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(KIND_WORK_THREAD_SIBLING_ARCHIVED as i32)
+        .fetch_all(&pool)
+        .await
+        .expect("recount notices");
+        assert_eq!(notices_after.len(), 2, "replay must not re-emit notices");
     }
 }

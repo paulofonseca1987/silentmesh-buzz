@@ -32,7 +32,7 @@ use buzz_core::kind::{
     KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF,
     KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED,
     KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM, KIND_TEXT_NOTE, KIND_USER_STATUS,
-    KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, KIND_WORK_THREAD_CHECKPOINT,
+    KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, KIND_WORK_THREAD_CHECKPOINT, KIND_WORK_THREAD_FORK,
     KIND_WORK_THREAD_METADATA, KIND_WORK_THREAD_OPEN, KIND_WORK_THREAD_OVERDUE,
     KIND_WORK_THREAD_RECOMMEND, KIND_WORK_THREAD_STATE, RELAY_ADMIN_ADD_MEMBER,
     RELAY_ADMIN_CHANGE_ROLE, RELAY_ADMIN_REMOVE_MEMBER, RELAY_ADMIN_SET_WORKSPACE_PROFILE,
@@ -509,6 +509,7 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
             | KIND_WORK_THREAD_RECOMMEND
             | KIND_WORK_THREAD_CHECKPOINT
             | KIND_WORK_THREAD_OVERDUE
+            | KIND_WORK_THREAD_FORK
     )
 }
 
@@ -1421,12 +1422,107 @@ fn validate_work_thread_open(event: &Event) -> Result<(), String> {
     Ok(())
 }
 
+/// Lowercase-hex check for work-thread reference tags. Uppercase hex is
+/// deliberately rejected: stored tag values are matched byte-for-byte by
+/// `#e`/`commit` lookups (fork-point validation, CLI fork lists), so one
+/// canonical case keeps every read model in agreement. The SDK builders
+/// normalize to lowercase already.
+fn is_lower_hex(v: &str, len: usize) -> bool {
+    v.len() == len
+        && v.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
+/// Validate a kind:47020 thread fork (Silent Mesh Phase 2, D27) — shape only.
+///
+/// The fork event is the **new** thread's root: content = the variation's
+/// goal (non-empty), exactly one **unmarked** `e` tag naming the parent
+/// thread root (`["e", <64-hex>]` — no relay hint, no NIP-10 marker, so a
+/// fork can never double-register as a chat reply through the
+/// thread-metadata path), an optional single `commit` tag naming the fork
+/// point (full 40/64-hex git object id; absent = fork at head), and the
+/// same optional `deadline`/`dri` tags as kind:47000. Hex values must be
+/// lowercase. Parent existence, channel match, and the checkpoint-commit
+/// check are I/O and live in the ingest pipeline.
+fn validate_work_thread_fork(event: &Event) -> Result<(), String> {
+    if event.content.trim().is_empty() {
+        return Err("fork goal (content) must not be empty".into());
+    }
+    let mut root_seen = 0usize;
+    let mut commit_seen = false;
+    let mut deadline_seen = false;
+    let mut dri_seen = false;
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        if parts.len() < 2 {
+            continue;
+        }
+        match parts[0].as_str() {
+            "e" => {
+                root_seen += 1;
+                if parts.len() != 2 {
+                    return Err(
+                        "parent thread reference must be an unmarked [\"e\", <id>] tag".into(),
+                    );
+                }
+                if !is_lower_hex(parts[1].as_str(), 64) {
+                    return Err(
+                        "parent thread reference must be a lowercase 64-hex event id".into(),
+                    );
+                }
+            }
+            "commit" => {
+                if commit_seen {
+                    return Err("duplicate commit tag".into());
+                }
+                commit_seen = true;
+                let v = parts[1].as_str();
+                if !is_lower_hex(v, 40) && !is_lower_hex(v, 64) {
+                    return Err(
+                        "commit must be a full lowercase 40- or 64-hex git object id".into(),
+                    );
+                }
+            }
+            "deadline" => {
+                if deadline_seen {
+                    return Err("duplicate deadline tag".into());
+                }
+                deadline_seen = true;
+                let secs: i64 = parts[1]
+                    .parse()
+                    .map_err(|_| "deadline must be unix seconds".to_string())?;
+                if chrono::DateTime::from_timestamp(secs, 0).is_none() {
+                    return Err("deadline out of range".into());
+                }
+            }
+            "dri" => {
+                if dri_seen {
+                    return Err("duplicate dri tag".into());
+                }
+                dri_seen = true;
+                if !is_lower_hex(parts[1].as_str(), 64) {
+                    return Err("dri must be a lowercase 64-hex pubkey".into());
+                }
+            }
+            _ => {}
+        }
+    }
+    if root_seen != 1 {
+        return Err("fork must reference exactly one parent thread root (e tag)".into());
+    }
+    Ok(())
+}
+
 /// Validate a kind:47010 per-turn checkpoint (Silent Mesh Phase 2).
 ///
-/// Exactly one `e` tag naming the thread root (64-hex event id); a required
-/// `commit` tag with a full git object id (40-hex SHA-1 or 64-hex SHA-256);
-/// optional `branch` (sane ref name) and `turn` (u32 ordinal) tags, each at
-/// most once. Content is an optional free-text note.
+/// Exactly one **unmarked** `e` tag naming the thread root (lowercase
+/// 64-hex event id — one canonical case so the kind:47020 fork-point
+/// lookup and CLI `#e` queries match byte-for-byte, and no NIP-10 marker
+/// so a checkpoint can never double-register as a chat reply); a required
+/// `commit` tag with a full lowercase git object id (40-hex SHA-1 or
+/// 64-hex SHA-256); optional `branch` (sane ref name) and `turn` (u32
+/// ordinal) tags, each at most once. Content is an optional free-text
+/// note.
 fn validate_work_thread_checkpoint(event: &Event) -> Result<(), String> {
     let mut root_seen = 0usize;
     let mut commit_seen = false;
@@ -1440,9 +1536,13 @@ fn validate_work_thread_checkpoint(event: &Event) -> Result<(), String> {
         match parts[0].as_str() {
             "e" => {
                 root_seen += 1;
-                let v = parts[1].as_str();
-                if v.len() != 64 || !v.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Err("thread root reference must be a 64-hex event id".into());
+                if parts.len() != 2 {
+                    return Err(
+                        "thread root reference must be an unmarked [\"e\", <id>] tag".into(),
+                    );
+                }
+                if !is_lower_hex(parts[1].as_str(), 64) {
+                    return Err("thread root reference must be a lowercase 64-hex event id".into());
                 }
             }
             "commit" => {
@@ -1451,10 +1551,10 @@ fn validate_work_thread_checkpoint(event: &Event) -> Result<(), String> {
                 }
                 commit_seen = true;
                 let v = parts[1].as_str();
-                let ok =
-                    (v.len() == 40 || v.len() == 64) && v.chars().all(|c| c.is_ascii_hexdigit());
-                if !ok {
-                    return Err("commit must be a full 40- or 64-hex git object id".into());
+                if !is_lower_hex(v, 40) && !is_lower_hex(v, 64) {
+                    return Err(
+                        "commit must be a full lowercase 40- or 64-hex git object id".into(),
+                    );
                 }
             }
             "branch" => {
@@ -2313,6 +2413,82 @@ async fn ingest_event_inner(
                 }
                 None => {
                     return Err(IngestError::Rejected("invalid: unknown work thread".into()));
+                }
+            }
+        }
+    }
+
+    // silent-mesh: thread forks (47020, D27) are opened by full channel
+    // members, like 47000 roots. The parent thread must exist in this
+    // channel (any lifecycle state — closed and archived history remains
+    // forkable), and a named fork point must be a commit the parent
+    // actually recorded via a kind:47010 checkpoint; no `commit` tag means
+    // a fork at head, which needs no git-side validation.
+    if kind_u32 == KIND_WORK_THREAD_FORK {
+        validate_work_thread_fork(&event)
+            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+        if let Some(ch_id) = channel_id {
+            let role = state
+                .db
+                .get_member_role(tenant.community(), ch_id, &event.pubkey.to_bytes())
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: member role lookup: {e}")))?;
+            if !matches!(
+                role.as_deref(),
+                Some("owner") | Some("admin") | Some("member")
+            ) {
+                return Err(IngestError::Rejected(
+                    "forbidden: only a full channel member may fork a work thread".into(),
+                ));
+            }
+            // The validator guarantees exactly one well-formed e tag.
+            let parent_bytes = event
+                .tags
+                .iter()
+                .find_map(|t| {
+                    let parts = t.as_slice();
+                    (parts.len() >= 2 && parts[0].as_str() == "e")
+                        .then(|| hex::decode(parts[1].as_str()).ok())
+                        .flatten()
+                })
+                .filter(|b| b.len() == 32)
+                .ok_or_else(|| IngestError::Rejected("invalid: bad parent thread id".into()))?;
+            let parent = state
+                .db
+                .get_work_thread(tenant.community(), &parent_bytes)
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: thread lookup: {e}")))?;
+            match parent {
+                Some(t) if t.channel_id == ch_id => {}
+                Some(_) => {
+                    return Err(IngestError::Rejected(
+                        "invalid: parent thread does not belong to this channel".into(),
+                    ));
+                }
+                None => {
+                    return Err(IngestError::Rejected(
+                        "invalid: unknown parent work thread".into(),
+                    ));
+                }
+            }
+            let fork_commit = event.tags.iter().find_map(|t| {
+                let parts = t.as_slice();
+                (parts.len() >= 2 && parts[0].as_str() == "commit").then(|| parts[1].to_string())
+            });
+            if let Some(commit) = fork_commit {
+                let recorded = super::work_thread::fork_point_is_recorded_checkpoint(
+                    state,
+                    tenant,
+                    ch_id,
+                    &parent_bytes,
+                    &commit,
+                )
+                .await?;
+                if !recorded {
+                    return Err(IngestError::Rejected(
+                        "invalid: fork commit is not a recorded checkpoint of the parent thread"
+                            .into(),
+                    ));
                 }
             }
         }
@@ -3449,8 +3625,8 @@ mod tests {
     }
 
     /// silent-mesh: work-thread kinds are channel-scoped MessagesWrite events;
-    /// 47001/47002 route through the command executor, 47000/47003/47010 are
-    /// stored, and 47011 is relay-only (never client-submittable).
+    /// 47001/47002 route through the command executor, 47000/47003/47010/47020
+    /// are stored, and 47011/47013 are relay-only (never client-submittable).
     #[test]
     fn work_thread_kinds_scope_and_channel_requirements() {
         let dummy = make_dummy_event();
@@ -3461,6 +3637,7 @@ mod tests {
             KIND_WORK_THREAD_RECOMMEND,
             KIND_WORK_THREAD_CHECKPOINT,
             KIND_WORK_THREAD_OVERDUE,
+            KIND_WORK_THREAD_FORK,
         ] {
             assert_eq!(
                 required_scope_for_kind(kind, &dummy).unwrap(),
@@ -3479,14 +3656,20 @@ mod tests {
         assert!(!buzz_core::kind::is_command_kind(
             KIND_WORK_THREAD_CHECKPOINT
         ));
-        // The overdue notice is emitted only by the deadline sweep — the
-        // relay-only gate rejects client submissions before storage.
+        assert!(!buzz_core::kind::is_command_kind(KIND_WORK_THREAD_FORK));
+        // The overdue and sibling-archive notices are emitted only by the
+        // relay's own sweep/close flows — the relay-only gate rejects client
+        // submissions before storage.
         assert!(buzz_core::kind::is_relay_only_kind(
             KIND_WORK_THREAD_OVERDUE
+        ));
+        assert!(buzz_core::kind::is_relay_only_kind(
+            buzz_core::kind::KIND_WORK_THREAD_SIBLING_ARCHIVED
         ));
         assert!(!buzz_core::kind::is_relay_only_kind(
             KIND_WORK_THREAD_CHECKPOINT
         ));
+        assert!(!buzz_core::kind::is_relay_only_kind(KIND_WORK_THREAD_FORK));
     }
 
     #[test]
@@ -3547,6 +3730,131 @@ mod tests {
             &[&["e", &root], &["commit", &sha1], &["turn", "-1"]],
         );
         assert!(validate_work_thread_checkpoint(&bad_turn).is_err());
+
+        // Lowercase-only and unmarked — the fork-point lookup and CLI `#e`
+        // queries match these values byte-for-byte.
+        let upper_commit = make_event_with_tags(
+            KIND_WORK_THREAD_CHECKPOINT,
+            "",
+            &[&["e", &root], &["commit", &sha1.to_uppercase()]],
+        );
+        assert!(validate_work_thread_checkpoint(&upper_commit).is_err());
+        let upper_root = make_event_with_tags(
+            KIND_WORK_THREAD_CHECKPOINT,
+            "",
+            &[&["e", &root.to_uppercase()], &["commit", &sha1]],
+        );
+        assert!(validate_work_thread_checkpoint(&upper_root).is_err());
+        let marked_root = make_event_with_tags(
+            KIND_WORK_THREAD_CHECKPOINT,
+            "",
+            &[&["e", &root, "", "reply"], &["commit", &sha1]],
+        );
+        assert!(validate_work_thread_checkpoint(&marked_root).is_err());
+    }
+
+    #[test]
+    fn work_thread_fork_validation() {
+        let parent = "b".repeat(64);
+        let sha1 = "c".repeat(40);
+        let sha256 = "d".repeat(64);
+        let dri = "a".repeat(64);
+
+        // Head fork: parent reference + goal, no commit tag.
+        let head =
+            make_event_with_tags(KIND_WORK_THREAD_FORK, "try approach B", &[&["e", &parent]]);
+        assert!(validate_work_thread_fork(&head).is_ok());
+
+        // Checkpoint fork with the full optional tag set.
+        let full = make_event_with_tags(
+            KIND_WORK_THREAD_FORK,
+            "try approach B",
+            &[
+                &["e", &parent],
+                &["commit", &sha256],
+                &["deadline", "1900000000"],
+                &["dri", &dri],
+            ],
+        );
+        assert!(validate_work_thread_fork(&full).is_ok());
+        let sha1_fork = make_event_with_tags(
+            KIND_WORK_THREAD_FORK,
+            "try approach B",
+            &[&["e", &parent], &["commit", &sha1]],
+        );
+        assert!(validate_work_thread_fork(&sha1_fork).is_ok());
+
+        let empty_goal = make_event_with_tags(KIND_WORK_THREAD_FORK, "  ", &[&["e", &parent]]);
+        assert!(validate_work_thread_fork(&empty_goal).is_err());
+
+        let no_parent = make_event_with_tags(KIND_WORK_THREAD_FORK, "goal", &[]);
+        assert!(validate_work_thread_fork(&no_parent).is_err());
+
+        let two_parents = make_event_with_tags(
+            KIND_WORK_THREAD_FORK,
+            "goal",
+            &[&["e", &parent], &["e", &parent]],
+        );
+        assert!(validate_work_thread_fork(&two_parents).is_err());
+
+        let bad_parent = make_event_with_tags(KIND_WORK_THREAD_FORK, "goal", &[&["e", "short"]]);
+        assert!(validate_work_thread_fork(&bad_parent).is_err());
+
+        let short_commit = make_event_with_tags(
+            KIND_WORK_THREAD_FORK,
+            "goal",
+            &[&["e", &parent], &["commit", "abc123"]],
+        );
+        assert!(validate_work_thread_fork(&short_commit).is_err());
+
+        let two_commits = make_event_with_tags(
+            KIND_WORK_THREAD_FORK,
+            "goal",
+            &[&["e", &parent], &["commit", &sha1], &["commit", &sha256]],
+        );
+        assert!(validate_work_thread_fork(&two_commits).is_err());
+
+        let bad_deadline = make_event_with_tags(
+            KIND_WORK_THREAD_FORK,
+            "goal",
+            &[&["e", &parent], &["deadline", "not-a-number"]],
+        );
+        assert!(validate_work_thread_fork(&bad_deadline).is_err());
+
+        let bad_dri = make_event_with_tags(
+            KIND_WORK_THREAD_FORK,
+            "goal",
+            &[&["e", &parent], &["dri", "nope"]],
+        );
+        assert!(validate_work_thread_fork(&bad_dri).is_err());
+
+        // One canonical case: uppercase hex is rejected everywhere it
+        // would be matched byte-for-byte later.
+        let upper_parent = parent.to_uppercase();
+        let upper = make_event_with_tags(KIND_WORK_THREAD_FORK, "goal", &[&["e", &upper_parent]]);
+        assert!(validate_work_thread_fork(&upper).is_err());
+        let upper_sha = sha1.to_uppercase();
+        let upper_commit = make_event_with_tags(
+            KIND_WORK_THREAD_FORK,
+            "goal",
+            &[&["e", &parent], &["commit", &upper_sha]],
+        );
+        assert!(validate_work_thread_fork(&upper_commit).is_err());
+
+        // The parent reference must be unmarked — a NIP-10 marker (or even
+        // a relay hint) would let a fork double-register as a chat reply.
+        let marked = make_event_with_tags(
+            KIND_WORK_THREAD_FORK,
+            "goal",
+            &[&["e", &parent, "", "reply"]],
+        );
+        assert!(validate_work_thread_fork(&marked).is_err());
+        let hinted = make_event_with_tags(
+            KIND_WORK_THREAD_FORK,
+            "goal",
+            &[&["e", &parent, "wss://relay.example"]],
+        );
+        assert!(validate_work_thread_fork(&hinted).is_err());
     }
 
     #[test]

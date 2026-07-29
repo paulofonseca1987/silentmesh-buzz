@@ -2929,6 +2929,29 @@ impl Db {
         .await
     }
 
+    /// Close the winner and archive its fork family in one family-locked
+    /// transaction (D28 — the close-with-`archive-siblings` flow). `None`
+    /// = the winner lost its status race (conflict, nothing changed);
+    /// otherwise the root ids of the siblings actually archived.
+    pub async fn close_work_thread_archiving_siblings(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        winner_thread_id: &[u8],
+        expected: work_thread::WorkThreadStatus,
+        canonicalize: Option<bool>,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        work_thread::close_thread_archiving_siblings(
+            &self.pool,
+            community_id,
+            channel_id,
+            winner_thread_id,
+            expected,
+            canonicalize,
+        )
+        .await
+    }
+
     /// List live, past-deadline threads not yet notified (the overdue sweep's
     /// work list, across all communities).
     pub async fn list_overdue_work_threads(

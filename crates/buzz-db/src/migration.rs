@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 29);
+        assert_eq!(migrations.len(), 30);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -964,6 +964,17 @@ mod tests {
         assert!(!canon.contains("CREATE TABLE"));
         assert!(!canon.contains("_operator_global_tables"));
 
+        // Phase 2f: fork provenance — two nullable columns plus a partial
+        // index on the existing tenant-scoped projection; no new tables.
+        assert_eq!(migrations[29].version, 30);
+        let forks = migrations[29].sql.as_str();
+        assert!(forks.contains("ALTER TABLE work_threads ADD COLUMN forked_from BYTEA"));
+        assert!(forks.contains("ALTER TABLE work_threads ADD COLUMN fork_commit TEXT"));
+        assert!(forks.contains("CREATE INDEX idx_work_threads_forked_from"));
+        assert!(forks.contains("ON work_threads (community_id, forked_from)"));
+        assert!(!forks.contains("CREATE TABLE"));
+        assert!(!forks.contains("_operator_global_tables"));
+
         let desired_schema = include_str!("../../../schema/schema.sql");
         assert!(
             desired_schema.contains("CREATE TABLE join_policy_acceptances"),
@@ -993,6 +1004,12 @@ mod tests {
             desired_schema.contains("canonicalized_at TIMESTAMPTZ")
                 && desired_schema.contains("canonicalize_outcome TEXT"),
             "desired-state schema must carry the canonicalization bookkeeping columns",
+        );
+        assert!(
+            desired_schema.contains("forked_from")
+                && desired_schema.contains("fork_commit")
+                && desired_schema.contains("idx_work_threads_forked_from"),
+            "desired-state schema must carry the fork provenance columns and index",
         );
     }
 
@@ -1236,7 +1253,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(29));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(30));
     }
 
     #[tokio::test]

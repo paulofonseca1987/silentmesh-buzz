@@ -972,7 +972,7 @@ pub enum ThreadsCmd {
     },
     /// Transition a thread's D41 state (signs a kind:47002 command)
     #[command(
-        after_help = "States: open, snoozed, ready, closed, archived.\nAuthority (D41): members snooze/ready/reopen-from-ready; Channel Admins close\nand archive; only the workspace Owner reopens from archived.\n\nExamples:\n  buzz threads state --channel <UUID> --thread <64-hex> --to ready\n  buzz threads state --channel <UUID> --thread <64-hex> --to closed --canonicalize"
+        after_help = "States: open, snoozed, ready, closed, archived.\nAuthority (D41): members snooze/ready/reopen-from-ready; Channel Admins close\nand archive; only the workspace Owner reopens from archived.\n\nExamples:\n  buzz threads state --channel <UUID> --thread <64-hex> --to ready\n  buzz threads state --channel <UUID> --thread <64-hex> --to closed --canonicalize\n  buzz threads state --channel <UUID> --thread <64-hex> --to closed --archive-siblings"
     )]
     State {
         /// Channel UUID
@@ -987,6 +987,37 @@ pub enum ThreadsCmd {
         /// Canonicalize on close (close only)
         #[arg(long)]
         canonicalize: bool,
+        /// Archive the losing threads in this thread's fork family (close only)
+        #[arg(long)]
+        archive_siblings: bool,
+    },
+    /// Fork a thread into a variation at head or a checkpoint (signs a kind:47020 root)
+    ///
+    /// The new thread inherits the conversation by reference (the parent
+    /// link); nothing is copied. Closing the eventual winner with
+    /// --archive-siblings archives the losing variations.
+    #[command(
+        after_help = "Examples:\n  buzz threads fork --channel <UUID> --thread <64-hex> --goal 'Try approach B'\n  buzz threads fork --channel <UUID> --thread <64-hex> --goal 'From turn 3' --commit <40-or-64-hex>"
+    )]
+    Fork {
+        /// Channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Parent thread root event id (64-char hex)
+        #[arg(long)]
+        thread: String,
+        /// The variation's goal (event content)
+        #[arg(long)]
+        goal: String,
+        /// Optional fork point: a checkpoint commit of the parent (40/64-hex; omit = head)
+        #[arg(long)]
+        commit: Option<String>,
+        /// Optional deadline as unix seconds
+        #[arg(long)]
+        deadline: Option<i64>,
+        /// Optional directly-responsible pubkey (64-char hex)
+        #[arg(long)]
+        dri: Option<String>,
     },
     /// Post an agent recommendation on a thread (signs a kind:47003 event)
     ///
@@ -2103,6 +2134,7 @@ mod tests {
             names(&cmd, "threads"),
             vec![
                 "checkpoint",
+                "fork",
                 "list",
                 "open",
                 "recommend",

@@ -167,7 +167,7 @@ CREATE TABLE channel_repos (
 -- Relay-side projection of the 47xxx work-thread events: the signed events
 -- are the truth; the row makes reads cheap and state transitions TOCTOU-safe
 -- (UPDATE ... WHERE status = expected). thread_id = 32-byte root event id.
--- Keep in sync with migrations/0027, 0028, and 0029.
+-- Keep in sync with migrations/0027, 0028, 0029, and 0030.
 
 CREATE TABLE work_threads (
     community_id UUID NOT NULL REFERENCES communities(id),
@@ -185,6 +185,8 @@ CREATE TABLE work_threads (
     overdue_notified_at TIMESTAMPTZ,
     canonicalized_at TIMESTAMPTZ,
     canonicalize_outcome TEXT,
+    forked_from  BYTEA CHECK (forked_from IS NULL OR length(forked_from) = 32),
+    fork_commit  TEXT CHECK (fork_commit IS NULL OR length(fork_commit) IN (40, 64)),
     PRIMARY KEY (community_id, thread_id),
     FOREIGN KEY (community_id, channel_id)
         REFERENCES channels (community_id, id) ON DELETE CASCADE
@@ -197,6 +199,9 @@ CREATE INDEX idx_work_threads_status
 CREATE INDEX idx_work_threads_overdue
     ON work_threads (deadline)
     WHERE status IN ('open', 'snoozed', 'ready') AND deadline IS NOT NULL;
+CREATE INDEX idx_work_threads_forked_from
+    ON work_threads (community_id, forked_from)
+    WHERE forked_from IS NOT NULL;
 
 -- ── Channel members ───────────────────────────────────────────────────────────
 -- Conformance: "Channels and channel membership". PK leads with community_id.

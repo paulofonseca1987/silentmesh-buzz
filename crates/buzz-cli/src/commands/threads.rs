@@ -1,15 +1,17 @@
-//! Work threads — open, list, show, set, state, recommend (Silent Mesh
-//! Phase 2, kinds 47000–47003).
+//! Work threads — open, list, show, set, state, fork, recommend (Silent
+//! Mesh Phase 2, kinds 47000–47003, 47010, 47013, 47020).
 //!
-//! Writes are signed events on the generic submit path: 47000 roots and
-//! 47003 recommendations store append-only; 47001/47002 are relay-validated
-//! commands (D41 authority + TOCTOU-safe projection updates).
+//! Writes are signed events on the generic submit path: 47000 roots, 47020
+//! fork roots, and 47003 recommendations store append-only; 47001/47002 are
+//! relay-validated commands (D41 authority + TOCTOU-safe projection
+//! updates).
 //!
 //! Reads fold the signed events client-side — the events are the truth.
 //! Every stored 47001/47002 was applied by the relay (rejected commands are
-//! never stored), so folding them in `created_at` order reproduces the
-//! projection; ties or skewed client clocks can differ transiently from the
-//! relay's row, which remains authoritative.
+//! never stored), and relay-signed 47013 notices record the batch sibling
+//! archiving a winner's close performed, so folding them in `created_at`
+//! order reproduces the projection; ties or skewed client clocks can differ
+//! transiently from the relay's row, which remains authoritative.
 
 use crate::client::BuzzClient;
 use crate::error::CliError;
@@ -60,10 +62,15 @@ struct FoldedThread {
     status: String,
     created_by: String,
     created_at: i64,
+    /// Parent thread root when the root is a kind:47020 fork.
+    forked_from: Option<String>,
+    /// Fork-point checkpoint commit (`None` = forked at head, or not a fork).
+    fork_commit: Option<String>,
 }
 
 impl FoldedThread {
     fn from_root(root: &serde_json::Value) -> Self {
+        let is_fork = root.get("kind").and_then(|v| v.as_u64()) == Some(47020);
         FoldedThread {
             thread_id: root
                 .get("id")
@@ -85,6 +92,12 @@ impl FoldedThread {
                 .unwrap_or_default()
                 .to_owned(),
             created_at: root.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0),
+            forked_from: is_fork
+                .then(|| tag_value(root, "e").map(str::to_owned))
+                .flatten(),
+            fork_commit: is_fork
+                .then(|| tag_value(root, "commit").map(str::to_owned))
+                .flatten(),
         }
     }
 
@@ -130,11 +143,14 @@ impl FoldedThread {
             "status": self.status,
             "created_by": self.created_by,
             "created_at": self.created_at,
+            "forked_from": self.forked_from,
+            "fork_commit": self.fork_commit,
         })
     }
 }
 
-/// Fold 47001/47002 command events (already sorted) over the root view.
+/// Fold 47001/47002 commands and relay-signed 47013 sibling-archive
+/// notices (already sorted) over the root view.
 fn fold_commands(thread: &mut FoldedThread, commands: &[serde_json::Value]) {
     for event in commands {
         match event.get("kind").and_then(|v| v.as_u64()) {
@@ -144,13 +160,15 @@ fn fold_commands(thread: &mut FoldedThread, commands: &[serde_json::Value]) {
                     thread.status = state.to_owned();
                 }
             }
+            // A winner's close archived this thread as a losing sibling.
+            Some(47013) => thread.status = "archived".to_owned(),
             _ => {}
         }
     }
 }
 
-/// Fetch all 47001/47002 commands for a set of thread roots, sorted for
-/// folding.
+/// Fetch all 47001/47002 commands (plus 47013 sibling-archive notices) for
+/// a set of thread roots, sorted for folding.
 async fn fetch_commands(
     client: &BuzzClient,
     channel: &str,
@@ -160,7 +178,7 @@ async fn fetch_commands(
         return Ok(Vec::new());
     }
     let filter = serde_json::json!({
-        "kinds": [47001, 47002],
+        "kinds": [47001, 47002, 47013],
         "#h": [channel],
         "#e": roots,
     });
@@ -214,7 +232,7 @@ pub async fn cmd_list_threads(
     }
     let limit = limit.unwrap_or(100).clamp(1, 500);
     let filter = serde_json::json!({
-        "kinds": [47000],
+        "kinds": [47000, 47020],
         "#h": [channel],
         "limit": limit,
     });
@@ -252,7 +270,7 @@ pub async fn cmd_show_thread(
     let thread_id = validate_thread_id(thread)?;
 
     let root_filter = serde_json::json!({
-        "kinds": [47000],
+        "kinds": [47000, 47020],
         "#h": [channel],
         "ids": [thread_id],
     });
@@ -312,10 +330,66 @@ pub async fn cmd_show_thread(
         })
         .collect();
 
+    // Forks of this thread (kind:47020 roots referencing it as parent).
+    let fork_filter = serde_json::json!({
+        "kinds": [47020],
+        "#h": [channel],
+        "#e": [thread_id],
+    });
+    let fork_resp = client.query(&fork_filter).await?;
+    let mut forks: Vec<serde_json::Value> = serde_json::from_str(&fork_resp).unwrap_or_default();
+    forks.sort_by_key(fold_key);
+    let forks: Vec<serde_json::Value> = forks
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "thread_id": f.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                "author": f.get("pubkey").and_then(|v| v.as_str()).unwrap_or_default(),
+                "goal": f.get("content").and_then(|v| v.as_str()).unwrap_or_default(),
+                "fork_commit": tag_value(f, "commit"),
+                "created_at": f.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0),
+            })
+        })
+        .collect();
+
     let mut view = folded.to_json();
     view["recommendations"] = serde_json::Value::Array(recommendations);
     view["checkpoints"] = serde_json::Value::Array(checkpoints);
+    view["forks"] = serde_json::Value::Array(forks);
     println!("{view}");
+    Ok(())
+}
+
+/// Fork a thread into a variation (kind 47020) at head or a checkpoint.
+/// The response echoes the write result with the new `thread_id` (the fork
+/// event id).
+pub async fn cmd_fork_thread(
+    client: &BuzzClient,
+    channel: &str,
+    thread: &str,
+    goal: &str,
+    commit: Option<&str>,
+    deadline: Option<i64>,
+    dri: Option<&str>,
+) -> Result<(), CliError> {
+    crate::validate::validate_uuid(channel)?;
+    let channel_id = uuid::Uuid::parse_str(channel)
+        .map_err(|_| CliError::Usage("channel must be a UUID".into()))?;
+    let parent_id = validate_thread_id(thread)?;
+    let builder = buzz_sdk::build_thread_fork(channel_id, &parent_id, goal, commit, deadline, dri)
+        .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let thread_id = event.id.to_hex();
+    let resp = client.submit_event(event).await?;
+    let normalized = crate::client::normalize_write_response(&resp);
+    match serde_json::from_str::<serde_json::Value>(&normalized) {
+        Ok(mut v) if v.is_object() => {
+            v["thread_id"] = serde_json::Value::String(thread_id);
+            v["forked_from"] = serde_json::Value::String(parent_id);
+            println!("{v}");
+        }
+        _ => println!("{normalized}"),
+    }
     Ok(())
 }
 
@@ -365,14 +439,17 @@ pub async fn cmd_thread_state(
     thread: &str,
     to: &str,
     canonicalize: bool,
+    archive_siblings: bool,
 ) -> Result<(), CliError> {
     crate::validate::validate_uuid(channel)?;
     let channel_id = uuid::Uuid::parse_str(channel)
         .map_err(|_| CliError::Usage("channel must be a UUID".into()))?;
     let thread_id = validate_thread_id(thread)?;
     let canonicalize = canonicalize.then_some(true);
+    let archive_siblings = archive_siblings.then_some(true);
     let builder =
-        buzz_sdk::build_thread_state(channel_id, &thread_id, to, canonicalize).map_err(sdk_err)?;
+        buzz_sdk::build_thread_state(channel_id, &thread_id, to, canonicalize, archive_siblings)
+            .map_err(sdk_err)?;
     let event = client.sign_event(builder)?;
     let resp = client.submit_event(event).await?;
     println!("{}", crate::client::normalize_write_response(&resp));
@@ -468,7 +545,37 @@ pub async fn dispatch(cmd: crate::ThreadsCmd, client: &BuzzClient) -> Result<(),
             thread,
             to,
             canonicalize,
-        } => cmd_thread_state(client, &channel, &thread, &to, canonicalize).await,
+            archive_siblings,
+        } => {
+            cmd_thread_state(
+                client,
+                &channel,
+                &thread,
+                &to,
+                canonicalize,
+                archive_siblings,
+            )
+            .await
+        }
+        ThreadsCmd::Fork {
+            channel,
+            thread,
+            goal,
+            commit,
+            deadline,
+            dri,
+        } => {
+            cmd_fork_thread(
+                client,
+                &channel,
+                &thread,
+                &goal,
+                commit.as_deref(),
+                deadline,
+                dri.as_deref(),
+            )
+            .await
+        }
         ThreadsCmd::Recommend {
             channel,
             thread,
@@ -575,5 +682,66 @@ mod tests {
         assert!(validate_thread_id(&"a".repeat(64)).is_ok());
         assert!(validate_thread_id("short").is_err());
         assert!(validate_thread_id(&"g".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn fork_root_folds_with_provenance() {
+        let parent_id = "11".repeat(32);
+        let fork_id = "22".repeat(32);
+        let channel = "7f7f7f7f-1111-2222-3333-444444444444";
+        let sha1 = "c".repeat(40);
+        let fork_root = event(
+            47020,
+            "try approach B",
+            &[&["e", &parent_id], &["h", channel], &["commit", &sha1]],
+            200,
+            &fork_id,
+        );
+        let folded = FoldedThread::from_root(&fork_root);
+        assert_eq!(folded.thread_id, fork_id);
+        assert_eq!(folded.goal, "try approach B");
+        assert_eq!(folded.status, "open");
+        assert_eq!(folded.forked_from.as_deref(), Some(parent_id.as_str()));
+        assert_eq!(folded.fork_commit.as_deref(), Some(sha1.as_str()));
+
+        // A 47000 root never carries fork provenance, even with an e tag.
+        let plain = event(
+            47000,
+            "original",
+            &[&["h", channel], &["e", &parent_id]],
+            100,
+            &"33".repeat(32),
+        );
+        let folded_plain = FoldedThread::from_root(&plain);
+        assert!(folded_plain.forked_from.is_none() && folded_plain.fork_commit.is_none());
+    }
+
+    #[test]
+    fn sibling_archive_notice_folds_to_archived() {
+        let root_id = "44".repeat(32);
+        let winner_id = "55".repeat(32);
+        let channel = "7f7f7f7f-1111-2222-3333-444444444444";
+        let root = event(47000, "losing variation", &[&["h", channel]], 100, &root_id);
+        let mut folded = FoldedThread::from_root(&root);
+
+        let mut commands = vec![
+            event(
+                47002,
+                "",
+                &[&["e", &root_id], &["h", channel], &["state", "ready"]],
+                101,
+                "cc00",
+            ),
+            event(
+                47013,
+                &format!(r#"{{"winner":"{winner_id}"}}"#),
+                &[&["e", &root_id], &["h", channel], &["winner", &winner_id]],
+                102,
+                "cc01",
+            ),
+        ];
+        commands.sort_by_key(fold_key);
+        fold_commands(&mut folded, &commands);
+        assert_eq!(folded.status, "archived");
     }
 }

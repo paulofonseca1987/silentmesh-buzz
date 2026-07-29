@@ -13,8 +13,8 @@ use buzz_core::{
         KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
         KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_USER_STATUS,
         KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, KIND_WORK_THREAD_CHECKPOINT,
-        KIND_WORK_THREAD_METADATA, KIND_WORK_THREAD_OPEN, KIND_WORK_THREAD_RECOMMEND,
-        KIND_WORK_THREAD_STATE,
+        KIND_WORK_THREAD_FORK, KIND_WORK_THREAD_METADATA, KIND_WORK_THREAD_OPEN,
+        KIND_WORK_THREAD_RECOMMEND, KIND_WORK_THREAD_STATE,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -58,14 +58,14 @@ fn check_hex_len(s: &str, min_len: usize, field: &str) -> Result<(), SdkError> {
 /// chars) or SHA-256 (64 hex chars) — anything shorter is an abbreviated
 /// ref that NIP-34 canonical tags shouldn't carry, since consumers resolve
 /// these against the actual repo.
-fn check_commit_hex(s: &str, field: &str) -> Result<(), SdkError> {
+fn check_commit_hex(s: &str, field: &str) -> Result<String, SdkError> {
     if (s.len() != 40 && s.len() != 64) || !s.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(SdkError::InvalidInput(format!(
             "{field} must be a full 40-character (SHA-1) or 64-character (SHA-256) hex commit id (got {:?})",
             s
         )));
     }
-    Ok(())
+    Ok(s.to_ascii_lowercase())
 }
 
 fn check_pubkey_hex(s: &str, field: &str) -> Result<String, SdkError> {
@@ -1622,14 +1622,18 @@ pub fn build_thread_metadata(
 
 /// Build a work-thread state-transition command (kind 47002).
 ///
-/// `state` must be one of [`THREAD_STATES`]; `canonicalize` is only legal
-/// when the target state is `closed`. The relay validates both the
-/// transition and the author's D41 authority.
+/// `state` must be one of [`THREAD_STATES`]; `canonicalize` and
+/// `archive_siblings` are only legal when the target state is `closed`.
+/// The relay validates both the transition and the author's D41 authority;
+/// `archive_siblings` additionally archives every losing thread in the
+/// winner's fork family (D28) and emits a relay-signed kind:47013 notice
+/// per archived sibling.
 pub fn build_thread_state(
     channel_id: Uuid,
     thread_root: &str,
     state: &str,
     canonicalize: Option<bool>,
+    archive_siblings: Option<bool>,
 ) -> Result<EventBuilder, SdkError> {
     let root = check_hex_exact(thread_root, 64, "thread_root")?;
     if !THREAD_STATES.contains(&state) {
@@ -1643,6 +1647,11 @@ pub fn build_thread_state(
             "canonicalize only applies to close".into(),
         ));
     }
+    if archive_siblings.is_some() && state != "closed" {
+        return Err(SdkError::InvalidInput(
+            "archive-siblings only applies to close".into(),
+        ));
+    }
     let mut tags = vec![
         tag(&["e", &root])?,
         tag(&["h", &channel_id.to_string()])?,
@@ -1651,7 +1660,53 @@ pub fn build_thread_state(
     if let Some(c) = canonicalize {
         tags.push(tag(&["canonicalize", if c { "true" } else { "false" }])?);
     }
+    if let Some(a) = archive_siblings {
+        tags.push(tag(&[
+            "archive-siblings",
+            if a { "true" } else { "false" },
+        ])?);
+    }
     Ok(EventBuilder::new(Kind::Custom(KIND_WORK_THREAD_STATE as u16), "").tags(tags))
+}
+
+/// Build a work-thread fork event (kind 47020, D27) — opens a **new**
+/// thread as a variation of `parent_root`, at head or at a named
+/// checkpoint. The signed event's id is the new thread's id; conversation
+/// is inherited by reference (the parent `e` tag), never copied.
+///
+/// - `goal`: the variation's goal, becomes the event content (non-empty).
+/// - `commit`: optional fork point — a kind:47010 checkpoint commit of the
+///   parent (full 40/64-hex git object id); `None` forks at head.
+/// - `deadline`/`dri`: as on [`build_thread_open`].
+///
+/// The relay requires the author to be a full channel member and validates
+/// that `commit`, when given, is a checkpoint the parent actually recorded.
+pub fn build_thread_fork(
+    channel_id: Uuid,
+    parent_root: &str,
+    goal: &str,
+    commit: Option<&str>,
+    deadline: Option<i64>,
+    dri: Option<&str>,
+) -> Result<EventBuilder, SdkError> {
+    let parent = check_hex_exact(parent_root, 64, "parent_root")?;
+    if goal.trim().is_empty() {
+        return Err(SdkError::InvalidInput("goal must not be empty".into()));
+    }
+    check_content(goal, 16 * 1024)?;
+    let mut tags = vec![tag(&["e", &parent])?, tag(&["h", &channel_id.to_string()])?];
+    if let Some(commit) = commit {
+        let commit = check_commit_hex(commit, "commit")?;
+        tags.push(tag(&["commit", &commit])?);
+    }
+    if let Some(deadline) = deadline {
+        tags.push(tag(&["deadline", &deadline.to_string()])?);
+    }
+    if let Some(dri) = dri {
+        let validated = check_pubkey_hex(dri, "dri")?;
+        tags.push(tag(&["dri", &validated])?);
+    }
+    Ok(EventBuilder::new(Kind::Custom(KIND_WORK_THREAD_FORK as u16), goal).tags(tags))
 }
 
 /// Build a per-turn checkpoint (kind 47010) — records a worktree commit for
@@ -1670,12 +1725,12 @@ pub fn build_thread_checkpoint(
     note: &str,
 ) -> Result<EventBuilder, SdkError> {
     let root = check_hex_exact(thread_root, 64, "thread_root")?;
-    check_commit_hex(commit, "commit")?;
+    let commit = check_commit_hex(commit, "commit")?;
     check_content(note, 16 * 1024)?;
     let mut tags = vec![
         tag(&["e", &root])?,
         tag(&["h", &channel_id.to_string()])?,
-        tag(&["commit", commit])?,
+        tag(&["commit", &commit])?,
     ];
     if let Some(branch) = branch {
         let ok = !branch.is_empty()
@@ -4056,5 +4111,74 @@ mod tests {
             .tags
             .iter()
             .any(|t| t.as_slice().first().map(String::as_str) == Some("replaced-by")));
+    }
+
+    #[test]
+    fn thread_fork_carries_provenance_tags() {
+        let channel = uuid();
+        let parent = "b".repeat(64);
+        let sha1 = "c".repeat(40);
+
+        // Checkpoint fork: parent e tag + commit + optional task framing.
+        let ev = sign(
+            build_thread_fork(
+                channel,
+                &parent,
+                "try approach B",
+                Some(&sha1),
+                Some(1_900_000_000),
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(ev.kind.as_u16() as u32, KIND_WORK_THREAD_FORK);
+        assert_eq!(ev.content, "try approach B");
+        assert!(has_tag(&ev, "e", &parent));
+        assert!(has_tag(&ev, "h", &channel.to_string()));
+        assert!(has_tag(&ev, "commit", &sha1));
+        assert!(has_tag(&ev, "deadline", "1900000000"));
+
+        // Head fork: no commit tag at all.
+        let head =
+            sign(build_thread_fork(channel, &parent, "variation", None, None, None).unwrap());
+        assert!(tag_values(&head, "commit").is_empty());
+
+        // Uppercase input is normalized — the relay only accepts lowercase.
+        let upper = sign(
+            build_thread_fork(
+                channel,
+                &parent,
+                "goal",
+                Some(&sha1.to_uppercase()),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        assert!(has_tag(&upper, "commit", &sha1));
+
+        assert!(build_thread_fork(channel, &parent, "  ", None, None, None).is_err());
+        assert!(build_thread_fork(channel, "short", "goal", None, None, None).is_err());
+        assert!(build_thread_fork(channel, &parent, "goal", Some("abc123"), None, None).is_err());
+    }
+
+    #[test]
+    fn thread_state_close_flags_are_close_only() {
+        let channel = uuid();
+        let root = "a".repeat(64);
+
+        let close =
+            sign(build_thread_state(channel, &root, "closed", Some(true), Some(true)).unwrap());
+        assert!(has_tag(&close, "state", "closed"));
+        assert!(has_tag(&close, "canonicalize", "true"));
+        assert!(has_tag(&close, "archive-siblings", "true"));
+
+        let plain = sign(build_thread_state(channel, &root, "ready", None, None).unwrap());
+        assert!(tag_values(&plain, "canonicalize").is_empty());
+        assert!(tag_values(&plain, "archive-siblings").is_empty());
+
+        assert!(build_thread_state(channel, &root, "ready", Some(true), None).is_err());
+        assert!(build_thread_state(channel, &root, "ready", None, Some(true)).is_err());
+        assert!(build_thread_state(channel, &root, "done", None, None).is_err());
     }
 }
