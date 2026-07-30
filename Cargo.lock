@@ -8258,10 +8258,13 @@ dependencies = [
  "buzz-core",
  "buzz-db",
  "chrono",
+ "reqwest 0.13.4",
+ "serde_json",
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 

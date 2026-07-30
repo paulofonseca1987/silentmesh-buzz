@@ -2,10 +2,15 @@
 //!
 //! Standing in for the real serving paths so the gateway's routing and
 //! metering can be exercised with no hardware or provider: each returns a
-//! canned completion and a whitespace-word token estimate. The real
-//! backends — server-GPU serving, the TEE provider, per-user vendor CLIs —
-//! replace these as `ModelBackend` impls in later slices; the trait
-//! contract does not change.
+//! canned completion and a whitespace-word token estimate. The TEE
+//! provider and the per-user vendor CLIs replace their stubs as
+//! `ModelBackend` impls in later slices; the trait contract does not
+//! change.
+//!
+//! [`local`] is now only a **test double** — the real `local` backend is
+//! [`crate::ollama::OllamaBackend`]. Keep the stub for routing/metering
+//! tests that must run with no model server; never register it in a
+//! deployment, where its canned "completion" would meter as real usage.
 
 use async_trait::async_trait;
 

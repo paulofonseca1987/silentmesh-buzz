@@ -7,11 +7,12 @@
 //! every routed request is attributed `(user, agent, channel, thread,
 //! model, tier, backend, purpose)` in `model_usage`.
 //!
-//! This is the skeleton: the routing gate, the metering write, an optional
-//! per-user token budget, and a [`Backend`] trait fronted by **stub**
-//! implementations ([`stub`]). The real backends — server-GPU serving, a
-//! TEE provider with attestation-then-send, per-user vendor CLIs — land in
-//! later slices as `Backend` impls; nothing about the routing or metering
+//! The gateway is the routing gate, the metering write, an optional
+//! per-user token budget, and a registry of [`ModelBackend`] impls. The
+//! `local` class is real — [`ollama::OllamaBackend`], an Ollama server that
+//! must prove its locality to be built at all. The remaining classes are
+//! still [`stub`]s: a TEE provider with attestation-then-send, and per-user
+//! vendor CLIs land in later slices; nothing about the routing or metering
 //! contract changes when they do.
 //!
 //! Everything privacy-critical is decided by the pure policy, so the
@@ -29,6 +30,7 @@ use buzz_core::CommunityId;
 use buzz_db::model_usage::RecordModelUsageParams;
 use buzz_db::Db;
 
+pub mod ollama;
 pub mod stub;
 
 /// The backend a request routes to: its explicit choice, or the loosest
