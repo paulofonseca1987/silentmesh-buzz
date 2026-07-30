@@ -44,6 +44,18 @@ guarantee, by design). Attribution-from-live-turns is blocked by the 44200
 owner-encryption and deferred to the real-backend slice. See
 phase3-tier-enforcement.md.
 
+**Phase 3 slice 3 — local Ollama backend (2026-07-30).** Owned channels now
+*serve* turns, not just refuse them: `buzz-agent` `Provider::Ollama` (OpenAI
+Chat dialect at loopback, no key), self-declared prefixed catalog identity
+(`ollama:<model>`) so the switch confirm verifies provider+model as one unit,
+vendor-only persona-prefix matcher fallback (Local/TEE prefixes must be
+self-declared — review-found regression of the slice-2 guarantee, closed),
+and execution-explicit reply instructions. Validated live: the owned vault
+answered a Mac member's message with qwen3:14b on the 2×4060s via
+localhost-only Ollama — gate allowed, switch confirmed, model executed
+`buzz messages send` through buzz-dev-mcp, threaded reply landed, zero
+egress. Model notes + deferred desktop wiring in phase3-local-backend.md.
+
 **Tier surface + live E2E (2026-07-30).** `buzz channels create --tier
 <owned|private|open>` (SDK `build_create_channel` tier param) closed the gap
 where no client could declare the D24 tier the relay already parsed. Proven
