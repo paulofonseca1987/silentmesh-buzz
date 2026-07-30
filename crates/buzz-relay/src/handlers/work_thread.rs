@@ -2271,3 +2271,373 @@ mod pg_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// silent-mesh: Privacy Gate pre-flight review (D30) — kind:47022 → 47023.
+// ---------------------------------------------------------------------------
+
+/// Maximum thread messages read as review context.
+const GATE_REVIEW_CONTEXT_MESSAGES: i64 = 200;
+
+/// Handle kind:47022 — a Privacy Gate pre-flight review (D30).
+///
+/// Read-only by construction: nothing moves, nothing closes, no projection
+/// changes. The member asks what a promotion of this thread *would* expose;
+/// the relay answers with a relay-signed kind:47023 in the same personal
+/// channel.
+///
+/// Runs as a **side effect after storage**, so a replayed request cannot
+/// produce a second review (side effects run only on fresh inserts) — the
+/// same dedup the 44201 attribution path relies on.
+///
+/// Two layers, and only the first is authoritative:
+///
+/// 1. The **deterministic scanners** ([`buzz_core::secret_scan`]) over the
+///    member's draft summary and the thread's own messages. These are the
+///    same rules kind:47021 enforces at promotion time, so the review
+///    previews the real gate rather than an approximation of it.
+/// 2. The **model assist**, when configured — advisory only. It may add
+///    findings the rules cannot see; it can never clear one. Its own
+///    output is scanned before publication, because a model that has just
+///    read a private thread is untrusted content, not a trusted verdict.
+///
+/// Everything about the assist is best-effort: a missing model, a refused
+/// route, a backend timeout, or an unparseable answer all still produce a
+/// review — with `assist` naming what happened, so "no findings" is never
+/// confused with "no model ran".
+///
+/// **Detached on purpose.** Side effects are awaited inline before ingest
+/// acks the submit, and every other one is a fast DB write; this one calls
+/// a model, which takes tens of seconds on a 14B. Running it inline would
+/// hold a handler permit and stall the member's ack for the length of an
+/// inference. Spawning from inside the fresh-insert branch keeps the dedup
+/// property that branch provides — a replayed 47022 still produces no
+/// second review — while the ack returns immediately.
+pub(crate) async fn handle_gate_review(
+    tenant: &TenantContext,
+    event: &Event,
+    state: &Arc<AppState>,
+) -> anyhow::Result<()> {
+    let tenant = tenant.clone();
+    let event = event.clone();
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        run_gate_review(&tenant, &event, &state).await;
+    });
+    Ok(())
+}
+
+/// The review itself. Never returns an error: every failure path either
+/// publishes a review saying what happened or logs and drops, because a
+/// pre-flight review that fails must not look like a promotion problem.
+async fn run_gate_review(tenant: &TenantContext, event: &Event, state: &Arc<AppState>) {
+    let author = event.pubkey.to_bytes().to_vec();
+
+    // Tags: exactly one unmarked lowercase 64-hex `e` (source root) and the
+    // `h` channel. A malformed request is dropped silently here — ingest
+    // validation (`validate_gate_review`) already rejected those before
+    // storage, so reaching this point with bad tags is not a member error
+    // worth a notice.
+    let Some((source_root, channel_id)) = gate_review_targets(event) else {
+        return;
+    };
+
+    // Authority: the promotion's own — only the personal channel's owner.
+    // Channel membership was already enforced at ingest; this pins the
+    // stricter rule so a bot in the member's personal channel cannot ask
+    // the model to read the thread on its own initiative.
+    match state
+        .db
+        .get_personal_channel_owner(tenant.community(), channel_id)
+        .await
+    {
+        Ok(Some(owner)) if owner == author => {}
+        Ok(_) => return,
+        Err(e) => {
+            warn!("gate review: personal channel lookup failed: {e}");
+            return;
+        }
+    }
+
+    let thread = match state
+        .db
+        .get_work_thread(tenant.community(), &source_root)
+        .await
+    {
+        Ok(Some(t)) if t.channel_id == channel_id => t,
+        Ok(_) => return,
+        Err(e) => {
+            warn!("gate review: thread lookup failed: {e}");
+            return;
+        }
+    };
+
+    // The thread's conversation: what a summary would be drawn from, and
+    // what the deterministic rules get a second look at.
+    let mut query = EventQuery::for_community(tenant.community());
+    query.channel_id = Some(channel_id);
+    query.e_tags = Some(vec![hex::encode(&source_root)]);
+    query.limit = Some(GATE_REVIEW_CONTEXT_MESSAGES);
+    let messages = match state.db.query_events(&query).await {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("gate review: context query failed: {e}");
+            Vec::new()
+        }
+    };
+
+    // Attribution records the channel's own declared tier. Routing does
+    // not depend on it — `Gate` is owned-pinned at every tier — but a
+    // usage row claiming a tier the channel does not have would be a lie
+    // in the owner's evidence. An unreadable tier falls back to the
+    // strictest, matching enforcement-under-uncertainty everywhere else.
+    let tier = state
+        .db
+        .get_channel(tenant.community(), channel_id)
+        .await
+        .ok()
+        .and_then(|ch| ch.tier.parse::<buzz_core::channel::ChannelTier>().ok())
+        .unwrap_or(buzz_core::channel::ChannelTier::Owned);
+
+    let draft_summary = event.content.trim().to_owned();
+    let deterministic = deterministic_findings(&draft_summary, &messages);
+    let (findings, status, model_used) = run_gate_assist(
+        tenant,
+        state,
+        &draft_summary,
+        &messages,
+        channel_id,
+        tier,
+        &author,
+    )
+    .await;
+
+    emit_gate_review_notice(
+        tenant,
+        state,
+        channel_id,
+        &source_root,
+        &event.id.to_bytes(),
+        GateReviewOutcome {
+            deterministic,
+            findings,
+            status,
+            model: model_used,
+            thread_status: thread.status,
+        },
+    )
+    .await;
+}
+
+/// The `(source_root, channel)` a review targets, or `None` if the tags do
+/// not have the required shape.
+fn gate_review_targets(event: &Event) -> Option<(Vec<u8>, Uuid)> {
+    let mut root: Option<Vec<u8>> = None;
+    let mut e_tags = 0usize;
+    let mut channel: Option<Uuid> = None;
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        if parts.len() < 2 {
+            continue;
+        }
+        match parts[0].as_str() {
+            "e" => {
+                e_tags += 1;
+                root = hex::decode(parts[1].as_str())
+                    .ok()
+                    .filter(|b| b.len() == 32);
+            }
+            "h" => channel = parts[1].parse::<Uuid>().ok(),
+            _ => {}
+        }
+    }
+    (e_tags == 1).then_some(())?;
+    Some((root?, channel?))
+}
+
+/// Deterministic findings over the draft summary and the thread's own
+/// messages, as `(rule, where)` pairs. The matched value is never carried —
+/// `SecretHit` deliberately withholds it, and a review event is published
+/// content like any other.
+fn deterministic_findings(
+    draft_summary: &str,
+    messages: &[buzz_core::StoredEvent],
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = buzz_core::secret_scan::scan_text(draft_summary)
+        .into_iter()
+        .map(|h| (h.rule.to_owned(), "summary".to_owned()))
+        .collect();
+    for m in messages {
+        for hit in buzz_core::secret_scan::scan_text(&m.event.content) {
+            let hit = (hit.rule.to_owned(), "conversation".to_owned());
+            if !out.contains(&hit) {
+                out.push(hit);
+            }
+        }
+    }
+    out
+}
+
+/// Run the model assist, if one is configured. Never fails the review.
+async fn run_gate_assist(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    draft_summary: &str,
+    messages: &[buzz_core::StoredEvent],
+    channel_id: Uuid,
+    tier: buzz_core::channel::ChannelTier,
+    author: &[u8],
+) -> (
+    sm_gateway::assist::ReviewFindings,
+    sm_gateway::assist::AssistStatus,
+    Option<String>,
+) {
+    use sm_gateway::assist::{AssistStatus, ContextMessage, ReviewFindings};
+
+    let (Some(gateway), Some(model)) = (
+        state.gate_assist.as_ref(),
+        state.config.gate_assist_model.as_deref(),
+    ) else {
+        return (ReviewFindings::default(), AssistStatus::Unavailable, None);
+    };
+
+    let context: Vec<ContextMessage> = messages
+        .iter()
+        .map(|m| ContextMessage {
+            // A short key prefix, never the full pubkey: enough for the
+            // model to tell speakers apart, nothing worth echoing.
+            author: m.event.pubkey.to_hex().chars().take(8).collect(),
+            text: m.event.content.clone(),
+        })
+        .collect();
+
+    let request = sm_gateway::InferenceRequest {
+        community_id: tenant.community(),
+        user_pubkey: author.to_vec(),
+        agent_pubkey: None,
+        channel_id: Some(channel_id),
+        thread_id: None,
+        tier,
+        // The owned pin: `Gate` is Local-only at every tier, so this
+        // request cannot leave the machine even if the channel were open
+        // and even if a vendor backend were registered.
+        purpose: buzz_core::model_route::InferencePurpose::Gate,
+        model: model.to_owned(),
+        backend: None,
+        prompt: sm_gateway::assist::build_prompt(draft_summary, &context),
+    };
+
+    match gateway.route_and_record(&request).await {
+        Ok(resp) => match sm_gateway::assist::parse_findings(&resp.text) {
+            Some(findings) => {
+                let (vetted, dropped) = findings.vetted();
+                if !dropped.is_empty() {
+                    warn!(
+                        rules = ?dropped,
+                        "gate assist: dropped model output that tripped the deterministic scanners"
+                    );
+                }
+                (vetted, AssistStatus::Ok, Some(resp.model))
+            }
+            None => (
+                ReviewFindings::default(),
+                AssistStatus::Unusable,
+                Some(resp.model),
+            ),
+        },
+        Err(e) => {
+            warn!("gate assist: {e}");
+            (
+                ReviewFindings::default(),
+                AssistStatus::Failed,
+                Some(model.to_owned()),
+            )
+        }
+    }
+}
+
+/// Everything the review found, ready to publish.
+struct GateReviewOutcome {
+    deterministic: Vec<(String, String)>,
+    findings: sm_gateway::assist::ReviewFindings,
+    status: sm_gateway::assist::AssistStatus,
+    model: Option<String>,
+    thread_status: WorkThreadStatus,
+}
+
+/// Relay-signed kind:47023 review result into the personal channel.
+/// Best-effort, like every other relay notice.
+async fn emit_gate_review_notice(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    channel_id: Uuid,
+    source_root: &[u8],
+    request_id: &[u8],
+    outcome: GateReviewOutcome,
+) {
+    let root_hex = hex::encode(source_root);
+    let tag_rows = [
+        vec!["e".to_owned(), root_hex.clone()],
+        vec!["h".to_owned(), channel_id.to_string()],
+        vec!["req".to_owned(), hex::encode(request_id)],
+    ];
+    let tags: Result<Vec<Tag>, _> = tag_rows
+        .iter()
+        .map(|t| Tag::parse(t.iter().map(String::as_str)))
+        .collect();
+    let tags = match tags {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(thread = %root_hex, "gate review notice: tag build failed: {e}");
+            return;
+        }
+    };
+
+    let deterministic: Vec<serde_json::Value> = outcome
+        .deterministic
+        .iter()
+        .map(|(rule, where_)| serde_json::json!({ "rule": rule, "where": where_ }))
+        .collect();
+    let content = serde_json::json!({
+        "deterministic": deterministic,
+        "advisory": outcome.findings.advisory,
+        "suggestedSummary": outcome.findings.suggested_summary,
+        "assist": outcome.status.as_str(),
+        "model": outcome.model,
+        "threadStatus": outcome.thread_status.to_string(),
+    })
+    .to_string();
+
+    let signed = match EventBuilder::new(
+        Kind::Custom(buzz_core::kind::KIND_WORK_THREAD_GATE_REVIEWED as u16),
+        content,
+    )
+    .tags(tags)
+    .sign_with_keys(&state.relay_keypair)
+    {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(thread = %root_hex, "gate review notice: signing failed: {e}");
+            return;
+        }
+    };
+    match state
+        .db
+        .insert_event(tenant.community(), &signed, Some(channel_id))
+        .await
+    {
+        Ok((stored, true)) => {
+            let _ = dispatch_persistent_event(
+                tenant,
+                state,
+                &stored,
+                buzz_core::kind::KIND_WORK_THREAD_GATE_REVIEWED,
+                &state.relay_keypair.public_key().to_hex(),
+                None,
+            )
+            .await;
+        }
+        Ok((_, false)) => {}
+        Err(e) => warn!(thread = %root_hex, "gate review notice: persist failed: {e}"),
+    }
+}

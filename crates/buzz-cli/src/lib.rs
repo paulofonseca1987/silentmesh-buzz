@@ -1033,6 +1033,29 @@ pub enum ThreadsCmd {
         #[arg(long)]
         commit: Option<String>,
     },
+    /// Preview what promoting a thread would expose (signs a kind:47022 request)
+    ///
+    /// Read-only: nothing moves and nothing closes. The relay runs the
+    /// same deterministic secret scanners a promotion would, adds advisory
+    /// notes from the local model assist when one is configured, and
+    /// answers with a kind:47023 review — including a suggested summary.
+    #[command(
+        after_help = "Examples:\n  buzz threads gate-review --channel <UUID> --thread <64-hex>\n  buzz threads gate-review --channel <UUID> --thread <64-hex> --summary 'Parser fix, tested'"
+    )]
+    GateReview {
+        /// Personal channel UUID holding the thread
+        #[arg(long)]
+        channel: String,
+        /// Thread root event id (64-char hex)
+        #[arg(long)]
+        thread: String,
+        /// Draft summary to review (omit to ask the gate to draft one)
+        #[arg(long)]
+        summary: Option<String>,
+        /// Seconds to wait for the relay's review (0 = don't wait)
+        #[arg(long, default_value_t = 60)]
+        wait: u64,
+    },
     /// Fork a thread into a variation at head or a checkpoint (signs a kind:47020 root)
     ///
     /// The new thread inherits the conversation by reference (the parent
@@ -2177,6 +2200,7 @@ mod tests {
             vec![
                 "checkpoint",
                 "fork",
+                "gate-review",
                 "list",
                 "open",
                 "promote",

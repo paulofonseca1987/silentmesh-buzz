@@ -518,6 +518,7 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
             | KIND_WORK_THREAD_OVERDUE
             | KIND_WORK_THREAD_FORK
             | buzz_core::kind::KIND_WORK_THREAD_PROMOTE
+            | buzz_core::kind::KIND_WORK_THREAD_GATE_REVIEW
     )
 }
 
@@ -1667,6 +1668,48 @@ fn validate_work_thread_checkpoint(event: &Event) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate a kind:47022 Privacy Gate review request (Silent Mesh D30).
+///
+/// Exactly one unmarked lowercase 64-hex `e` tag naming the thread the
+/// member is considering promoting. Content is the **draft** summary and
+/// may be empty (that is the "draft one for me" case), but is bounded like
+/// the promotion summary it is destined to become.
+///
+/// Strict tag allowlist, for the same reason kind:47021 has one: the
+/// request is stored in the personal channel and its tags travel with it.
+fn validate_gate_review(event: &Event) -> Result<(), String> {
+    if event.content.len() > 16 * 1024 {
+        return Err("draft summary exceeds 16 KiB".into());
+    }
+    let mut root_seen = 0usize;
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        if parts.len() < 2 {
+            continue;
+        }
+        match parts[0].as_str() {
+            "e" => {
+                root_seen += 1;
+                if parts.len() != 2 || !is_lower_hex(parts[1].as_str(), 64) {
+                    return Err(
+                        "thread reference must be an unmarked lowercase 64-hex e tag".into(),
+                    );
+                }
+            }
+            "h" => {}
+            other => {
+                return Err(format!(
+                    "unexpected tag '{other}' on a gate review (allowed: e, h)"
+                ));
+            }
+        }
+    }
+    if root_seen != 1 {
+        return Err("gate review must reference exactly one thread root (e tag)".into());
+    }
+    Ok(())
+}
+
 /// Validate a kind:47003 agent recommendation (Silent Mesh Phase 2, D41).
 ///
 /// Exactly one `e` tag naming the thread root (64-hex event id). The event
@@ -2487,12 +2530,22 @@ async fn ingest_event_inner(
     // channel participants (any role, bots included) — never from outside
     // the channel, even when the channel has open visibility — and must
     // reference a thread that actually exists in this channel.
-    if kind_u32 == KIND_WORK_THREAD_RECOMMEND || kind_u32 == KIND_WORK_THREAD_CHECKPOINT {
+    if kind_u32 == KIND_WORK_THREAD_RECOMMEND
+        || kind_u32 == KIND_WORK_THREAD_CHECKPOINT
+        || kind_u32 == buzz_core::kind::KIND_WORK_THREAD_GATE_REVIEW
+    {
         if kind_u32 == KIND_WORK_THREAD_RECOMMEND {
             validate_work_thread_recommend(&event)
                 .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
-        } else {
+        } else if kind_u32 == KIND_WORK_THREAD_CHECKPOINT {
             validate_work_thread_checkpoint(&event)
+                .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+        } else {
+            // silent-mesh: gate review (47022, D30) — same membership and
+            // thread-exists checks as a checkpoint; the tighter
+            // personal-channel-owner rule is applied in the side effect,
+            // where the personal registry is already being read.
+            validate_gate_review(&event)
                 .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
         }
         if let Some(ch_id) = channel_id {
@@ -3797,6 +3850,77 @@ mod tests {
             .tags(nostr_tags)
             .sign_with_keys(&keys)
             .unwrap()
+    }
+
+    /// silent-mesh D30: a gate review (47022) must name exactly one thread
+    /// and carry nothing else — its tags travel with it into the personal
+    /// channel, and an unlisted tag would be an unscanned content channel
+    /// (the same reason kind:47021 has a strict allowlist).
+    #[test]
+    fn gate_review_shape_is_validated() {
+        let root = "a".repeat(64);
+        let channel = uuid::Uuid::new_v4().to_string();
+        let kind = buzz_core::kind::KIND_WORK_THREAD_GATE_REVIEW;
+
+        // A draft summary is optional — empty content asks the gate to
+        // draft one, which is the whole point of the pre-flight.
+        let drafted = make_event_with_tags(kind, "", &[&["e", &root], &["h", &channel]]);
+        assert!(validate_gate_review(&drafted).is_ok());
+        let with_draft =
+            make_event_with_tags(kind, "Parser fix", &[&["e", &root], &["h", &channel]]);
+        assert!(validate_gate_review(&with_draft).is_ok());
+
+        // Exactly one thread, named in full lowercase hex.
+        let none = make_event_with_tags(kind, "", &[&["h", &channel]]);
+        assert!(validate_gate_review(&none).is_err());
+        let two = make_event_with_tags(
+            kind,
+            "",
+            &[&["e", &root], &["e", &"b".repeat(64)], &["h", &channel]],
+        );
+        assert!(validate_gate_review(&two).is_err());
+        let short = make_event_with_tags(kind, "", &[&["e", "abc"], &["h", &channel]]);
+        assert!(validate_gate_review(&short).is_err());
+        let upper = make_event_with_tags(kind, "", &[&["e", &"A".repeat(64)], &["h", &channel]]);
+        assert!(validate_gate_review(&upper).is_err());
+        let marked = make_event_with_tags(
+            kind,
+            "",
+            &[&["e", &root, "wss://r", "root"], &["h", &channel]],
+        );
+        assert!(validate_gate_review(&marked).is_err());
+
+        // Strict allowlist: nothing but e and h.
+        let extra = make_event_with_tags(
+            kind,
+            "",
+            &[&["e", &root], &["h", &channel], &["p", &"c".repeat(64)]],
+        );
+        assert!(validate_gate_review(&extra).is_err());
+
+        // Bounded like the promotion summary it may become.
+        let huge = make_event_with_tags(
+            kind,
+            &"x".repeat(16 * 1024 + 1),
+            &[&["e", &root], &["h", &channel]],
+        );
+        assert!(validate_gate_review(&huge).is_err());
+    }
+
+    /// The review request is client-submitted and channel-scoped, but is
+    /// **not** a command: it moves nothing and takes no transaction, so it
+    /// must never enter the transactional command path. Its answer (47023)
+    /// is relay-only in the other direction.
+    #[test]
+    fn gate_review_is_channel_scoped_but_not_a_command() {
+        let kind = buzz_core::kind::KIND_WORK_THREAD_GATE_REVIEW;
+        assert!(requires_h_channel_scope(kind));
+        assert!(!is_global_only_kind(kind));
+        assert!(!buzz_core::kind::is_command_kind(kind));
+        assert!(!buzz_core::kind::is_relay_only_kind(kind));
+        assert!(buzz_core::kind::is_relay_only_kind(
+            buzz_core::kind::KIND_WORK_THREAD_GATE_REVIEWED
+        ));
     }
 
     /// silent-mesh: command kinds must be routed AFTER the ban/timeout

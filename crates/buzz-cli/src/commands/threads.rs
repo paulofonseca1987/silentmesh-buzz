@@ -57,7 +57,7 @@ fn tag_value<'a>(event: &'a serde_json::Value, name: &str) -> Option<&'a str> {
 /// authoritative in every case.
 fn fold_key(event: &serde_json::Value) -> (i64, u8, String) {
     let kind = event.get("kind").and_then(|v| v.as_u64()).unwrap_or(0);
-    let relay_notice = u8::from(matches!(kind, 47011..=47014));
+    let relay_notice = u8::from(matches!(kind, 47011..=47014 | 47023));
     (
         event
             .get("created_at")
@@ -368,13 +368,14 @@ pub async fn cmd_show_thread(
         .collect();
 
     // Relay-emitted notices about this thread: overdue (47011),
-    // canonicalization outcome (47012), sibling-archive (47013), and
-    // promotion (47014). These are the relay's own signals — an agent
+    // canonicalization outcome (47012), sibling-archive (47013),
+    // promotion (47014), and gate review (47023). These are the relay's
+    // own signals — an agent
     // driving a thread learns its deadline passed or its canonicalization
     // failed from here, so `show` surfaces them alongside the human and
     // agent events rather than leaving them invisible to the CLI.
     let notice_filter = serde_json::json!({
-        "kinds": [47011, 47012, 47013, 47014],
+        "kinds": [47011, 47012, 47013, 47014, 47023],
         "#h": [channel],
         "#e": [thread_id],
     });
@@ -399,6 +400,7 @@ pub async fn cmd_show_thread(
                     47012 => "canonicalized",
                     47013 => "sibling_archived",
                     47014 => "promoted",
+                    47023 => "gate_review",
                     _ => "unknown",
                 },
                 // The DRI the overdue notice tags, when present.
@@ -556,6 +558,107 @@ pub async fn cmd_promote_thread(
     Ok(())
 }
 
+/// Ask the Privacy Gate what promoting a thread would expose (kind 47022).
+///
+/// Publishes the request, then polls for the relay's kind:47023 answer,
+/// which is signed by the relay and scoped to the same personal channel.
+/// The wait is a poll rather than a live subscription because the review
+/// is a one-shot answer, not a stream — and because a member who does not
+/// want to wait (`--wait 0`) still gets the request receipt and can read
+/// the result later with `buzz threads show`.
+pub async fn cmd_gate_review(
+    client: &BuzzClient,
+    channel: &str,
+    thread: &str,
+    summary: Option<&str>,
+    wait_secs: u64,
+) -> Result<(), CliError> {
+    crate::validate::validate_uuid(channel)?;
+    let channel_id = uuid::Uuid::parse_str(channel)
+        .map_err(|_| CliError::Usage("--channel must be a UUID".into()))?;
+    let thread_root = validate_thread_id(thread)?;
+    let builder =
+        buzz_sdk::build_thread_gate_review(channel_id, &thread_root, summary.unwrap_or_default())
+            .map_err(sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let request_id = event.id.to_hex();
+    let resp = client.submit_event(event).await?;
+    let normalized = crate::client::normalize_write_response(&resp);
+
+    if wait_secs == 0 {
+        println!("{normalized}");
+        return Ok(());
+    }
+    // The relay accepted the request; a rejected one never produces a
+    // review, so don't sit in a poll loop waiting for an answer that
+    // cannot come.
+    let accepted = serde_json::from_str::<serde_json::Value>(&normalized)
+        .ok()
+        .and_then(|v| v.get("accepted").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false);
+    if !accepted {
+        println!("{normalized}");
+        return Ok(());
+    }
+
+    let filter = serde_json::json!({
+        "kinds": [buzz_core::kind::KIND_WORK_THREAD_GATE_REVIEWED],
+        "#h": [channel_id.to_string()],
+        "#e": [thread_root],
+        "limit": 20,
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+    loop {
+        if let Ok(raw) = client.query(&filter).await {
+            if let Ok(events) = serde_json::from_str::<Vec<serde_json::Value>>(&raw) {
+                // Match on the `req` tag: a thread can be reviewed more
+                // than once, and an older review must never be mistaken
+                // for this one's answer.
+                let mine = events.iter().find(|e| {
+                    e.get("tags")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|tags| {
+                            tags.iter().any(|t| {
+                                let parts = t.as_array();
+                                parts.is_some_and(|p| {
+                                    p.first().and_then(serde_json::Value::as_str) == Some("req")
+                                        && p.get(1).and_then(serde_json::Value::as_str)
+                                            == Some(request_id.as_str())
+                                })
+                            })
+                        })
+                });
+                if let Some(review) = mine {
+                    let content = review
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("{}");
+                    match serde_json::from_str::<serde_json::Value>(content) {
+                        Ok(parsed) => println!("{parsed}"),
+                        Err(_) => println!("{content}"),
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "event_id": request_id,
+                    "accepted": true,
+                    "message": format!(
+                        "review not ready within {wait_secs}s — read it later with \
+                         'buzz threads show'"
+                    ),
+                })
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+    }
+}
+
 /// Transition a thread's D41 state (kind 47002).
 pub async fn cmd_thread_state(
     client: &BuzzClient,
@@ -688,6 +791,12 @@ pub async fn dispatch(cmd: crate::ThreadsCmd, client: &BuzzClient) -> Result<(),
             summary,
             commit,
         } => cmd_promote_thread(client, &from, &thread, &to, &summary, commit.as_deref()).await,
+        ThreadsCmd::GateReview {
+            channel,
+            thread,
+            summary,
+            wait,
+        } => cmd_gate_review(client, &channel, &thread, summary.as_deref(), wait).await,
         ThreadsCmd::Fork {
             channel,
             thread,

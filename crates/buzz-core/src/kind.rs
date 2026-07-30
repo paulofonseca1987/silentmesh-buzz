@@ -609,6 +609,24 @@ pub const KIND_WORK_THREAD_FORK: u32 = 47020;
 /// checkpoint to promote (absent = the thread's latest). Files and
 /// summary transfer; the conversation stays behind.
 pub const KIND_WORK_THREAD_PROMOTE: u32 = 47021;
+/// Privacy Gate **pre-flight review** request (Silent Mesh D30) — the
+/// member asks, before promoting, what a promotion of this thread would
+/// expose. Read-only: nothing moves, nothing closes; the relay answers
+/// with a relay-only kind:47023. Tags: `h` = the source personal channel,
+/// exactly one unmarked lowercase `e` = source thread root. Content = the
+/// member's **draft** summary, or empty to ask for one to be drafted.
+/// Authority is the promotion's own: only the personal channel's owner.
+pub const KIND_WORK_THREAD_GATE_REVIEW: u32 = 47022;
+/// Relay-signed Privacy Gate review result (Silent Mesh D30) — the answer
+/// to a kind:47022, emitted into the source personal channel. Tags: `e` =
+/// source thread root, `h` = source channel, `req` = the request event id
+/// (hex). Content JSON `{deterministic:[{rule,where}], advisory:[{note}],
+/// suggestedSummary, model, assist}`. The deterministic scanners are
+/// authoritative — the model assist may only **add** advisory findings,
+/// never clear one — and every string the model produced is itself
+/// scanned before it is published here, so the review can never become a
+/// new leak path. Relay-only.
+pub const KIND_WORK_THREAD_GATE_REVIEWED: u32 = 47023;
 
 // System / admin custom range (48000–48999)
 /// An audit log entry was recorded.
@@ -751,6 +769,8 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_WORK_THREAD_PROMOTED,
     KIND_WORK_THREAD_FORK,
     KIND_WORK_THREAD_PROMOTE,
+    KIND_WORK_THREAD_GATE_REVIEW,
+    KIND_WORK_THREAD_GATE_REVIEWED,
     KIND_AGENT_TURN_METRIC,
     KIND_AGENT_TURN_ATTRIBUTION,
     KIND_WORKFLOW_DEF,
@@ -839,11 +859,12 @@ pub const fn is_identity_archive_request_kind(kind: u32) -> bool {
 }
 
 /// Returns `true` if `kind` is a Silent Mesh work-thread kind
-/// (47000–47003, 47010–47014, 47020–47021).
+/// (47000–47003, 47010–47014, 47020–47023).
 ///
 /// The canonical route check — use this instead of scattering `47000..`
-/// matches across ingest/dispatch. Note 47011/47012/47013/47014 (overdue,
-/// canon, sibling-archive, and promotion notices) are also relay-only
+/// matches across ingest/dispatch. Note 47011/47012/47013/47014/47023
+/// (overdue, canon, sibling-archive, promotion, and gate-review notices)
+/// are also relay-only
 /// ([`is_relay_only_kind`]) — part of the family for dispatch and
 /// workflow-exclusion purposes, but never client-submittable.
 pub const fn is_work_thread_kind(kind: u32) -> bool {
@@ -860,6 +881,8 @@ pub const fn is_work_thread_kind(kind: u32) -> bool {
             | KIND_WORK_THREAD_PROMOTED
             | KIND_WORK_THREAD_FORK
             | KIND_WORK_THREAD_PROMOTE
+            | KIND_WORK_THREAD_GATE_REVIEW
+            | KIND_WORK_THREAD_GATE_REVIEWED
     )
 }
 
@@ -897,6 +920,7 @@ pub const fn is_relay_only_kind(kind: u32) -> bool {
             | KIND_WORK_THREAD_CANON
             | KIND_WORK_THREAD_SIBLING_ARCHIVED
             | KIND_WORK_THREAD_PROMOTED
+            | KIND_WORK_THREAD_GATE_REVIEWED
     )
 }
 
@@ -976,6 +1000,24 @@ const _: () = assert!(!is_ephemeral(KIND_WORK_THREAD_PROMOTE));
 const _: () = assert!(!is_relay_only_kind(KIND_WORK_THREAD_PROMOTE));
 const _: () = assert!(is_command_kind(KIND_WORK_THREAD_PROMOTE));
 const _: () = assert!(KIND_WORK_THREAD_PROMOTE <= u16::MAX as u32);
+const _: () = assert!(!is_replaceable(KIND_WORK_THREAD_GATE_REVIEW));
+const _: () = assert!(!is_parameterized_replaceable(KIND_WORK_THREAD_GATE_REVIEW));
+const _: () = assert!(!is_ephemeral(KIND_WORK_THREAD_GATE_REVIEW));
+// A review is client-submitted (unlike its answer) but is NOT a command
+// kind: it moves nothing and takes no transaction — it only reads and
+// reports, so it must never enter the transactional command path.
+const _: () = assert!(!is_relay_only_kind(KIND_WORK_THREAD_GATE_REVIEW));
+const _: () = assert!(!is_command_kind(KIND_WORK_THREAD_GATE_REVIEW));
+const _: () = assert!(is_work_thread_kind(KIND_WORK_THREAD_GATE_REVIEW));
+const _: () = assert!(KIND_WORK_THREAD_GATE_REVIEW <= u16::MAX as u32);
+const _: () = assert!(!is_replaceable(KIND_WORK_THREAD_GATE_REVIEWED));
+const _: () = assert!(!is_parameterized_replaceable(
+    KIND_WORK_THREAD_GATE_REVIEWED
+));
+const _: () = assert!(!is_ephemeral(KIND_WORK_THREAD_GATE_REVIEWED));
+const _: () = assert!(is_relay_only_kind(KIND_WORK_THREAD_GATE_REVIEWED));
+const _: () = assert!(is_work_thread_kind(KIND_WORK_THREAD_GATE_REVIEWED));
+const _: () = assert!(KIND_WORK_THREAD_GATE_REVIEWED <= u16::MAX as u32);
 
 // Compile-time: NIP-34 parameterized replaceable kinds are in the correct range.
 const _: () = assert!(

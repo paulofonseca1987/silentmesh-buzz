@@ -30,6 +30,7 @@ use buzz_core::CommunityId;
 use buzz_db::model_usage::RecordModelUsageParams;
 use buzz_db::Db;
 
+pub mod assist;
 pub mod ollama;
 pub mod stub;
 

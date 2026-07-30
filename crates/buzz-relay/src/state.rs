@@ -526,6 +526,11 @@ pub struct AppState {
     pub workflow_engine: Arc<WorkflowEngine>,
     /// Relay signing keypair — used to sign system messages (kind 40099).
     pub relay_keypair: nostr::Keys,
+    /// silent-mesh: the Privacy Gate assist gateway (D30), present only
+    /// when `gate_assist_model` is configured AND the configured base URL
+    /// proved local. `None` = deterministic-only reviews; the gate itself
+    /// never depends on it.
+    pub gate_assist: Option<Arc<sm_gateway::Gateway>>,
 
     /// Recently-published event IDs for local-echo deduplication, keyed by
     /// `(community_id, event_id)`. Events fanned out in-process are added here;
@@ -689,6 +694,32 @@ impl AppState {
             tracing::warn!("audit log worker exited (expected on shutdown)");
         });
 
+        // silent-mesh: the Privacy Gate assist (D30). Built once, and only
+        // if a model is configured; a base URL that is not loopback or on
+        // the tailnet fails `OllamaBackend::new`, which disables the assist
+        // rather than sending a private thread somewhere it must not go.
+        let gate_assist = config.gate_assist_model.as_deref().and_then(|model| {
+            match sm_gateway::ollama::OllamaBackend::new(&config.gate_assist_base_url) {
+                Ok(backend) => {
+                    tracing::info!(
+                        model,
+                        base_url = %config.gate_assist_base_url,
+                        "silent-mesh: privacy gate assist enabled"
+                    );
+                    Some(Arc::new(
+                        sm_gateway::Gateway::new(db.clone()).with_backend(Box::new(backend)),
+                    ))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        base_url = %config.gate_assist_base_url,
+                        "silent-mesh: privacy gate assist disabled: {e}"
+                    );
+                    None
+                }
+            }
+        });
+
         let git_max_concurrent_ops = config.git_max_concurrent_ops;
         let media_max_concurrent_uploads = config.media_max_concurrent_uploads;
         let git_store = crate::api::git::store::GitStore::new(
@@ -730,6 +761,7 @@ impl AppState {
             media_upload_semaphore: Arc::new(Semaphore::new(media_max_concurrent_uploads)),
             workflow_engine,
             relay_keypair,
+            gate_assist,
 
             local_event_ids: Arc::new(
                 moka::sync::Cache::builder()

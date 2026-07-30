@@ -13,8 +13,9 @@ use buzz_core::{
         KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
         KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_USER_STATUS,
         KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, KIND_WORK_THREAD_CHECKPOINT,
-        KIND_WORK_THREAD_FORK, KIND_WORK_THREAD_METADATA, KIND_WORK_THREAD_OPEN,
-        KIND_WORK_THREAD_PROMOTE, KIND_WORK_THREAD_RECOMMEND, KIND_WORK_THREAD_STATE,
+        KIND_WORK_THREAD_FORK, KIND_WORK_THREAD_GATE_REVIEW, KIND_WORK_THREAD_METADATA,
+        KIND_WORK_THREAD_OPEN, KIND_WORK_THREAD_PROMOTE, KIND_WORK_THREAD_RECOMMEND,
+        KIND_WORK_THREAD_STATE,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -1790,6 +1791,32 @@ pub fn build_thread_promote(
         tags.push(tag(&["commit", &commit])?);
     }
     Ok(EventBuilder::new(Kind::Custom(KIND_WORK_THREAD_PROMOTE as u16), summary).tags(tags))
+}
+
+/// Build a Privacy Gate pre-flight review request (kind 47022, D30) — ask
+/// what promoting this thread *would* expose, before promoting it.
+///
+/// - `channel_id`: the member's personal channel holding the thread.
+/// - `thread_root`: the thread's root event id (`e` tag).
+/// - `draft_summary`: the summary the member is considering (event
+///   content). May be empty — that asks the gate to draft one.
+///
+/// Read-only: nothing moves and nothing closes. The relay answers with a
+/// relay-signed kind:47023 carrying the deterministic findings, any
+/// advisory notes from the local model assist, and a suggested summary.
+pub fn build_thread_gate_review(
+    channel_id: Uuid,
+    thread_root: &str,
+    draft_summary: &str,
+) -> Result<EventBuilder, SdkError> {
+    let root = check_hex_exact(thread_root, 64, "thread_root")?;
+    check_content(draft_summary, 16 * 1024)?;
+    let tags = vec![tag(&["e", &root])?, tag(&["h", &channel_id.to_string()])?];
+    Ok(EventBuilder::new(
+        Kind::Custom(KIND_WORK_THREAD_GATE_REVIEW as u16),
+        draft_summary,
+    )
+    .tags(tags))
 }
 
 /// Build a per-turn checkpoint (kind 47010) — records a worktree commit for

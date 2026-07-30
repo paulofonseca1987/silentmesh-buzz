@@ -45,6 +45,7 @@ pub fn is_side_effect_kind(kind: u32) -> bool {
             | KIND_WORK_THREAD_OPEN
             | KIND_WORK_THREAD_FORK
             | KIND_AGENT_TURN_ATTRIBUTION
+            | buzz_core::kind::KIND_WORK_THREAD_GATE_REVIEW
     )
 }
 
@@ -230,6 +231,11 @@ pub async fn handle_side_effects(
         KIND_WORK_THREAD_FORK => handle_work_thread_fork(tenant, event, state).await,
         // silent-mesh Phase 3: turn attribution → record a model_usage row.
         KIND_AGENT_TURN_ATTRIBUTION => handle_agent_turn_attribution(tenant, event, state).await,
+        // silent-mesh Phase 3 (D30): privacy-gate pre-flight review → scan,
+        // optionally ask the local model, answer with a kind:47023.
+        buzz_core::kind::KIND_WORK_THREAD_GATE_REVIEW => {
+            super::work_thread::handle_gate_review(tenant, event, state).await
+        }
         // kind:7 (reaction) handled inline in ingest_event() before storage.
         _ => Ok(()),
     }

@@ -125,6 +125,19 @@ pub struct Config {
     /// channels. The Silent Mesh deploy profile enables this.
     pub workspace_channel_gate: bool,
 
+    /// silent-mesh: model id for the Privacy Gate assist (D30), e.g.
+    /// `ollama:qwen3:14b`. `None` (default, upstream-preserving) disables
+    /// the assist — a gate review then returns deterministic findings only
+    /// and reports `assist: "unavailable"`, so a member can always tell an
+    /// absent model from a clean review.
+    pub gate_assist_model: Option<String>,
+
+    /// silent-mesh: base URL of the local model server backing the gate
+    /// assist. Defaults to Ollama on loopback; `sm_gateway` refuses any
+    /// value that is not loopback or on the tailnet, so a misconfiguration
+    /// disables the assist at startup rather than leaking a private thread.
+    pub gate_assist_base_url: String,
+
     /// Whether this deployment can serve huddle (voice) audio.
     ///
     /// Huddle audio frames are relayed peer-to-peer *within a single pod*
@@ -507,6 +520,16 @@ impl Config {
         let workspace_channel_gate = std::env::var("BUZZ_WORKSPACE_CHANNEL_GATE")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
+
+        let gate_assist_model = std::env::var("BUZZ_GATE_ASSIST_MODEL")
+            .ok()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty());
+        let gate_assist_base_url = std::env::var("BUZZ_GATE_ASSIST_BASE_URL")
+            .ok()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| sm_gateway::ollama::DEFAULT_BASE_URL.to_owned());
 
         // Defaults true → single-pod (N=1) keeps today's huddle behavior. A
         // horizontally-scaled deployment sets this false; see the field doc.
@@ -917,6 +940,8 @@ impl Config {
             pubkey_allowlist_enabled,
             require_relay_membership,
             workspace_channel_gate,
+            gate_assist_model,
+            gate_assist_base_url,
             huddle_audio_available,
             mesh,
             mesh_demo_echo,
