@@ -29,6 +29,21 @@ New `sm-gateway` crate: `ModelBackend` trait + stub local/tee/vendor impls,
 refused request records nothing). Backends are stubs; the harness/relay
 wiring that calls the gateway is a later slice. See phase3-model-plane.md.
 
+**Phase 3 slice 2 — buzz-acp pre-turn tier enforcement.** The routing policy
+made load-bearing at the turn boundary: a pre-turn gate in `run_prompt_task`
+(before session creation / before any content reaches the agent subprocess)
+refuses a turn whose model backend would egress below the channel's tier, and
+posts a kind:9 notice. New pure `buzz_core::model_route::provider_to_backend`
+(`provider:model-id` → Backend; unknown/absent → Vendor, fail-closed);
+`buzz_acp` reads the `tier` tag the relay already stamps on kind:39000
+(no relay change) and threads it ChannelInfo → PromptChannelInfo → resolver.
+Fail-closed both ways (unresolvable tier → Owned; unclassifiable provider →
+Vendor). Strict rollout — since all providers today are Vendor, owned/private
+channels refuse all agent turns until a Local/TEE backend ships (the tier
+guarantee, by design). Attribution-from-live-turns is blocked by the 44200
+owner-encryption and deferred to the real-backend slice. See
+phase3-tier-enforcement.md.
+
 **Phase 1 — governance (complete).** Workflow approval gate (WF-08) with
 kinds 46010/46011/46012; agent permission requests (relay HTTP create/list +
 hashed-token store); grant/deny via kind 46030/46031 commands (workflow and
@@ -210,12 +225,14 @@ slice; its **harness wiring** is the one remaining Phase-2 follow-up.
    thread pushing to a running relay's forge — the whole value is that
    round trip, unexercisable in the dev sandbox.
 2. **Phase 3 continues** — slice 1 (tier-aware router + attribution +
-   sm-gateway skeleton) shipped; see phase3-model-plane.md. Next: real
+   sm-gateway skeleton, phase3-model-plane.md) and slice 2 (buzz-acp pre-turn
+   tier enforcement, phase3-tier-enforcement.md) shipped. Next: real
    `ModelBackend` impls (server-GPU serving spike, TEE
-   attestation-then-send, per-user vendor CLIs), the harness/relay wiring
-   that *calls* the gateway, the owner usage read surface, then seals /
-   copilot / retrieval — all pinned owned-tier in the router by
-   construction.
+   attestation-then-send, per-user vendor CLIs) — these also populate the
+   Local/TEE arms of `provider_to_backend` and unblock owned/private agent
+   turns; the attribution-from-live-turns half (blocked today by 44200
+   owner-encryption); the owner usage read surface; then seals / copilot /
+   retrieval — all pinned owned-tier in the router by construction.
 
 ## Suggested kickoff prompt for a fresh session
 
