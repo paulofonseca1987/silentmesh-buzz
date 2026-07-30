@@ -64,6 +64,35 @@ answers in text. **qwen3:14b handles the full toolset and composed the
 correct `buzz messages send` invocation** (channel UUID + `--reply-to` +
 content) from the standard prompt.
 
+## 3b. Text-fallback reply (shipped with this slice)
+
+Even with the execution-explicit instructions, local models drop the
+send-step after exploration rounds — the correct answer lands as final text
+and the channel stays silent. The harness now catches it: a channel turn
+ending `EndTurn` with un-sent final text posts that text as the threaded
+reply.
+
+- **Buffer**: session-scoped `agent_message_chunk` accumulator, reset at
+  every boundary where earlier text becomes non-final (turn start, tool
+  round starting, delivered mid-turn steer, `started_new_turn`). Only the
+  post-final-boundary text can post — never preamble or superseded drafts.
+- **Never double-post**: one relay probe (kinds 9/40002/45001/45003 by the
+  agent's own key in the channel since turn start); any hit *or any probe
+  error* skips — fail closed. Inert for capable models.
+- **Only clean endings**: `MaxTokens`/`MaxTurnRequests`/`Refusal` turns and
+  the completed-before-control-signal race never post (truncated/refused
+  scratch is not an answer; a steering user must not get a stale one).
+- **Envelope unwrap**: when the final text is a literal
+  `buzz messages send --content "…"` command (the model composed the right
+  command but emitted it as text — the most common shape observed), the
+  content payload posts instead of the command string.
+- Adversarially reviewed (6 confirmed findings, all fixed pre-commit).
+  Validated live: vault question → clean threaded prose reply in 14 s via
+  the fallback; the tool path stays preferred and suppresses it.
+- Trust note: the probe's author filter is the harness key, which the MCP
+  env injection forces into the CLI the agent uses — the two can only
+  diverge for a custom agent bypassing the harness MCP (out of contract).
+
 ## 4. Deferred / next slices
 
 - **Attribution from live turns**: with inference now local, the gateway-
