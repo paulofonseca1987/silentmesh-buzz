@@ -1094,8 +1094,9 @@ async fn very_long_query_is_bounded_before_pg_parse() {
 ///   - 44100 = `KIND_MEMBER_ADDED_NOTIFICATION`  (p-gated membership notice)
 ///   - 44101 = `KIND_MEMBER_REMOVED_NOTIFICATION` (p-gated membership notice)
 ///   - 44200 = `KIND_AGENT_TURN_METRIC` (NIP-AM: p-gated encrypted turn metrics)
+///   - 44201 = `KIND_AGENT_TURN_ATTRIBUTION` (Silent Mesh: p-gated cleartext metering)
 ///
-/// All seven events are inserted with the same unique token in their content
+/// All eight events are inserted with the same unique token in their content
 /// so a single search query exercises every kind in one round-trip. Only
 /// the kind:9 control must surface — the excluded kinds must not.
 ///
@@ -1201,6 +1202,20 @@ async fn excluded_kinds_are_storage_level_unsearchable() {
     )
     .await;
 
+    // kind:44201 turn attribution — p-gated CLEARTEXT metering (model names,
+    // token counts, user attribution) and MUST NOT be searchable.
+    insert_event(
+        &pool,
+        c,
+        rand_bytes32(),
+        rand_bytes32(),
+        buzz_core::kind::KIND_AGENT_TURN_ATTRIBUTION as i32,
+        &format!("turn attribution — {token}"),
+        None,
+        1_700_000_007,
+    )
+    .await;
+
     let svc = SearchService::new(pool.clone());
     let result = svc
         .search(&SearchQuery {
@@ -1234,6 +1249,7 @@ async fn excluded_kinds_are_storage_level_unsearchable() {
         KIND_MEMBER_ADDED_NOTIFICATION as i32,
         KIND_MEMBER_REMOVED_NOTIFICATION as i32,
         KIND_AGENT_TURN_METRIC as i32,
+        buzz_core::kind::KIND_AGENT_TURN_ATTRIBUTION as i32,
     ] {
         assert!(
             !kinds.contains(&forbidden),

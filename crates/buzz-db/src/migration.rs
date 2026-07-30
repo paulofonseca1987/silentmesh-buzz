@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 32);
+        assert_eq!(migrations.len(), 33);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1000,6 +1000,17 @@ mod tests {
         assert!(usage.contains("CREATE INDEX idx_model_usage_rollup"));
         assert!(!usage.contains("_operator_global_tables"));
 
+        // Phase 3: kind 44201 (cleartext turn attribution) joins the p-gated
+        // FTS exclusion list — additive drop/re-add of search_tsv, mirroring
+        // 0005's pattern. 0001/0005 must NOT carry 44201.
+        assert_eq!(migrations[32].version, 33);
+        let attr_fts = migrations[32].sql.as_str();
+        assert!(attr_fts.contains("search_tsv"));
+        assert!(attr_fts.contains("44201"));
+        assert!(attr_fts.contains("CREATE INDEX idx_events_search_tsv"));
+        assert!(!migrations[0].sql.as_str().contains("44201"));
+        assert!(!migrations[4].sql.as_str().contains("44201"));
+
         let desired_schema = include_str!("../../../schema/schema.sql");
         assert!(
             desired_schema.contains("CREATE TABLE join_policy_acceptances"),
@@ -1287,7 +1298,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(32));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(33));
     }
 
     #[tokio::test]

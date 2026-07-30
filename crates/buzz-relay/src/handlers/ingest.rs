@@ -12,24 +12,24 @@ use uuid::Uuid;
 use buzz_auth::Scope;
 use buzz_core::kind::{
     event_kind_u32, is_identity_archive_request_kind, is_parameterized_replaceable,
-    is_relay_admin_kind, KIND_AGENT_ENGRAM, KIND_AGENT_PROFILE, KIND_AGENT_TURN_METRIC,
-    KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_AUTH, KIND_BOOKMARK_LIST, KIND_BOOKMARK_SET,
-    KIND_CANVAS, KIND_CONTACT_LIST, KIND_DELETION, KIND_DM_ADD_MEMBER, KIND_DM_HIDE, KIND_DM_OPEN,
-    KIND_EMOJI_LIST, KIND_EMOJI_SET, KIND_EVENT_REMINDER, KIND_FOLLOW_SET, KIND_FORUM_COMMENT,
-    KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_GIFT_WRAP, KIND_GIT_ISSUE, KIND_GIT_PATCH,
-    KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT, KIND_GIT_REPO_STATE,
-    KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN,
-    KIND_HUDDLE_ENDED, KIND_HUDDLE_GUIDELINES, KIND_HUDDLE_PARTICIPANT_JOINED,
-    KIND_HUDDLE_PARTICIPANT_LEFT, KIND_HUDDLE_STARTED, KIND_IA_ARCHIVE_REQUEST,
-    KIND_IA_UNARCHIVE_REQUEST, KIND_LONG_FORM, KIND_MANAGED_AGENT, KIND_MEMBER_ADDED_NOTIFICATION,
-    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT,
-    KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST,
-    KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT, KIND_NIP29_DELETE_GROUP,
-    KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST, KIND_NIP29_LEAVE_REQUEST,
-    KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER, KIND_NIP43_LEAVE_REQUEST,
-    KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST, KIND_PRESENCE_UPDATE,
-    KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_REACTION, KIND_READ_STATE, KIND_REPORT,
-    KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF,
+    is_relay_admin_kind, KIND_AGENT_ENGRAM, KIND_AGENT_PROFILE, KIND_AGENT_TURN_ATTRIBUTION,
+    KIND_AGENT_TURN_METRIC, KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_AUTH, KIND_BOOKMARK_LIST,
+    KIND_BOOKMARK_SET, KIND_CANVAS, KIND_CONTACT_LIST, KIND_DELETION, KIND_DM_ADD_MEMBER,
+    KIND_DM_HIDE, KIND_DM_OPEN, KIND_EMOJI_LIST, KIND_EMOJI_SET, KIND_EVENT_REMINDER,
+    KIND_FOLLOW_SET, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_GIFT_WRAP,
+    KIND_GIT_ISSUE, KIND_GIT_PATCH, KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST,
+    KIND_GIT_REPO_ANNOUNCEMENT, KIND_GIT_REPO_STATE, KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT,
+    KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN, KIND_HUDDLE_ENDED, KIND_HUDDLE_GUIDELINES,
+    KIND_HUDDLE_PARTICIPANT_JOINED, KIND_HUDDLE_PARTICIPANT_LEFT, KIND_HUDDLE_STARTED,
+    KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST, KIND_LONG_FORM, KIND_MANAGED_AGENT,
+    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_MODERATION_BAN,
+    KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN,
+    KIND_MODERATION_UNTIMEOUT, KIND_MUTE_LIST, KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT,
+    KIND_NIP29_DELETE_GROUP, KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST,
+    KIND_NIP29_LEAVE_REQUEST, KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER,
+    KIND_NIP43_LEAVE_REQUEST, KIND_NIP65_RELAY_LIST_METADATA, KIND_PERSONA, KIND_PIN_LIST,
+    KIND_PRESENCE_UPDATE, KIND_PRODUCT_FEEDBACK, KIND_PROFILE, KIND_REACTION, KIND_READ_STATE,
+    KIND_REPORT, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF,
     KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED,
     KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM, KIND_TEXT_NOTE, KIND_USER_STATUS,
     KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, KIND_WORK_THREAD_CHECKPOINT, KIND_WORK_THREAD_FORK,
@@ -222,6 +222,9 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         }
         // NIP-AM: agent turn metrics are agent-authored global events (encrypted to owner).
         KIND_AGENT_TURN_METRIC => Ok(Scope::MessagesWrite),
+        // Silent Mesh: cleartext turn attributions are agent-authored global
+        // metering events (owner-read-gated like the 44200 they mirror).
+        KIND_AGENT_TURN_ATTRIBUTION => Ok(Scope::MessagesWrite),
         // NIP-56 reports are ordinary member writes into the mod-only queue.
         // Ingest persists them to `moderation_reports` and suppresses public
         // storage/fanout; reports are signals, never enforcement triggers.
@@ -466,6 +469,9 @@ pub(crate) fn is_global_only_kind(kind: u32) -> bool {
             // NIP-AM: agent turn metrics are owner-scoped global events.
             // Channel identity is encrypted inside the payload — no `h` tag.
             | KIND_AGENT_TURN_METRIC
+            // Silent Mesh: turn attributions carry the channel in their
+            // cleartext payload (not queryable) — no `h` tag either.
+            | KIND_AGENT_TURN_ATTRIBUTION
             // NIP-PL leases are author-owned, addressable global state.
             | super::push_lease::KIND_PUSH_LEASE
     )
@@ -1268,6 +1274,74 @@ fn validate_agent_turn_metric_envelope(event: &nostr::Event) -> Result<(), Strin
     validate_engram_nip44_content(&event.content)
         .map_err(|e| e.replace("agent-engram", "agent-turn-metric"))?;
 
+    Ok(())
+}
+
+/// Validate the public envelope of a Silent Mesh `kind:44201` turn-attribution
+/// event: same tag contract as the 44200 (exactly one `p` owner tag, exactly
+/// one `agent` tag equal to the event pubkey, no `h` tag), but the content is
+/// CLEARTEXT JSON — parsed and shape-validated here so the side-effect
+/// handler (and the `model_usage` CHECK constraints) never see a malformed
+/// payload.
+fn validate_agent_turn_attribution_envelope(event: &nostr::Event) -> Result<(), String> {
+    let event_pubkey_hex = event.pubkey.to_hex();
+    let mut p_tags: Vec<&str> = Vec::new();
+    let mut agent_tags: Vec<&str> = Vec::new();
+    let mut has_h_tag = false;
+
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        if parts.len() < 2 {
+            continue;
+        }
+        match parts[0].as_str() {
+            "p" => p_tags.push(&parts[1]),
+            "agent" => agent_tags.push(&parts[1]),
+            "h" => has_h_tag = true,
+            _ => {}
+        }
+    }
+
+    if has_h_tag {
+        return Err(
+            "turn-attribution event must not have an `h` tag (the channel lives in the payload)"
+                .to_string(),
+        );
+    }
+    if p_tags.len() != 1 {
+        return Err(format!(
+            "turn-attribution event must have exactly one `p` tag (got {})",
+            p_tags.len()
+        ));
+    }
+    let p = p_tags[0];
+    if p.len() != 64
+        || !p
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err("turn-attribution `p` tag must be 64 lowercase hex chars".to_string());
+    }
+    if agent_tags.len() != 1 {
+        return Err(format!(
+            "turn-attribution event must have exactly one `agent` tag (got {})",
+            agent_tags.len()
+        ));
+    }
+    if agent_tags[0] != event_pubkey_hex {
+        return Err("turn-attribution `agent` tag must equal event pubkey".to_string());
+    }
+
+    let payload: buzz_core::agent_turn_attribution::AgentTurnAttributionPayload =
+        serde_json::from_str(&event.content)
+            .map_err(|e| format!("turn-attribution content must be valid JSON: {e}"))?;
+    payload
+        .validate()
+        .map_err(|e| format!("turn-attribution payload invalid: {e}"))?;
+    // Token counts must fit the store's signed BIGINT columns.
+    if payload.prompt_tokens > i64::MAX as u64 || payload.completion_tokens > i64::MAX as u64 {
+        return Err("turn-attribution token counts out of range".to_string());
+    }
     Ok(())
 }
 
@@ -2333,6 +2407,43 @@ async fn ingest_event_inner(
         if !is_owner {
             return Err(IngestError::AuthFailed(
                 "restricted: agent-turn-metric `p` tag must be the registered owner of this agent"
+                    .into(),
+            ));
+        }
+    }
+
+    if kind_u32 == KIND_AGENT_TURN_ATTRIBUTION {
+        validate_agent_turn_attribution_envelope(&event)
+            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+
+        // Same ownership contract as the 44200 sibling: the `p` tag must be
+        // the registered owner of the publishing agent.
+        let owner_hex = event
+            .tags
+            .iter()
+            .find_map(|t| {
+                let parts = t.as_slice();
+                if parts.len() >= 2 && parts[0].as_str() == "p" {
+                    Some(parts[1].as_str())
+                } else {
+                    None
+                }
+            })
+            .expect("p tag present (validated above)");
+        let agent_bytes = event.pubkey.to_bytes().to_vec();
+        let owner_bytes = hex::decode(owner_hex).expect("hex validated above");
+        let is_owner = state
+            .db
+            .is_agent_owner(tenant.community(), &agent_bytes, &owner_bytes)
+            .await
+            .map_err(|e| {
+                IngestError::Internal(format!(
+                    "error: db error checking turn-attribution ownership: {e}"
+                ))
+            })?;
+        if !is_owner {
+            return Err(IngestError::AuthFailed(
+                "restricted: turn-attribution `p` tag must be the registered owner of this agent"
                     .into(),
             ));
         }
@@ -4596,6 +4707,118 @@ mod tests {
         .tags(nostr_tags)
         .sign_with_keys(agent_keys)
         .unwrap()
+    }
+
+    #[test]
+    fn agent_turn_attribution_is_global_only_and_in_scope_allowlist() {
+        let dummy = make_dummy_event();
+        assert!(
+            is_global_only_kind(KIND_AGENT_TURN_ATTRIBUTION),
+            "kind:44201 must be global-only (no h tag)"
+        );
+        assert!(
+            !requires_h_channel_scope(KIND_AGENT_TURN_ATTRIBUTION),
+            "kind:44201 must not require an h-tag"
+        );
+        assert_eq!(
+            required_scope_for_kind(KIND_AGENT_TURN_ATTRIBUTION, &dummy).unwrap(),
+            Scope::MessagesWrite,
+            "kind:44201 requires MessagesWrite scope"
+        );
+    }
+
+    fn make_attribution_content() -> String {
+        serde_json::json!({
+            "model": "ollama:qwen3:14b",
+            "promptTokens": 2050,
+            "completionTokens": 145,
+            "purpose": "agent_turn",
+            "channelId": uuid::Uuid::new_v4(),
+            "userPubkey": "2b".repeat(32),
+            "threadRootId": "aa".repeat(32),
+        })
+        .to_string()
+    }
+
+    fn make_agent_turn_attribution(
+        agent_keys: &nostr::Keys,
+        tags: &[&[&str]],
+        content: &str,
+    ) -> nostr::Event {
+        let nostr_tags: Vec<nostr::Tag> = tags
+            .iter()
+            .map(|t| nostr::Tag::parse(t.iter().copied()).unwrap())
+            .collect();
+        nostr::EventBuilder::new(
+            nostr::Kind::Custom(buzz_core::kind::KIND_AGENT_TURN_ATTRIBUTION as u16),
+            content,
+        )
+        .tags(nostr_tags)
+        .sign_with_keys(agent_keys)
+        .unwrap()
+    }
+
+    #[test]
+    fn agent_turn_attribution_envelope_accepts_canonical_and_rejects_bad_shapes() {
+        let agent = nostr::Keys::generate();
+        let owner_hex = "b".repeat(64);
+        let agent_hex = agent.public_key().to_hex();
+        let canonical_tags: &[&[&str]] = &[&["p", &owner_hex], &["agent", &agent_hex]];
+
+        // Canonical accepts.
+        let ev = make_agent_turn_attribution(&agent, canonical_tags, &make_attribution_content());
+        validate_agent_turn_attribution_envelope(&ev).expect("canonical accepted");
+
+        // An `h` tag is rejected (channel lives in the payload).
+        let ev = make_agent_turn_attribution(
+            &agent,
+            &[
+                &["p", &owner_hex],
+                &["agent", &agent_hex],
+                &["h", "95f75926-4420-4c7d-9683-0c91281789d2"],
+            ],
+            &make_attribution_content(),
+        );
+        assert!(validate_agent_turn_attribution_envelope(&ev)
+            .unwrap_err()
+            .contains("`h` tag"));
+
+        // Missing p tag rejected.
+        let ev = make_agent_turn_attribution(
+            &agent,
+            &[&["agent", &agent_hex]],
+            &make_attribution_content(),
+        );
+        assert!(validate_agent_turn_attribution_envelope(&ev).is_err());
+
+        // Agent tag not matching the event pubkey rejected.
+        let other_hex = "c".repeat(64);
+        let ev = make_agent_turn_attribution(
+            &agent,
+            &[&["p", &owner_hex], &["agent", &other_hex]],
+            &make_attribution_content(),
+        );
+        assert!(validate_agent_turn_attribution_envelope(&ev)
+            .unwrap_err()
+            .contains("must equal event pubkey"));
+
+        // Non-JSON content rejected.
+        let ev = make_agent_turn_attribution(&agent, canonical_tags, "not json");
+        assert!(validate_agent_turn_attribution_envelope(&ev)
+            .unwrap_err()
+            .contains("valid JSON"));
+
+        // Unknown purpose rejected (would violate the model_usage CHECK).
+        let bad = make_attribution_content().replace("agent_turn", "mining");
+        let ev = make_agent_turn_attribution(&agent, canonical_tags, &bad);
+        assert!(validate_agent_turn_attribution_envelope(&ev)
+            .unwrap_err()
+            .contains("purpose"));
+
+        // Malformed user pubkey rejected.
+        let bad = make_attribution_content().replace(&"2b".repeat(32), "nothex");
+        let ev = make_agent_turn_attribution(&agent, canonical_tags, &bad);
+        assert!(validate_agent_turn_attribution_envelope(&ev).is_err());
     }
 
     #[test]

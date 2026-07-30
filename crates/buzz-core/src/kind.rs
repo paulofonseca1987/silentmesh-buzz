@@ -126,7 +126,11 @@ pub const AUTHOR_ONLY_KINDS: &[u32] = &[KIND_EVENT_REMINDER, KIND_PUSH_LEASE];
 ///
 /// Used by `filter_can_match_result_gated_kinds` to force the per-event
 /// fallback path in COUNT rather than the fast SQL `count_events()`.
-pub const RESULT_GATED_KINDS: &[u32] = &[KIND_DM_VISIBILITY, KIND_AGENT_TURN_METRIC];
+pub const RESULT_GATED_KINDS: &[u32] = &[
+    KIND_DM_VISIBILITY,
+    KIND_AGENT_TURN_METRIC,
+    KIND_AGENT_TURN_ATTRIBUTION,
+];
 
 /// Kinds whose stored events have `#p`-bound read access — readable only by
 /// subscribers whose pubkey appears in the event's `#p` tag.
@@ -153,6 +157,9 @@ pub const P_GATED_KINDS: &[u32] = &[
     // readable by any unauthenticated or non-owner party, including via `ids`
     // filters — see NIP-AM §Relay Behavior.
     KIND_AGENT_TURN_METRIC,
+    // Silent Mesh: turn attributions are cleartext metering records — same
+    // owner-only read contract as the 44200 they mirror.
+    KIND_AGENT_TURN_ATTRIBUTION,
 ];
 
 /// NIP-AP: Agent Persona (parameterized replaceable, owner-authored).
@@ -484,6 +491,19 @@ pub const KIND_MEMBER_REMOVED_NOTIFICATION: u32 = 44101;
 /// See `docs/nips/NIP-AM.md`.
 pub const KIND_AGENT_TURN_METRIC: u32 = 44200;
 
+/// Agent Turn Attribution (Silent Mesh Phase 3, model plane).
+///
+/// Cleartext sibling of [`KIND_AGENT_TURN_METRIC`]: one event per completed
+/// turn with reliable token counts, carrying the metering attribution the
+/// relay records into `model_usage` (model, tokens, purpose, channel, the
+/// triggering user, thread root). Published by the harness, signed by the
+/// agent. Tags mirror 44200: exactly one `p` (owner) and one `agent`
+/// (== event pubkey); no `h` tag; stored globally (channel_id = NULL);
+/// owner-scoped reads only (p-gated). The relay NEVER trusts the client's
+/// tier/backend classification — tier is resolved from its own channels
+/// table and backend derived from the model's provider prefix on ingest.
+pub const KIND_AGENT_TURN_ATTRIBUTION: u32 = 44201;
+
 // Forum / social (45000–45999)
 // V1 used addressable range (30001–30003) — wrong.
 /// A forum post (thread root).
@@ -732,6 +752,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_WORK_THREAD_FORK,
     KIND_WORK_THREAD_PROMOTE,
     KIND_AGENT_TURN_METRIC,
+    KIND_AGENT_TURN_ATTRIBUTION,
     KIND_WORKFLOW_DEF,
     KIND_LONG_FORM,
     KIND_USER_STATUS,
@@ -976,6 +997,11 @@ const _: () = assert!(!is_ephemeral(KIND_AGENT_TURN_METRIC));
 const _: () = assert!(!is_replaceable(KIND_AGENT_TURN_METRIC));
 const _: () = assert!(!is_parameterized_replaceable(KIND_AGENT_TURN_METRIC));
 const _: () = assert!(KIND_AGENT_TURN_METRIC <= u16::MAX as u32);
+// Same contract for its cleartext attribution sibling.
+const _: () = assert!(!is_ephemeral(KIND_AGENT_TURN_ATTRIBUTION));
+const _: () = assert!(!is_replaceable(KIND_AGENT_TURN_ATTRIBUTION));
+const _: () = assert!(!is_parameterized_replaceable(KIND_AGENT_TURN_ATTRIBUTION));
+const _: () = assert!(KIND_AGENT_TURN_ATTRIBUTION <= u16::MAX as u32);
 // Moderation kinds fit u16 and are neither replaceable nor ephemeral:
 // 1984 is a regular event (persisted to the queue, never fanned out);
 // 9040–9044 are direct commands (executed, never stored).

@@ -6,6 +6,7 @@
 //! verification. All other Buzz crates depend on this one.
 
 /// NIP-AM: Agent Turn Metric — payload type and encrypt/decrypt helpers.
+pub mod agent_turn_attribution;
 pub mod agent_turn_metric;
 /// Channel and membership enums shared across crates.
 pub mod channel;

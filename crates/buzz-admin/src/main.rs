@@ -81,6 +81,16 @@ enum Command {
         #[command(subcommand)]
         command: ProductFeedbackCommand,
     },
+    /// Show per-user model-usage totals by tier and backend.
+    ///
+    /// The Phase 3 metering read: aggregates the `model_usage` rows recorded
+    /// from kind:44201 turn-attribution events. Requires only DATABASE_URL +
+    /// RELAY_URL (community resolution by host).
+    Usage {
+        /// Only include usage from the last N hours. Omit for all time.
+        #[arg(long)]
+        since_hours: Option<i64>,
+    },
     /// Emit kind:39000/39002 events for channels missing them.
     ///
     /// Channels created via direct SQL (seed scripts, pre-migration data) won't
@@ -145,6 +155,7 @@ async fn run(cli: Cli) -> Result<i32> {
         Command::AddMember { pubkey, role } => cmd_add_member(pubkey, role).await,
         Command::RemoveMember { pubkey, role } => cmd_remove_member(pubkey, role).await,
         Command::ListMembers => cmd_list_members().await,
+        Command::Usage { since_hours } => cmd_usage(since_hours).await,
         Command::ProductFeedback {
             command: ProductFeedbackCommand::List { limit },
         } => cmd_list_product_feedback(limit).await,
@@ -254,6 +265,36 @@ async fn cmd_list_product_feedback(limit: u16) -> Result<i32> {
     let db = connect_db().await?;
     let feedback = db.list_product_feedback(i64::from(limit)).await?;
     println!("{}", serde_json::to_string_pretty(&feedback)?);
+    Ok(0)
+}
+
+/// Print per-user model-usage totals by tier and backend (Phase 3 exit
+/// criterion: "usage query shows per-user totals by tier and backend").
+async fn cmd_usage(since_hours: Option<i64>) -> Result<i32> {
+    let db = connect_db().await?;
+    let tenant = resolve_admin_tenant(&db).await?;
+    let since = since_hours.map(|h| chrono::Utc::now() - chrono::Duration::hours(h));
+    let totals = db.user_usage_totals(tenant.community(), since).await?;
+    if totals.is_empty() {
+        println!("(no model usage recorded)");
+        return Ok(0);
+    }
+    println!(
+        "{:<66} {:<8} {:<7} {:>9} {:>14} {:>18}",
+        "user_pubkey", "tier", "backend", "requests", "prompt_tokens", "completion_tokens"
+    );
+    println!("{}", "-".repeat(126));
+    for t in &totals {
+        println!(
+            "{:<66} {:<8} {:<7} {:>9} {:>14} {:>18}",
+            hex::encode(&t.user_pubkey),
+            t.tier,
+            t.backend,
+            t.requests,
+            t.prompt_tokens,
+            t.completion_tokens
+        );
+    }
     Ok(0)
 }
 

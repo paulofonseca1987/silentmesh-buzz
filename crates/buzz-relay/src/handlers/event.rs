@@ -43,7 +43,7 @@ pub(crate) fn bounded_kind_label(kind: u32) -> String {
         41001 | 41010..=41012 => kind.to_string(),
         43001..=43006 => kind.to_string(),
         44100..=44101 => kind.to_string(),
-        44200 => kind.to_string(),
+        44200..=44201 => kind.to_string(),
         45001..=45003 => kind.to_string(),
         46001..=46012 | 46020 | 46030..=46031 => kind.to_string(),
         47000..=47011 => kind.to_string(),
@@ -460,7 +460,8 @@ async fn dispatch_persistent_event_inner(
     // subscription can otherwise match it. Pull paths (HTTP /query, WS historical)
     // are gated separately by reader_authorized_for_event.
     let owner_only_kind = kind_u32 == buzz_core::kind::KIND_DM_VISIBILITY
-        || kind_u32 == buzz_core::kind::KIND_AGENT_TURN_METRIC;
+        || kind_u32 == buzz_core::kind::KIND_AGENT_TURN_METRIC
+        || kind_u32 == buzz_core::kind::KIND_AGENT_TURN_ATTRIBUTION;
     let private_event_owner: Option<String> = owner_only_kind
         .then(|| {
             let p = nostr::SingleLetterTag::lowercase(nostr::Alphabet::P);

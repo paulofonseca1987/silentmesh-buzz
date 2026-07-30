@@ -7,11 +7,12 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use buzz_core::kind::{
-    event_kind_u32, is_parameterized_replaceable, KIND_AGENT_PROFILE, KIND_DM_VISIBILITY,
-    KIND_GIT_REPO_ANNOUNCEMENT, KIND_IA_ARCHIVED, KIND_IA_ARCHIVED_LIST, KIND_IA_UNARCHIVED,
-    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_NIP29_GROUP_ADMINS,
-    KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA, KIND_NIP43_MEMBERSHIP_LIST, KIND_REACTION,
-    KIND_THREAD_SUMMARY, KIND_WORK_THREAD_FORK, KIND_WORK_THREAD_OPEN,
+    event_kind_u32, is_parameterized_replaceable, KIND_AGENT_PROFILE, KIND_AGENT_TURN_ATTRIBUTION,
+    KIND_DM_VISIBILITY, KIND_GIT_REPO_ANNOUNCEMENT, KIND_IA_ARCHIVED, KIND_IA_ARCHIVED_LIST,
+    KIND_IA_UNARCHIVED, KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION,
+    KIND_NIP29_GROUP_ADMINS, KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA,
+    KIND_NIP43_MEMBERSHIP_LIST, KIND_REACTION, KIND_THREAD_SUMMARY, KIND_WORK_THREAD_FORK,
+    KIND_WORK_THREAD_OPEN,
 };
 use buzz_core::StoredEvent;
 use buzz_db::channel::{MemberRecord, MemberRole};
@@ -43,6 +44,7 @@ pub fn is_side_effect_kind(kind: u32) -> bool {
             | 40099
             | KIND_WORK_THREAD_OPEN
             | KIND_WORK_THREAD_FORK
+            | KIND_AGENT_TURN_ATTRIBUTION
     )
 }
 
@@ -226,6 +228,8 @@ pub async fn handle_side_effects(
         KIND_WORK_THREAD_OPEN => handle_work_thread_open(tenant, event, state).await,
         // silent-mesh: thread fork → create the projection row with provenance.
         KIND_WORK_THREAD_FORK => handle_work_thread_fork(tenant, event, state).await,
+        // silent-mesh Phase 3: turn attribution → record a model_usage row.
+        KIND_AGENT_TURN_ATTRIBUTION => handle_agent_turn_attribution(tenant, event, state).await,
         // kind:7 (reaction) handled inline in ingest_event() before storage.
         _ => Ok(()),
     }
@@ -1305,6 +1309,80 @@ async fn handle_agent_profile(
 /// 47001/47002 command handlers a TOCTOU-safe state to check against. The
 /// tags were validated pre-storage (`validate_work_thread_open`), so parse
 /// failures here mean a code drift bug, not bad client input.
+/// silent-mesh Phase 3: record a `kind:44201` turn attribution into the
+/// `model_usage` table.
+///
+/// The relay is the classification authority here: the channel's tier comes
+/// from its OWN channels table and the backend derives from the model string
+/// via the shared `classify_model` rule — the client's opinion is never
+/// consulted. The envelope (tags, JSON shape, purpose vocabulary, token
+/// ranges) was validated at ingest; failures here are defensive.
+async fn handle_agent_turn_attribution(
+    tenant: &TenantContext,
+    event: &Event,
+    state: &Arc<AppState>,
+) -> anyhow::Result<()> {
+    let payload: buzz_core::agent_turn_attribution::AgentTurnAttributionPayload =
+        serde_json::from_str(&event.content)
+            .map_err(|e| anyhow::anyhow!("kind:44201 content parse: {e}"))?;
+    payload
+        .validate()
+        .map_err(|e| anyhow::anyhow!("kind:44201 payload invalid: {e}"))?;
+
+    // Tier: authoritative from the channels table. A missing channel is a
+    // hard error — attribution against a nonexistent channel is meaningless.
+    let channel = state
+        .db
+        .get_channel(tenant.community(), payload.channel_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("kind:44201 channel {} lookup: {e}", payload.channel_id))?;
+    let tier: buzz_core::channel::ChannelTier = channel
+        .tier
+        .parse()
+        .map_err(|_| anyhow::anyhow!("kind:44201 unparseable stored tier {}", channel.tier))?;
+
+    // Backend: the same shared rule the tier gate applies to the declared
+    // model — a turn is metered under exactly the classification it was
+    // gated by (unknown/bare models fail closed to vendor).
+    let backend = buzz_core::model_route::classify_model(&payload.model);
+
+    let user_pubkey =
+        hex::decode(&payload.user_pubkey).map_err(|e| anyhow::anyhow!("userPubkey hex: {e}"))?;
+    let thread_id = payload
+        .thread_root_id
+        .as_deref()
+        .map(hex::decode)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("threadRootId hex: {e}"))?;
+    let agent_pubkey = event.pubkey.to_bytes().to_vec();
+
+    let row_id = state
+        .db
+        .record_model_usage(buzz_db::model_usage::RecordModelUsageParams {
+            community_id: tenant.community(),
+            user_pubkey: &user_pubkey,
+            agent_pubkey: Some(&agent_pubkey),
+            channel_id: Some(payload.channel_id),
+            thread_id: thread_id.as_deref(),
+            model: &payload.model,
+            tier,
+            backend,
+            purpose: payload.purpose_typed(),
+            prompt_tokens: payload.prompt_tokens as i64,
+            completion_tokens: payload.completion_tokens as i64,
+        })
+        .await?;
+    info!(
+        row_id,
+        channel = %payload.channel_id,
+        tier = %tier,
+        backend = %backend,
+        model = %payload.model,
+        "turn attribution recorded"
+    );
+    Ok(())
+}
+
 async fn handle_work_thread_open(
     tenant: &TenantContext,
     event: &Event,

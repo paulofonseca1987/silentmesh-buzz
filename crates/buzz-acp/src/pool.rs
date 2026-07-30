@@ -1389,6 +1389,16 @@ pub async fn run_prompt_task(
         .as_ref()
         .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
         .unwrap_or_default();
+    // Attribution context for the kind:44201 metering event, captured before
+    // any `batch` move so every metric call site can use it.
+    let turn_attribution = batch.as_ref().and_then(|b| b.events.last()).map(|be| {
+        let tags = crate::queue::parse_thread_tags(&be.event);
+        TurnAttribution {
+            user_pubkey_hex: be.event.pubkey.to_hex(),
+            thread_root_id: tags.root_event_id,
+            declared_model: agent.desired_model.clone(),
+        }
+    });
     agent.acp.observe(
         "turn_started",
         serde_json::json!({
@@ -1690,6 +1700,9 @@ pub async fn run_prompt_task(
                             "created session {sid} for channel {cid}"
                         );
                         agent.state.sessions.insert(*cid, sid.clone());
+                        // The harness created this session: zero is the true
+                        // usage baseline, so turn one's delta is reliable.
+                        agent.acp.seed_fresh_session(&sid);
                         // Commit canvas only after session creation succeeds (I3).
                         if let Some((pending_cid, section)) = pending_canvas.take() {
                             agent.state.canvas_sections.insert(pending_cid, section);
@@ -1738,6 +1751,7 @@ pub async fn run_prompt_task(
                             agent.index
                         );
                         agent.state.heartbeat_session = Some(sid.clone());
+                        agent.acp.seed_fresh_session(&sid);
                         (sid, true)
                     }
                     Err(AcpError::AgentExited) => {
@@ -2086,6 +2100,7 @@ pub async fn run_prompt_task(
                                     &session_id,
                                     &turn_id,
                                     Some(buzz_core::agent_turn_metric::StopReason::Cancelled),
+                                    turn_attribution.as_ref(),
                                 )
                                 .await;
                                 send_prompt_result(
@@ -2122,6 +2137,7 @@ pub async fn run_prompt_task(
                                     &session_id,
                                     &turn_id,
                                     Some(buzz_core::agent_turn_metric::StopReason::Error),
+                                    turn_attribution.as_ref(),
                                 )
                                 .await;
                                 send_prompt_result(
@@ -2177,6 +2193,7 @@ pub async fn run_prompt_task(
                             &session_id,
                             &turn_id,
                             Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
+                            turn_attribution.as_ref(),
                         )
                         .await;
                         // NO text-fallback here (review-hardened): this race
@@ -2247,6 +2264,7 @@ pub async fn run_prompt_task(
                 &session_id,
                 &turn_id,
                 Some(core_stop),
+                turn_attribution.as_ref(),
             )
             .await;
 
@@ -2286,6 +2304,7 @@ pub async fn run_prompt_task(
                 &session_id,
                 &turn_id,
                 Some(buzz_core::agent_turn_metric::StopReason::Error),
+                turn_attribution.as_ref(),
             )
             .await;
             send_prompt_result(
@@ -2318,6 +2337,7 @@ pub async fn run_prompt_task(
                         &session_id,
                         &turn_id,
                         Some(buzz_core::agent_turn_metric::StopReason::Cancelled),
+                        turn_attribution.as_ref(),
                     )
                     .await;
                     // Timeout triggers respawn in handle_prompt_result —
@@ -2346,6 +2366,7 @@ pub async fn run_prompt_task(
                         &session_id,
                         &turn_id,
                         Some(buzz_core::agent_turn_metric::StopReason::Error),
+                        turn_attribution.as_ref(),
                     )
                     .await;
                     send_prompt_result(
@@ -2371,6 +2392,7 @@ pub async fn run_prompt_task(
                         &session_id,
                         &turn_id,
                         Some(buzz_core::agent_turn_metric::StopReason::Error),
+                        turn_attribution.as_ref(),
                     )
                     .await;
                     send_prompt_result(
@@ -2400,6 +2422,7 @@ pub async fn run_prompt_task(
                 &session_id,
                 &turn_id,
                 Some(buzz_core::agent_turn_metric::StopReason::Error),
+                turn_attribution.as_ref(),
             )
             .await;
             send_prompt_result(
@@ -2427,6 +2450,7 @@ pub async fn run_prompt_task(
                 &session_id,
                 &turn_id,
                 Some(buzz_core::agent_turn_metric::StopReason::Error),
+                turn_attribution.as_ref(),
             )
             .await;
             send_prompt_result(
@@ -3546,7 +3570,24 @@ fn acp_stop_to_core(r: &StopReason) -> buzz_core::agent_turn_metric::StopReason 
     }
 }
 
-/// Best-effort: build and publish a `kind:44200` NIP-AM agent turn metric event.
+/// Per-turn attribution context for the cleartext `kind:44201` metering
+/// event, captured at turn start (before any `batch` moves) so every
+/// `publish_agent_turn_metric` call site can pass it unchanged.
+#[derive(Debug, Clone)]
+struct TurnAttribution {
+    /// The member whose message triggered the turn (hex pubkey).
+    user_pubkey_hex: String,
+    /// The trigger's thread root event id, when threaded.
+    thread_root_id: Option<String>,
+    /// The agent's declared model at turn start — the gate-classified
+    /// `"provider:model"` string. Falls back to the usage-reported model
+    /// (which classifies Vendor, matching the gate's fail-closed rule).
+    declared_model: Option<String>,
+}
+
+/// Best-effort: build and publish a `kind:44200` NIP-AM agent turn metric
+/// event, plus its cleartext `kind:44201` attribution sibling when the turn
+/// has reliable per-turn token counts and a channel/user attribution.
 ///
 /// Does nothing when `usage` is `None` (goose emitted no usage notification
 /// for this turn) or when `owner_pubkey` is unconfigured (no NIP-AO identity).
@@ -3559,6 +3600,7 @@ async fn publish_agent_turn_metric(
     session_id: &str,
     turn_id: &str,
     stop_reason: Option<buzz_core::agent_turn_metric::StopReason>,
+    attribution: Option<&TurnAttribution>,
 ) {
     use buzz_core::agent_turn_metric::{AgentTurnMetricPayload, TokenCounts};
     use nostr::{EventBuilder, Kind, Tag};
@@ -3567,6 +3609,8 @@ async fn publish_agent_turn_metric(
         (Some(u), Some(pk)) => (u, pk),
         _ => return,
     };
+
+    publish_agent_turn_attribution(ctx, &usage, channel_id, session_id, turn_id, attribution).await;
 
     let turn_counts = if usage.delta_reliable {
         Some(TokenCounts {
@@ -3659,6 +3703,113 @@ async fn publish_agent_turn_metric(
             session_id,
             turn_id,
             "NIP-AM: publish timed out"
+        ),
+    }
+}
+
+/// Best-effort: build and publish the cleartext `kind:44201` turn-attribution
+/// event (Silent Mesh Phase 3 metering). Skipped — silently, this is
+/// best-effort metering — unless ALL attribution inputs exist: an owner (for
+/// the read-gating `p` tag), reliable per-turn token counts, a channel, a
+/// triggering user, and a model identity (the declared gate-classified model,
+/// else the usage-reported one). The relay re-validates everything and
+/// resolves tier/backend itself on ingest.
+async fn publish_agent_turn_attribution(
+    ctx: &PromptContext,
+    usage: &crate::usage::TurnUsage,
+    channel_id: Option<uuid::Uuid>,
+    session_id: &str,
+    turn_id: &str,
+    attribution: Option<&TurnAttribution>,
+) {
+    use nostr::{EventBuilder, Kind, Tag};
+
+    let Some(owner_pk) = ctx.agent_owner_pubkey.as_ref() else {
+        return;
+    };
+    let Some(attr) = attribution else {
+        tracing::debug!(target: "pool::metrics", turn_id, "attribution skipped: no trigger context");
+        return;
+    };
+    let Some(channel_id) = channel_id else {
+        tracing::debug!(target: "pool::metrics", turn_id, "attribution skipped: no channel");
+        return;
+    };
+    let (Some(prompt_tokens), Some(completion_tokens)) = (
+        usage
+            .delta_reliable
+            .then_some(usage.turn_input_tokens)
+            .flatten(),
+        usage
+            .delta_reliable
+            .then_some(usage.turn_output_tokens)
+            .flatten(),
+    ) else {
+        tracing::warn!(
+            target: "pool::metrics",
+            turn_id,
+            delta_reliable = usage.delta_reliable,
+            "attribution skipped: no reliable per-turn token counts"
+        );
+        return;
+    };
+    let Some(model) = attr.declared_model.clone().or_else(|| usage.model.clone()) else {
+        tracing::warn!(target: "pool::metrics", turn_id, "attribution skipped: no model identity");
+        return;
+    };
+
+    let payload = buzz_core::agent_turn_attribution::AgentTurnAttributionPayload {
+        model,
+        prompt_tokens,
+        completion_tokens,
+        purpose: "agent_turn".to_string(),
+        channel_id,
+        user_pubkey: attr.user_pubkey_hex.clone(),
+        thread_root_id: attr.thread_root_id.clone(),
+    };
+    if let Err(e) = payload.validate() {
+        tracing::warn!(target: "pool::metrics", session_id, turn_id, "attribution invalid: {e}");
+        return;
+    }
+    let content = match serde_json::to_string(&payload) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(target: "pool::metrics", session_id, turn_id, "attribution serialize: {e}");
+            return;
+        }
+    };
+    let agent_hex = ctx.agent_keys.public_key().to_hex();
+    let owner_hex = owner_pk.to_hex();
+    let event = match EventBuilder::new(
+        Kind::Custom(buzz_core::kind::KIND_AGENT_TURN_ATTRIBUTION as u16),
+        content,
+    )
+    .tags([
+        Tag::parse(["p", &owner_hex]).expect("p tag"),
+        Tag::parse(["agent", &agent_hex]).expect("agent tag"),
+    ])
+    .sign_with_keys(&ctx.agent_keys)
+    {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(target: "pool::metrics", session_id, turn_id, "attribution sign: {e}");
+            return;
+        }
+    };
+    const ATTRIBUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+    match tokio::time::timeout(ATTRIBUTION_TIMEOUT, ctx.rest_client.submit_event(&event)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(
+            target: "pool::metrics",
+            session_id,
+            turn_id,
+            "attribution publish failed: {e}"
+        ),
+        Err(_) => tracing::warn!(
+            target: "pool::metrics",
+            session_id,
+            turn_id,
+            "attribution publish timed out"
         ),
     }
 }
@@ -5715,6 +5866,7 @@ mod tests {
             "sess-1",
             "turn-1",
             Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
+            None,
         )
         .await;
     }
@@ -5743,6 +5895,7 @@ mod tests {
             "sess-1",
             "turn-1",
             Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
+            None,
         )
         .await;
     }
@@ -5775,6 +5928,7 @@ mod tests {
             "sess-1",
             "turn-1",
             Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
+            None,
         )
         .await;
     }
@@ -5808,6 +5962,7 @@ mod tests {
             "sess-cancel",
             "turn-cancel",
             Some(buzz_core::agent_turn_metric::StopReason::Cancelled),
+            None,
         )
         .await;
     }
@@ -5841,6 +5996,7 @@ mod tests {
             "sess-ba",
             "turn-ba",
             Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
+            None,
         )
         .await;
     }

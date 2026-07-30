@@ -251,6 +251,23 @@ pub fn is_known_provider_prefix(prefix: &str) -> bool {
     )
 }
 
+/// Classify a full persona model string (`"provider:model-id"` or a bare
+/// model id) into the [`Backend`] that serves it — the shared rule the tier
+/// gate and the relay's attribution ingest both apply, so a turn is metered
+/// under exactly the classification it was gated by.
+///
+/// The pre-colon segment counts as a provider only when
+/// [`is_known_provider_prefix`] recognizes it (model ids themselves contain
+/// `:` — an Ollama tag like `llama3.2:3b` must not classify by its tag).
+/// A bare or unrecognized-prefix model fails closed to [`Backend::Vendor`],
+/// matching [`provider_to_backend`]'s rule for absent providers.
+pub fn classify_model(model: &str) -> Backend {
+    match model.trim().split_once(':') {
+        Some((prefix, _)) if is_known_provider_prefix(prefix) => provider_to_backend(Some(prefix)),
+        _ => provider_to_backend(None),
+    }
+}
+
 /// Classify an agent's configured model **provider** — the `provider` half of
 /// a persona's `"provider:model-id"` string (see
 /// `buzz_persona::persona::split_model`) — into the [`Backend`] that serves
@@ -448,6 +465,19 @@ mod tests {
         for tier in TIERS {
             assert!(route(tier, local, AgentTurn).is_allowed(), "{tier}");
         }
+    }
+
+    #[test]
+    fn classify_model_matches_the_gate_rule() {
+        assert_eq!(classify_model("ollama:qwen3:14b"), Backend::Local);
+        assert_eq!(classify_model("vllm:llama3.1"), Backend::Local);
+        assert_eq!(classify_model("tee:some-model"), Backend::Tee);
+        assert_eq!(classify_model("anthropic:claude-sonnet-4"), Backend::Vendor);
+        // Bare ids — including colon-bearing Ollama tags — fail closed.
+        assert_eq!(classify_model("qwen3:14b"), Backend::Vendor);
+        assert_eq!(classify_model("llama3.2:3b"), Backend::Vendor);
+        assert_eq!(classify_model("claude-sonnet-4"), Backend::Vendor);
+        assert_eq!(classify_model(""), Backend::Vendor);
     }
 
     #[test]

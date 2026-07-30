@@ -988,6 +988,13 @@ impl AcpClient {
         self.goose_usage.take()
     }
 
+    /// Seed a zero usage baseline for a session this harness just created —
+    /// makes the first turn's token delta reliable (see
+    /// `UsageTracker::seed_fresh_session`).
+    pub fn seed_fresh_session(&mut self, session_id: &str) {
+        self.goose_usage.seed_fresh_session(session_id);
+    }
+
     /// Drain the turn's final assistant text (post-last-tool-call), if any.
     ///
     /// Consumed by the text-fallback in `run_prompt_task`: when a channel

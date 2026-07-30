@@ -184,6 +184,23 @@ impl UsageTracker {
         self.pending = None;
     }
 
+    /// Seed a zero baseline for a session the harness ITSELF just created
+    /// via `session/new`. The first turn's accumulated counters then equal
+    /// its per-turn usage, so the delta is reliable from turn one — unlike a
+    /// session first observed mid-life (e.g. after a harness restart), where
+    /// the conservative no-baseline rule correctly stands. Never overwrites
+    /// an existing baseline.
+    pub(crate) fn seed_fresh_session(&mut self, session_id: &str) {
+        self.sessions
+            .entry(session_id.to_string())
+            .or_insert(SessionState {
+                published_seq: 0,
+                last_input: 0,
+                last_output: 0,
+                last_cost: None,
+            });
+    }
+
     /// Process a `usage_update` notification payload.
     ///
     /// Behavior depends on which session (if any) is currently in-flight; see
@@ -343,6 +360,49 @@ mod tests {
             accumulated_cost: cost,
             model: None,
         }
+    }
+
+    #[test]
+    fn seeded_fresh_session_makes_first_turn_delta_reliable() {
+        let mut t = UsageTracker::default();
+        // Harness creates the session → zero baseline is provably correct.
+        t.seed_fresh_session("ses_fresh");
+        t.begin_turn("ses_fresh");
+        t.record("ses_fresh", &payload_no_context(4100, 1200, None));
+        let u = t.take().expect("usage present");
+        assert!(
+            u.delta_reliable,
+            "fresh-session first turn must be reliable"
+        );
+        assert_eq!(u.turn_input_tokens, Some(4100));
+        assert_eq!(u.turn_output_tokens, Some(1200));
+        assert_eq!(u.turn_seq, 1);
+
+        // Second turn on the same session still computes deltas normally.
+        t.begin_turn("ses_fresh");
+        t.record("ses_fresh", &payload_no_context(6000, 2000, None));
+        let u = t.take().expect("usage present");
+        assert!(u.delta_reliable);
+        assert_eq!(u.turn_input_tokens, Some(1900));
+        assert_eq!(u.turn_output_tokens, Some(800));
+
+        // Seeding never overwrites an existing baseline.
+        t.seed_fresh_session("ses_fresh");
+        t.begin_turn("ses_fresh");
+        t.record("ses_fresh", &payload_no_context(7000, 2500, None));
+        let u = t.take().expect("usage present");
+        assert_eq!(
+            u.turn_input_tokens,
+            Some(1000),
+            "baseline not reset by re-seed"
+        );
+
+        // An UNSEEDED session (observed mid-life) keeps the conservative rule.
+        let mut t2 = UsageTracker::default();
+        t2.begin_turn("ses_unknown");
+        t2.record("ses_unknown", &payload_no_context(500, 100, None));
+        let u = t2.take().expect("usage present");
+        assert!(!u.delta_reliable, "unseeded first turn stays unreliable");
     }
 
     // ── Turn scoping: setup notifications must not pollute the first real turn ─
