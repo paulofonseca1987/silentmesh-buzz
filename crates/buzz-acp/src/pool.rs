@@ -1376,6 +1376,9 @@ pub async fn run_prompt_task(
         PromptSource::Heartbeat => None,
     };
     let turn_started_at = chrono::Utc::now().to_rfc3339();
+    // Second-granularity Nostr timestamp for the text-fallback's
+    // "did the agent already post this turn?" relay query.
+    let turn_started_ts = nostr::Timestamp::now();
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
         None,
@@ -2176,6 +2179,14 @@ pub async fn run_prompt_task(
                             Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
                         )
                         .await;
+                        // NO text-fallback here (review-hardened): this race
+                        // arm synthesizes EndTurn — the real stop reason was
+                        // dropped, so the buffer may hold truncated scratch —
+                        // and a control signal just arrived, meaning the user
+                        // is actively steering; posting a stale answer under
+                        // them is worse than silence. Drain the buffer so the
+                        // residue can't leak into a later turn.
+                        let _ = agent.acp.take_final_agent_text();
                         send_prompt_result(
                             &result_tx,
                             &turn_id,
@@ -2238,6 +2249,22 @@ pub async fn run_prompt_task(
                 Some(core_stop),
             )
             .await;
+
+            // Text-fallback: a channel turn that ended cleanly (EndTurn only
+            // — MaxTokens/MaxTurnRequests/Refusal buffers hold truncated or
+            // refused scratch, not an answer) with un-sent final text posts
+            // that text as the threaded reply (unless the agent already
+            // posted this turn — checked inside). The buffer is drained
+            // unconditionally so non-EndTurn residue can't linger.
+            let fallback_text = agent.acp.take_final_agent_text();
+            if matches!(stop_reason, StopReason::EndTurn) {
+                if let (Some(text), Some(b), PromptSource::Channel(_)) =
+                    (fallback_text, batch.as_ref(), &source)
+                {
+                    post_text_fallback(&ctx.rest_client, b.channel_id, b, turn_started_ts, &text)
+                        .await;
+                }
+            }
 
             send_prompt_result(
                 &result_tx,
@@ -3761,6 +3788,168 @@ fn format_model_fallback_refusal_notice(declared: Option<&str>, reason: &RefuseR
     }
 }
 
+/// Unwrap a reply the model wrote as a literal `buzz messages send` command
+/// instead of executing it — the most common local-model fallback shape: the
+/// model composes the exact right command (channel, `--reply-to`, content)
+/// but emits it as text. Returns the `--content` payload when the ENTIRE
+/// text (after stripping a surrounding code fence / backticks) is a single
+/// `buzz messages send` invocation with a quoted `--content`; anything else
+/// (surrounding prose, unquoted content, other commands) returns `None` and
+/// the text posts as-is.
+fn extract_intended_reply(text: &str) -> Option<String> {
+    let mut t = text.trim();
+    // Strip one surrounding markdown fence or inline-backtick wrapper.
+    if let Some(stripped) = t.strip_prefix("```") {
+        // Drop an optional language tag line, then the closing fence.
+        let stripped = stripped.trim_start_matches(|c: char| c.is_alphanumeric());
+        t = stripped.strip_suffix("```").unwrap_or(stripped).trim();
+    } else if t.starts_with('`') && t.ends_with('`') && t.len() > 1 {
+        t = t[1..t.len() - 1].trim();
+    }
+    if !t.starts_with("buzz ") {
+        return None;
+    }
+    let after = t.strip_prefix("buzz")?.trim_start();
+    let after = after.strip_prefix("messages")?.trim_start();
+    let after = after.strip_prefix("send")?;
+    // Find the quoted --content argument.
+    let idx = after.find("--content")?;
+    let rest = after[idx + "--content".len()..].trim_start();
+    let rest = rest.strip_prefix('=').unwrap_or(rest).trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let body = &rest[1..];
+    // Scan to the matching close quote, honoring backslash escapes.
+    let mut out = String::new();
+    let mut chars = body.chars();
+    let mut closed = false;
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(esc) => out.push(esc),
+                None => return None,
+            }
+        } else if c == quote {
+            closed = true;
+            break;
+        } else {
+            out.push(c);
+        }
+    }
+    // Unterminated quote: the command was truncated mid-content (e.g. by the
+    // buffer cap) — the partial content is still the intended reply.
+    let _ = closed;
+    let out = out.trim().to_string();
+    (!out.is_empty()).then_some(out)
+}
+
+/// Text-fallback (Silent Mesh): post the agent's un-sent final answer.
+///
+/// Local models reliably produce the correct answer but drop the "EXECUTE
+/// `buzz messages send`" step after exploration rounds — the answer lands as
+/// final text, which tool-calls-as-output discards. When a channel turn ends
+/// Ok with non-empty final text, this posts that text as the threaded reply
+/// **unless the agent already posted this turn** (one relay query: kind-9/
+/// 40002 messages by the agent's own key in this channel since turn start —
+/// the agent subprocess signs with the same key as the harness). Fails
+/// closed: on a query error nothing is posted (never risk a double reply).
+/// Inert for capable models — they post via tools and the query finds it.
+///
+/// Anchor contract matches the agent's own reply instructions: reuse the
+/// triggering event's thread when it has one, else the triggering event
+/// itself becomes the thread root.
+async fn post_text_fallback(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    batch: &FlushBatch,
+    turn_started_ts: nostr::Timestamp,
+    text: &str,
+) {
+    use nostr::{Alphabet, SingleLetterTag};
+
+    let Some(trigger) = batch.events.last() else {
+        return;
+    };
+
+    // Did the agent already post this turn? Covers every reply surface the
+    // CLI offers — stream messages AND forum posts/comments — so a forum
+    // reply suppresses the fallback too. (Fail closed on error/timeout.)
+    let ch_str = channel_id.to_string();
+    let filter = nostr::Filter::new()
+        .kinds([
+            nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16),
+            nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_V2 as u16),
+            nostr::Kind::Custom(buzz_core::kind::KIND_FORUM_POST as u16),
+            nostr::Kind::Custom(buzz_core::kind::KIND_FORUM_COMMENT as u16),
+        ])
+        .author(rest.keys.public_key())
+        .custom_tags(SingleLetterTag::lowercase(Alphabet::H), [ch_str.as_str()])
+        .since(turn_started_ts)
+        .limit(1);
+    match tokio::time::timeout(Duration::from_secs(5), rest.query(&[filter])).await {
+        Ok(Ok(json)) => {
+            if json.as_array().is_some_and(|a| !a.is_empty()) {
+                tracing::debug!(
+                    channel = %channel_id,
+                    "text fallback skipped: agent already posted this turn"
+                );
+                return;
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(channel = %channel_id, "text fallback query failed: {e} — skipping");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(channel = %channel_id, "text fallback query timed out — skipping");
+            return;
+        }
+    }
+
+    // Anchor matches the agent's own `--reply-to <trigger>` contract: parent
+    // is always the TRIGGERING event (not the trigger's own parent — that
+    // would make the reply a sibling of the question), root is the trigger's
+    // thread root when it has one, else the trigger itself.
+    let thread_tags = crate::queue::parse_thread_tags(&trigger.event);
+    let root_id = thread_tags
+        .root_event_id
+        .as_deref()
+        .and_then(|r| nostr::EventId::from_hex(r).ok())
+        .unwrap_or(trigger.event.id);
+    let thread_ref = Some(buzz_sdk::ThreadRef {
+        root_event_id: root_id,
+        parent_event_id: trigger.event.id,
+    });
+    // If the model wrote its reply as a literal send-command, post the
+    // intended content rather than the command envelope.
+    let extracted = extract_intended_reply(text);
+    let content = extracted.as_deref().unwrap_or(text);
+    let builder =
+        match buzz_sdk::build_message(channel_id, content, thread_ref.as_ref(), &[], false, &[]) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(channel = %channel_id, "text fallback: build failed: {e}");
+                return;
+            }
+        };
+    let event = match builder.sign_with_keys(&rest.keys) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(channel = %channel_id, "text fallback: sign failed: {e}");
+            return;
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+        Ok(Ok(_)) => {
+            tracing::info!(channel = %channel_id, "text fallback posted the agent's final answer");
+        }
+        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "text fallback post failed: {e}"),
+        Err(_) => tracing::warn!(channel = %channel_id, "text fallback post timed out"),
+    }
+}
+
 /// Best-effort: post a visible failure notice (kind:9) to a channel after a
 /// batch is dead-lettered. Replies into the thread of `thread_tags` when the
 /// triggering event was threaded. Errors are logged and swallowed — the
@@ -3959,6 +4148,44 @@ mod tests {
             tier_gate_decision(Owned, Some("claude-sonnet-4")),
             RouteDecision::Refuse(_)
         ));
+    }
+
+    #[test]
+    fn extract_intended_reply_unwraps_literal_send_commands_only() {
+        let e = super::extract_intended_reply;
+        // The exact shape observed live: bare command with double quotes.
+        assert_eq!(
+            e(r#"buzz messages send --channel abc --reply-to def --content "The answer is 42.""#)
+                .as_deref(),
+            Some("The answer is 42.")
+        );
+        // Fenced and backticked wrappers unwrap.
+        assert_eq!(
+            e("```bash\nbuzz messages send --channel a --content \"Hi there\"\n```").as_deref(),
+            Some("Hi there")
+        );
+        assert_eq!(
+            e("`buzz messages send --content 'single quoted'`").as_deref(),
+            Some("single quoted")
+        );
+        // Escaped quotes inside the content survive.
+        assert_eq!(
+            e(r#"buzz messages send --content "She said \"hi\".""#).as_deref(),
+            Some(r#"She said "hi"."#)
+        );
+        // A truncated (unterminated) content still yields the partial reply.
+        assert_eq!(
+            e(r#"buzz messages send --content "cut off mid-sen"#).as_deref(),
+            Some("cut off mid-sen")
+        );
+        // Prose around the command does NOT unwrap — post as-is.
+        assert_eq!(e(r#"Run this: buzz messages send --content "x""#), None);
+        // Ordinary answers pass through untouched.
+        assert_eq!(e("This channel is private."), None);
+        // Other buzz commands don't unwrap.
+        assert_eq!(e("buzz channels list"), None);
+        // Unquoted content doesn't unwrap.
+        assert_eq!(e("buzz messages send --content hello"), None);
     }
 
     #[test]

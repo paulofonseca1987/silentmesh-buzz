@@ -257,6 +257,78 @@ pub struct AcpClient {
     /// deltas. Both goose and buzz-agent emit this notification; goose gates
     /// on client capability advertisement, buzz-agent emits unconditionally.
     goose_usage: UsageTracker,
+    /// Final-answer text buffer for the text-fallback reply (Silent Mesh):
+    /// accumulates `agent_message_chunk` text since the last `tool_call`, so
+    /// at turn end it holds only the post-final-tool assistant text — the
+    /// answer a local model wrote instead of executing `buzz messages send`.
+    final_text: FinalTextBuffer,
+}
+
+/// Per-turn assistant-text accumulator for the harness text-fallback.
+///
+/// Semantics: `push` concatenates message chunks for the in-flight turn's
+/// session only (buzz-agent emits one complete chunk per LLM round; goose
+/// token-streams many small ones — both shapes concatenate correctly);
+/// `reset_on_boundary` clears it at every point where earlier text becomes
+/// non-final (a tool round starts; a steer delivers a mid-turn correction;
+/// the agent reports the awaited turn already ended); `take` drains the
+/// trimmed result. Capped so a runaway model cannot grow the buffer
+/// unboundedly (build_message rejects >64 KiB content anyway).
+#[derive(Debug, Default)]
+pub(crate) struct FinalTextBuffer {
+    text: String,
+    /// The in-flight turn's session id. Chunks from any other session (one
+    /// `AcpClient` hosts sessions for multiple channels) are ignored so a
+    /// concurrent session's text can never pollute this turn's fallback.
+    session_id: Option<String>,
+}
+
+impl FinalTextBuffer {
+    /// Cap matches `buzz_sdk::build_message`'s content limit.
+    const MAX_BYTES: usize = 64 * 1024;
+
+    pub(crate) fn begin_turn(&mut self, session_id: &str) {
+        self.text.clear();
+        self.session_id = Some(session_id.to_owned());
+    }
+
+    pub(crate) fn push(&mut self, session_id: Option<&str>, chunk: &str) {
+        // Session-scoped: only the in-flight turn's session accumulates.
+        // A chunk with no session id cannot be attributed — drop it.
+        match (self.session_id.as_deref(), session_id) {
+            (Some(ours), Some(theirs)) if ours == theirs => {}
+            _ => return,
+        }
+        if self.text.len() < Self::MAX_BYTES {
+            let room = Self::MAX_BYTES - self.text.len();
+            if chunk.len() <= room {
+                self.text.push_str(chunk);
+            } else {
+                // Truncate on a char boundary; an over-cap fallback is
+                // better delivered clipped than dropped.
+                let mut end = room;
+                while !chunk.is_char_boundary(end) {
+                    end -= 1;
+                }
+                self.text.push_str(&chunk[..end]);
+            }
+        }
+    }
+
+    /// Clear accumulated text: everything said so far is no longer final
+    /// (tool round starting, steer delivered, awaited turn already ended).
+    pub(crate) fn reset_on_boundary(&mut self) {
+        self.text.clear();
+    }
+
+    /// Drain the buffer, returning the trimmed final text if non-empty.
+    /// Also drops the session scope so late chunks can't repopulate it.
+    pub(crate) fn take(&mut self) -> Option<String> {
+        self.session_id = None;
+        let t = std::mem::take(&mut self.text);
+        let t = t.trim().to_string();
+        (!t.is_empty()).then_some(t)
+    }
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -600,6 +672,7 @@ impl AcpClient {
             steering_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
+            final_text: FinalTextBuffer::default(),
         })
     }
 
@@ -809,6 +882,7 @@ impl AcpClient {
         // prompt so that any setup notifications recorded earlier are not
         // misattributed to this turn.
         self.goose_usage.begin_turn(session_id);
+        self.final_text.begin_turn(session_id);
 
         self.last_prompt_id = Some(self.next_id);
         let id = self.next_id;
@@ -912,6 +986,15 @@ impl AcpClient {
     /// publish a kind 44200 NIP-AM event.
     pub fn take_turn_usage(&mut self) -> Option<TurnUsage> {
         self.goose_usage.take()
+    }
+
+    /// Drain the turn's final assistant text (post-last-tool-call), if any.
+    ///
+    /// Consumed by the text-fallback in `run_prompt_task`: when a channel
+    /// turn ends Ok and the agent posted nothing, this text is posted as the
+    /// threaded reply so a local model's un-sent answer is not lost.
+    pub fn take_final_agent_text(&mut self) -> Option<String> {
+        self.final_text.take()
     }
 
     /// Install a per-turn steer request channel for goose-native
@@ -1680,9 +1763,17 @@ impl AcpClient {
                                                     "steer accepted as {STEER_OUTCOME_STARTED_NEW_TURN}: \
                                                      awaited turn had ended — hard deadline not renewed"
                                                 );
+                                                // The awaited turn is settled and the
+                                                // agent moved on: its buffered text is
+                                                // stale — never fallback-post it.
+                                                self.final_text.reset_on_boundary();
                                                 crate::pool::SteerAck::Success
                                             }
                                             Some(_) => {
+                                                // A steer delivered a mid-turn
+                                                // correction: text produced before
+                                                // it is a superseded draft.
+                                                self.final_text.reset_on_boundary();
                                                 let renew_now = Instant::now();
                                                 let new_deadline = renew_now + max_duration;
                                                 if new_deadline > hard_deadline {
@@ -1805,10 +1896,14 @@ impl AcpClient {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
+                    let chunk_session = msg["params"]["sessionId"].as_str();
+                    self.final_text.push(chunk_session, text);
                 }
                 false
             }
             "tool_call" => {
+                // A tool round starts: everything said so far was preamble.
+                self.final_text.reset_on_boundary();
                 let title = update
                     .get("title")
                     .and_then(|v| v.as_str())
@@ -3138,6 +3233,53 @@ mod tests {
                 option_value: "opus[1m]".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn final_text_buffer_keeps_only_post_boundary_text_for_its_session() {
+        let mut b = super::FinalTextBuffer::default();
+        let s = Some("ses_a");
+        b.begin_turn("ses_a");
+        // Preamble before a tool round is discarded.
+        b.push(s, "Let me check that for you.");
+        b.reset_on_boundary();
+        // goose-style token streaming concatenates.
+        b.push(s, "The answer ");
+        b.push(s, "is 42.");
+        // Another session's chunks never pollute this turn's buffer,
+        // and unattributable (session-less) chunks are dropped.
+        b.push(Some("ses_other"), "WRONG TURN TEXT");
+        b.push(None, "NO SESSION TEXT");
+        assert_eq!(b.take().as_deref(), Some("The answer is 42."));
+        // take() drains AND drops the session scope: late chunks are inert.
+        b.push(s, "late chunk");
+        assert_eq!(b.take(), None);
+
+        // A turn ending on a boundary (agent posted via tools, or a steer
+        // superseded the draft) yields None.
+        b.begin_turn("ses_a");
+        b.push(s, "Sending now.");
+        b.reset_on_boundary();
+        assert_eq!(b.take(), None);
+
+        // Whitespace-only text is not a fallback answer.
+        b.begin_turn("ses_a");
+        b.push(s, "  \n ");
+        assert_eq!(b.take(), None);
+
+        // begin_turn clears residue from an aborted turn.
+        b.begin_turn("ses_a");
+        b.push(s, "stale");
+        b.begin_turn("ses_b");
+        assert_eq!(b.take(), None);
+
+        // The cap truncates on a char boundary rather than growing unbounded.
+        b.begin_turn("ses_a");
+        let big = "é".repeat(40 * 1024); // 2 bytes per char
+        b.push(s, &big);
+        let taken = b.take().expect("capped text kept");
+        assert!(taken.len() <= 64 * 1024);
+        assert!(taken.chars().all(|c| c == 'é'));
     }
 
     #[test]
