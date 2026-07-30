@@ -44,6 +44,19 @@ guarantee, by design). Attribution-from-live-turns is blocked by the 44200
 owner-encryption and deferred to the real-backend slice. See
 phase3-tier-enforcement.md.
 
+**Tier surface + live E2E (2026-07-30).** `buzz channels create --tier
+<owned|private|open>` (SDK `build_create_channel` tier param) closed the gap
+where no client could declare the D24 tier the relay already parsed. Proven
+on a two-machine testbed: relay on the WSL host bound to its Tailscale IP
+(`ws://100.72.140.59:3999`, dev docker infra), `buzz` CLI on a MacBook over
+the tailnet. Verified live: 30/30 Phase 2 exit dry-run over the Tailscale
+address; cross-machine messaging/threads; and the slice-2 tier gate —
+a vendor-model agent turn in an `--tier owned` channel refused pre-turn with
+the ⚠️ notice visible from the Mac (zero egress), while the same agent's
+open-channel turn reached the provider (auth error on a canned key = egress
+attempted where permitted). Testbed env: scratchpad `relay-e2e.env` +
+`ids.env` (E2E identities, channels, Mac client key).
+
 **Phase 1 — governance (complete).** Workflow approval gate (WF-08) with
 kinds 46010/46011/46012; agent permission requests (relay HTTP create/list +
 hashed-token store); grant/deny via kind 46030/46031 commands (workflow and
