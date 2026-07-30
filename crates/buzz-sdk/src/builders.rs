@@ -673,6 +673,10 @@ pub fn build_set_purpose(channel_id: Uuid, purpose: &str) -> Result<EventBuilder
 /// `ttl`: `Some(secs)` makes the channel ephemeral with that lifetime in
 /// seconds (the relay archives it once the deadline passes without activity);
 /// `None` leaves it permanent.
+///
+/// `tier`: the immutable privacy tier (Silent Mesh D24/D26), declared at
+/// creation and unchangeable afterwards. `None` omits the tag and the relay
+/// defaults to `open` (loosest).
 pub fn build_create_channel(
     channel_id: Uuid,
     name: &str,
@@ -680,6 +684,7 @@ pub fn build_create_channel(
     channel_type: Option<ChannelKind>,
     about: Option<&str>,
     ttl: Option<i32>,
+    tier: Option<buzz_core::channel::ChannelTier>,
 ) -> Result<EventBuilder, SdkError> {
     let name = buzz_core::channel::canonical_channel_name(name);
     if name.trim().is_empty() {
@@ -697,6 +702,9 @@ pub fn build_create_channel(
     }
     if let Some(secs) = ttl {
         tags.push(tag(&["ttl", &secs.to_string()])?);
+    }
+    if let Some(t) = tier {
+        tags.push(tag(&["tier", t.as_str()])?);
     }
     Ok(EventBuilder::new(Kind::Custom(9007), "").tags(tags))
 }
@@ -2797,6 +2805,7 @@ mod tests {
                 Some(ChannelKind::Stream),
                 Some("General chat"),
                 None,
+                None,
             )
             .unwrap(),
         );
@@ -2818,6 +2827,7 @@ mod tests {
                 None::<ChannelKind>,
                 None,
                 None,
+                None,
             )
             .unwrap(),
         );
@@ -2833,6 +2843,7 @@ mod tests {
                 "  ###dev  ",
                 None::<Visibility>,
                 None::<ChannelKind>,
+                None,
                 None,
                 None,
             )
@@ -2851,9 +2862,48 @@ mod tests {
                 None::<ChannelKind>,
                 None,
                 None,
+                None,
             ),
             Err(SdkError::InvalidTag(_))
         ));
+    }
+
+    #[test]
+    fn create_channel_emits_tier_tag_when_declared() {
+        use buzz_core::channel::ChannelTier;
+        let cid = uuid();
+        let ev = sign(
+            build_create_channel(
+                cid,
+                "secrets",
+                Some(Visibility::Private),
+                Some(ChannelKind::Stream),
+                None,
+                None,
+                Some(ChannelTier::Owned),
+            )
+            .unwrap(),
+        );
+        assert_eq!(ev.kind.as_u16(), 9007);
+        assert!(has_tag(&ev, "tier", "owned"));
+
+        // Omitted tier ⇒ no tag (relay defaults to open).
+        let ev = sign(
+            build_create_channel(
+                cid,
+                "lobby",
+                Some(Visibility::Open),
+                Some(ChannelKind::Stream),
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        assert!(!ev
+            .tags
+            .iter()
+            .any(|t| t.clone().to_vec().first().map(String::as_str) == Some("tier")));
     }
 
     #[test]
@@ -2867,6 +2917,7 @@ mod tests {
                 Some(ChannelKind::Stream),
                 None,
                 Some(3600),
+                None,
             )
             .unwrap(),
         );

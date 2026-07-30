@@ -566,6 +566,11 @@ pub enum ChannelsCmd {
         /// it once this many seconds pass without a new message.
         #[arg(long, value_name = "SECONDS")]
         ttl: Option<i64>,
+        /// Immutable privacy tier (Silent Mesh D24): owned (zero-egress
+        /// models only), private (owned + TEE), or open (any backend).
+        /// Declared at creation and unchangeable afterwards; omitted = open.
+        #[arg(long, value_parser = ["owned", "private", "open"])]
+        tier: Option<String>,
         /// Apply a desktop-local channel template by name (case-insensitive):
         /// supplies default type/visibility/description/canvas, and resolves
         /// its agent roster against the relay to add as members.

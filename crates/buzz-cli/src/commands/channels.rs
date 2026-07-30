@@ -286,6 +286,7 @@ pub async fn cmd_create_channel(
     visibility: &str,
     description: Option<&str>,
     ttl: Option<i64>,
+    tier: Option<&str>,
 ) -> Result<(), CliError> {
     match channel_type {
         "stream" | "forum" => {}
@@ -318,9 +319,27 @@ pub async fn cmd_create_channel(
         "forum" => buzz_sdk::ChannelKind::Forum,
         _ => unreachable!(),
     };
-    let builder =
-        buzz_sdk::build_create_channel(channel_uuid, name, Some(vis), Some(ct), description, ttl)
-            .map_err(|e| CliError::Other(format!("build_create_channel failed: {e}")))?;
+    // Immutable privacy tier (Silent Mesh D24/D26): declared at creation,
+    // never changeable afterwards. Omitted ⇒ the relay defaults to `open`.
+    let tier = tier
+        .map(|t| {
+            t.parse::<buzz_core::channel::ChannelTier>().map_err(|_| {
+                CliError::Usage(format!(
+                    "--tier must be 'owned', 'private', or 'open' (got: {t})"
+                ))
+            })
+        })
+        .transpose()?;
+    let builder = buzz_sdk::build_create_channel(
+        channel_uuid,
+        name,
+        Some(vis),
+        Some(ct),
+        description,
+        ttl,
+        tier,
+    )
+    .map_err(|e| CliError::Other(format!("build_create_channel failed: {e}")))?;
 
     let event = client.sign_event(builder)?;
     let resp = client.submit_event(event).await?;
@@ -724,6 +743,8 @@ pub async fn cmd_create_channel_from_template(
         _ => unreachable!(),
     };
     let effective_description = description.or(template.description.as_deref());
+    // Templates don't carry a tier; template channels take the relay default
+    // (`open`). Use `channels create --tier` for tiered channels.
     let builder = buzz_sdk::build_create_channel(
         channel_uuid,
         name,
@@ -731,6 +752,7 @@ pub async fn cmd_create_channel_from_template(
         Some(ct),
         effective_description,
         ttl,
+        None,
     )
     .map_err(|e| CliError::Other(format!("build_create_channel failed: {e}")))?;
     let event = client.sign_event(builder)?;
@@ -1107,10 +1129,20 @@ pub async fn dispatch(
             visibility,
             description,
             ttl,
+            tier,
             template,
             templates_file,
         } => {
             if let Some(template_name) = template {
+                if tier.is_some() {
+                    // Templates take the relay default (`open`); a silently
+                    // dropped tier on an immutable property would be a trap.
+                    return Err(CliError::Usage(
+                        "--tier cannot be combined with --template (template channels are \
+                         open-tier; create tiered channels without a template)"
+                            .into(),
+                    ));
+                }
                 cmd_create_channel_from_template(
                     client,
                     &name,
@@ -1136,6 +1168,7 @@ pub async fn dispatch(
                     &visibility.to_string(),
                     description.as_deref(),
                     ttl,
+                    tier.as_deref(),
                 )
                 .await
             }
