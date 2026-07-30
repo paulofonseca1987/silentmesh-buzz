@@ -44,6 +44,23 @@ guarantee, by design). Attribution-from-live-turns is blocked by the 44200
 owner-encryption and deferred to the real-backend slice. See
 phase3-tier-enforcement.md.
 
+**Phase 3 slice 4 — live-turn attribution + owner usage read (2026-07-30).**
+**The Phase 3 exit criterion is closed with live data.** New cleartext kind
+44201 (attribution sibling of the encrypted 44200): harness publishes per
+completed turn with reliable token counts; the relay is the classification
+authority (tier from its own channels table, backend via the shared
+`classify_model`, ownership via `users.agent_owner_pubkey`, dedup by event
+id) and records into `model_usage`; owner-only read gating on every surface
+incl. FTS exclusion (migration 0033, expression-wrapping pattern).
+`UsageTracker::seed_fresh_session` makes first-turn deltas reliable for
+harness-created sessions (without it, max-turns-per-session=1 never
+attributed). `buzz-admin usage` prints per-user totals by tier/backend.
+Validated live: Mac vault message → qwen3:14b on the 4060s → 44201 →
+model_usage row (owned/local, 4100/1054) → usage table. See
+phase3-attribution.md. Testbed gotcha: the users-table agent-owner
+registration (NIP-OA BUZZ_AUTH_TAG in production) must exist or the relay
+403s the 44200/44201 — correctly.
+
 **Phase 3 slice 3 — local Ollama backend (2026-07-30).** Owned channels now
 *serve* turns, not just refuse them: `buzz-agent` `Provider::Ollama` (OpenAI
 Chat dialect at loopback, no key), self-declared prefixed catalog identity
