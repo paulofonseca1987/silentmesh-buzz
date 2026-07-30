@@ -440,7 +440,7 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
     // leaves the cell empty on error so the next `session/new` call retries). On
     // discovery failure the fallback is used for the immediate response without
     // being written to the cell.
-    let available_models: Vec<Value> = {
+    let (current_model_id, available_models): (String, Vec<Value>) = {
         use crate::config::Provider;
         match app.cfg.provider {
             Provider::Databricks | Provider::DatabricksV2 => {
@@ -451,12 +451,32 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
                     discover_databricks_models(&app.cfg),
                 )
                 .await;
-                models
-                    .iter()
-                    .map(|m| json!({ "modelId": m.id, "name": m.name }))
-                    .collect()
+                (
+                    app.cfg.model.clone(),
+                    models
+                        .iter()
+                        .map(|m| json!({ "modelId": m.id, "name": m.name }))
+                        .collect(),
+                )
             }
-            _ => vec![json!({ "modelId": app.cfg.model, "name": app.cfg.model })],
+            // Ollama advertises the persona-prefixed id as its catalog
+            // identity — a SELF-DECLARATION that this model is served by the
+            // local runtime. The harness's tier gate only relaxes for a
+            // Local-class prefix when the agent's catalog carries it exactly
+            // (no bare alias: a bare pick would strip the provider from
+            // `desired_model` and lock the agent out of owned/private tiers).
+            // The prefix is stripped again at the wire (see `wire_model`).
+            Provider::Ollama => {
+                let prefixed = format!("ollama:{}", app.cfg.model);
+                (
+                    prefixed.clone(),
+                    vec![json!({ "modelId": prefixed, "name": app.cfg.model })],
+                )
+            }
+            _ => (
+                app.cfg.model.clone(),
+                vec![json!({ "modelId": app.cfg.model, "name": app.cfg.model })],
+            ),
         }
     };
 
@@ -467,7 +487,7 @@ async fn session_new(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSen
             json!({
                 "sessionId": session_id,
                 "models": {
-                    "currentModelId": app.cfg.model,
+                    "currentModelId": current_model_id,
                     "availableModels": available_models,
                 },
             }),
@@ -667,9 +687,18 @@ async fn run_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender
     )
     .await;
     // Resolve effective model: session override wins over config default.
+    // For Ollama, the catalog identity is the persona-prefixed
+    // "ollama:<model>" (see the session/new advertisement), so a
+    // `session/set_model` override may arrive prefixed — strip it back to
+    // the bare id the local server serves before it reaches the wire body.
     let effective_model_str = effective_model_override
         .as_deref()
         .unwrap_or(&app.cfg.model);
+    let effective_model_str = if app.cfg.provider == crate::config::Provider::Ollama {
+        crate::config::strip_ollama_prefix(effective_model_str)
+    } else {
+        effective_model_str
+    };
     let mut turn_input_tokens: Option<u64> = None;
     let mut turn_output_tokens: Option<u64> = None;
     let mut ctx = RunCtx {

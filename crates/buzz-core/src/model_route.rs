@@ -225,6 +225,32 @@ pub fn allowed_backends(tier: ChannelTier, purpose: InferencePurpose) -> Vec<Bac
         .collect()
 }
 
+/// Whether `prefix` is a recognized persona model-provider prefix (the
+/// `provider` half of `"provider:model-id"`).
+///
+/// Needed because the persona split is ambiguous: model ids themselves may
+/// contain `:` (an Ollama tag like `llama3.2:3b`), so a consumer must only
+/// treat the pre-colon segment as a provider when it names one we know.
+/// Covers the vendor providers seen in the ecosystem plus every
+/// local/TEE runtime [`provider_to_backend`] classifies.
+pub fn is_known_provider_prefix(prefix: &str) -> bool {
+    matches!(
+        prefix.trim().to_ascii_lowercase().as_str(),
+        "anthropic"
+            | "openai"
+            | "openai-compat"
+            | "databricks"
+            | "databricks-v2"
+            | "databricks_v2"
+            | "local"
+            | "ollama"
+            | "vllm"
+            | "llamacpp"
+            | "llama-cpp"
+            | "tee"
+    )
+}
+
 /// Classify an agent's configured model **provider** — the `provider` half of
 /// a persona's `"provider:model-id"` string (see
 /// `buzz_persona::persona::split_model`) — into the [`Backend`] that serves
@@ -421,6 +447,28 @@ mod tests {
         let local = provider_to_backend(Some("ollama"));
         for tier in TIERS {
             assert!(route(tier, local, AgentTurn).is_allowed(), "{tier}");
+        }
+    }
+
+    #[test]
+    fn known_provider_prefixes_cover_vendors_and_local_runtimes() {
+        for p in [
+            "anthropic",
+            "openai",
+            "databricks",
+            "ollama",
+            "local",
+            "vllm",
+            "llamacpp",
+            "tee",
+            " Ollama ", // trimmed + case-insensitive
+        ] {
+            assert!(is_known_provider_prefix(p), "{p}");
+        }
+        // Model-tag segments and arbitrary strings are NOT providers — this
+        // is what stops "llama3.2:3b" being split as provider "llama3.2".
+        for p in ["llama3.2", "3b", "claude", "gpt-4o", ""] {
+            assert!(!is_known_provider_prefix(p), "{p}");
         }
     }
 

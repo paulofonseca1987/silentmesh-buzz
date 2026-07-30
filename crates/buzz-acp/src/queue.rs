@@ -1152,8 +1152,11 @@ pub(crate) fn format_event_block(
 /// top level.
 fn append_reply_instruction(s: &mut String, event_id: &str) {
     s.push_str(&format!(
-        "\nIMPORTANT: For ordinary replies in this turn, use `--reply-to {event_id}` \
-         on `buzz messages send` so the conversation stays threaded. \
+        "\nIMPORTANT: To reply, you must EXECUTE the `buzz` CLI through your \
+         shell tool — plain-text answers are discarded, never delivered. For \
+         ordinary replies in this turn run:\n\
+         `buzz messages send --channel <channel-uuid> --reply-to {event_id} --content \"<your reply>\"`\n\
+         so the conversation stays threaded. \
          If the human explicitly asks for a channel-root, top-level, \
          or broadcast post, send that message without `--reply-to`. \
          If the requested destination is ambiguous, ask before sending."
@@ -1167,11 +1170,14 @@ fn append_reply_instruction(s: &mut String, event_id: &str) {
 /// choice open) prevents replying into a stale/unrelated prior thread.
 fn append_new_thread_reply_instruction(s: &mut String, event_id: &str) {
     s.push_str(&format!(
-        "\nIMPORTANT: This is a new top-level message. For ordinary replies in \
-         this turn, use `--reply-to {event_id}` on `buzz messages send` — the \
-         triggering message is the thread root. Do NOT reply into any other \
-         (older) thread. If the human explicitly asks for a channel-root, \
-         top-level, or broadcast post, send that message without `--reply-to`."
+        "\nIMPORTANT: This is a new top-level message. To reply, you must \
+         EXECUTE the `buzz` CLI through your shell tool — plain-text answers \
+         are discarded, never delivered. For ordinary replies in this turn run:\n\
+         `buzz messages send --channel <channel-uuid> --reply-to {event_id} --content \"<your reply>\"`\n\
+         — the triggering message is the thread root. Do NOT reply into any \
+         other (older) thread. If the human explicitly asks for a \
+         channel-root, top-level, or broadcast post, send that message \
+         without `--reply-to`."
     ));
 }
 

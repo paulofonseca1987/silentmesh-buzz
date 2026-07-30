@@ -671,6 +671,13 @@ pub enum Provider {
     /// Databricks AI Gateway v2. Routes by model family through the gateway's
     /// OpenAI Responses, Anthropic Messages, or MLflow Chat Completions paths.
     DatabricksV2,
+    /// Local Ollama server (Silent Mesh D16 `local` backend class). Speaks the
+    /// OpenAI Chat Completions dialect at `{base_url}/chat/completions`
+    /// (default `http://127.0.0.1:11434/v1`) — reuses the OpenAI body builder
+    /// and parser. No API key required: Ollama ignores auth, so a placeholder
+    /// bearer is sent. Zero egress when the base URL is loopback (the
+    /// default).
+    Ollama,
 }
 
 /// Which OpenAI-family HTTP API to call. Set via `OPENAI_COMPAT_API`
@@ -789,6 +796,24 @@ impl Config {
                     .ok_or_else(|| "config: DATABRICKS_MODEL required".to_string())?,
                 databricks_host.ok_or_else(|| "config: DATABRICKS_HOST required".to_string())?,
                 OpenAiApi::Chat, // only read by OpenAI/legacy Databricks dispatch
+            ),
+            Provider::Ollama => (
+                // Ollama ignores auth; a placeholder keeps the unconditional
+                // bearer header well-formed. Overridable for proxied setups.
+                env("OLLAMA_API_KEY").unwrap_or_else(|| "ollama".to_owned()),
+                resolve_model(
+                    // The persona/desktop env projection may deliver either
+                    // the bare model id or the persona-prefixed "ollama:<id>"
+                    // form — strip the prefix so the wire model is what the
+                    // local server actually serves.
+                    buzz_agent_model.as_deref().map(strip_ollama_prefix),
+                    env("OLLAMA_MODEL").as_deref().map(strip_ollama_prefix),
+                )
+                .ok_or_else(|| "config: OLLAMA_MODEL required".to_string())?,
+                env_or("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1"),
+                // Ollama has no Responses API — pin the Chat dialect so the
+                // Auto host-detection and chat→responses upgrade never apply.
+                OpenAiApi::Chat,
             ),
         };
         let system_prompt = match (env("BUZZ_AGENT_SYSTEM_PROMPT"), env("BUZZ_AGENT_SYSTEM_PROMPT_FILE")) {
@@ -985,6 +1010,22 @@ fn resolve_model(
     explicit_override.or(provider_default).map(str::to_owned)
 }
 
+/// Strip a leading `ollama:` persona-provider prefix from a model id.
+///
+/// Buzz personas name models `"provider:model-id"`; the env projection
+/// usually delivers the bare id, but the prefixed form can arrive when the
+/// operator sets `BUZZ_AGENT_MODEL` by hand from a persona string. The wire
+/// model must be the bare id the local server serves (`llama3.2:3b` — note
+/// Ollama tags themselves contain `:`, so only the known provider prefix is
+/// stripped, case-insensitively).
+pub(crate) fn strip_ollama_prefix(model: &str) -> &str {
+    let trimmed = model.trim();
+    match trimmed.split_once(':') {
+        Some((prefix, rest)) if prefix.eq_ignore_ascii_case("ollama") && !rest.is_empty() => rest,
+        _ => trimmed,
+    }
+}
+
 fn present_nonempty(v: Option<&str>) -> bool {
     v.map(str::trim).is_some_and(|s| !s.is_empty())
 }
@@ -1008,6 +1049,9 @@ fn resolve_provider(
                 ),
                 "databricks" => Ok(Provider::Databricks),
                 "databricks_v2" | "databricks-v2" => Ok(Provider::DatabricksV2),
+                // No API key gate: Ollama ignores auth (mirrors databricks,
+                // whose token is optional).
+                "ollama" => Ok(Provider::Ollama),
                 _ => Err(format!(
                     "config: BUZZ_AGENT_PROVIDER={raw} not supported"
                 )),
@@ -1271,6 +1315,33 @@ mod tests {
     fn resolve_provider_unsupported_error_preserves_user_casing() {
         let err = resolve_provider(Some("OpenAIish"), None, None).unwrap_err();
         assert!(err.contains("BUZZ_AGENT_PROVIDER=OpenAIish"));
+    }
+
+    #[test]
+    fn resolve_provider_ollama_needs_no_api_key() {
+        // Mirrors databricks: the local server ignores auth, so no key gate.
+        assert_eq!(
+            resolve_provider(Some("ollama"), None, None).unwrap(),
+            Provider::Ollama
+        );
+        assert_eq!(
+            resolve_provider(Some("OLLAMA"), None, None).unwrap(),
+            Provider::Ollama
+        );
+    }
+
+    #[test]
+    fn strip_ollama_prefix_handles_prefixed_bare_and_tagged_ids() {
+        // Persona-prefixed forms lose the provider segment.
+        assert_eq!(strip_ollama_prefix("ollama:llama3.2"), "llama3.2");
+        assert_eq!(strip_ollama_prefix("ollama:llama3.2:3b"), "llama3.2:3b");
+        assert_eq!(strip_ollama_prefix("Ollama:qwen2.5"), "qwen2.5");
+        // Bare ids — including colon-bearing Ollama tags — pass through.
+        assert_eq!(strip_ollama_prefix("llama3.2"), "llama3.2");
+        assert_eq!(strip_ollama_prefix("llama3.2:3b"), "llama3.2:3b");
+        // Degenerate "ollama:" keeps the original (empty rest is no model).
+        assert_eq!(strip_ollama_prefix("ollama:"), "ollama:");
+        assert_eq!(strip_ollama_prefix("  ollama:x  "), "x");
     }
 
     #[test]

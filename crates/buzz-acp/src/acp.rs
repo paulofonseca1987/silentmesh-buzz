@@ -2460,6 +2460,45 @@ pub fn resolve_model_switch_method(
     session_new_result: &serde_json::Value,
     desired_model: &str,
 ) -> Option<ModelSwitchMethod> {
+    // Persona model strings are "provider:model-id" (e.g. "ollama:llama3.2"),
+    // but agents advertise the bare ids they actually serve. Try the exact
+    // string first (agents that advertise prefixed ids), then fall back to
+    // the provider-stripped id. The resolved method carries whichever id the
+    // AGENT advertised, so the set request is always one it understands —
+    // while the tier gate keeps classifying from the full prefixed string.
+    if let Some(method) = resolve_model_switch_method_exact(session_new_result, desired_model) {
+        return Some(method);
+    }
+    match buzz_persona::persona::split_model(desired_model) {
+        // Only treat the pre-colon segment as a provider when it names one we
+        // know — Ollama tags themselves contain `:` ("llama3.2:3b"), and
+        // stripping an arbitrary segment could false-match another model.
+        //
+        // And only strip VENDOR-class prefixes. A confirmed switch is the
+        // tier gate's proof that "the model the gate classified is in
+        // effect" — for a Local/TEE prefix that classification *relaxes* the
+        // gate, so the provider half must be SELF-DECLARED by the agent (an
+        // exact match on the prefixed id it advertises), never inferred by
+        // stripping: "ollama:claude-x" must not confirm against a
+        // vendor-served agent advertising bare "claude-x". Vendor prefixes
+        // can't relax anything (Vendor is the most-restricted class), so
+        // "anthropic:X" matching an advertised bare "X" is safe convenience.
+        (Some(prefix), bare)
+            if buzz_core::model_route::is_known_provider_prefix(prefix)
+                && buzz_core::model_route::provider_to_backend(Some(prefix))
+                    == buzz_core::model_route::Backend::Vendor
+                && bare != desired_model =>
+        {
+            resolve_model_switch_method_exact(session_new_result, bare)
+        }
+        _ => None,
+    }
+}
+
+fn resolve_model_switch_method_exact(
+    session_new_result: &serde_json::Value,
+    desired_model: &str,
+) -> Option<ModelSwitchMethod> {
     // 1. Search stable configOptions for a "model"-category entry whose
     //    options contain a value matching desired_model.
     for config_opt in extract_model_config_options(session_new_result) {
@@ -2510,6 +2549,31 @@ pub fn resolve_model_switch_method(
 /// [`AgentModelCapabilities`](crate::pool::AgentModelCapabilities) caches — the
 /// idle-path pre-cancel guard has those halves, not the full `session/new` JSON.
 pub fn model_in_catalog(
+    config_options: &[serde_json::Value],
+    available_models: Option<&serde_json::Value>,
+    desired_model: &str,
+) -> bool {
+    if model_in_catalog_exact(config_options, available_models, desired_model) {
+        return true;
+    }
+    // Same persona-prefix fallback as `resolve_model_switch_method`, with the
+    // same restriction: only VENDOR-class prefixes may match an agent's bare
+    // advertised id — Local/TEE prefixes must be self-declared by the agent
+    // (see the rationale there).
+    match buzz_persona::persona::split_model(desired_model) {
+        (Some(prefix), bare)
+            if buzz_core::model_route::is_known_provider_prefix(prefix)
+                && buzz_core::model_route::provider_to_backend(Some(prefix))
+                    == buzz_core::model_route::Backend::Vendor
+                && bare != desired_model =>
+        {
+            model_in_catalog_exact(config_options, available_models, bare)
+        }
+        _ => false,
+    }
+}
+
+fn model_in_catalog_exact(
     config_options: &[serde_json::Value],
     available_models: Option<&serde_json::Value>,
     desired_model: &str,
@@ -3074,6 +3138,104 @@ mod tests {
                 option_value: "opus[1m]".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn resolve_strips_vendor_prefixes_only_and_requires_self_declared_local_ids() {
+        // Vendor prefixes strip to match bare advertised ids — harmless
+        // convenience, Vendor never relaxes the tier gate.
+        let result = serde_json::json!({
+            "models": {
+                "currentModelId": "claude-sonnet-4-20250514",
+                "availableModels": [ { "modelId": "claude-sonnet-4-20250514", "name": "c" } ]
+            }
+        });
+        assert_eq!(
+            super::resolve_model_switch_method(&result, "anthropic:claude-sonnet-4-20250514"),
+            Some(super::ModelSwitchMethod::SetModel {
+                model_id: "claude-sonnet-4-20250514".to_string(),
+            })
+        );
+        // A LOCAL-class prefix must NOT strip: "ollama:X" confirming against
+        // an agent that only advertises bare "X" would let a vendor-served
+        // agent satisfy the tier gate's verified-switch check while the
+        // prefix classifies the turn Local (the slice-2 egress leak, again).
+        let bare_only = serde_json::json!({
+            "models": {
+                "currentModelId": "llama3.2:3b",
+                "availableModels": [ { "modelId": "llama3.2:3b", "name": "llama3.2:3b" } ]
+            }
+        });
+        assert_eq!(
+            super::resolve_model_switch_method(&bare_only, "ollama:llama3.2:3b"),
+            None,
+            "local-class prefixes must be self-declared by the agent, not stripped"
+        );
+        // The self-declared path: an Ollama agent advertises the PREFIXED id
+        // as its catalog identity, and the exact match confirms it.
+        let self_declared = serde_json::json!({
+            "models": {
+                "currentModelId": "ollama:llama3.2:3b",
+                "availableModels": [ { "modelId": "ollama:llama3.2:3b", "name": "llama3.2:3b" } ]
+            }
+        });
+        assert_eq!(
+            super::resolve_model_switch_method(&self_declared, "ollama:llama3.2:3b"),
+            Some(super::ModelSwitchMethod::SetModel {
+                model_id: "ollama:llama3.2:3b".to_string(),
+            })
+        );
+        // An UNKNOWN prefix must not strip: a bare Ollama tag's own colon
+        // ("llama3.2:3b") is not a provider, and stripping it could
+        // false-match a model literally named "3b".
+        let trap = serde_json::json!({
+            "models": {
+                "currentModelId": "3b",
+                "availableModels": [ { "modelId": "3b", "name": "3b" } ]
+            }
+        });
+        assert_eq!(
+            super::resolve_model_switch_method(&trap, "llama3.2:3b"),
+            None,
+            "bare tag colon must not be treated as a provider prefix"
+        );
+    }
+
+    #[test]
+    fn model_in_catalog_applies_the_same_vendor_only_fallback() {
+        // Vendor prefix strips.
+        let vendor = serde_json::json!({
+            "availableModels": [ { "modelId": "gpt-5", "name": "gpt-5" } ]
+        });
+        assert!(super::model_in_catalog(&[], Some(&vendor), "openai:gpt-5"));
+        // Local prefix does NOT strip; the self-declared prefixed id matches
+        // exactly.
+        let bare_only = serde_json::json!({
+            "availableModels": [ { "modelId": "llama3.2:3b", "name": "llama3.2:3b" } ]
+        });
+        assert!(super::model_in_catalog(
+            &[],
+            Some(&bare_only),
+            "llama3.2:3b"
+        ));
+        assert!(!super::model_in_catalog(
+            &[],
+            Some(&bare_only),
+            "ollama:llama3.2:3b"
+        ));
+        let self_declared = serde_json::json!({
+            "availableModels": [ { "modelId": "ollama:llama3.2:3b", "name": "llama3.2:3b" } ]
+        });
+        assert!(super::model_in_catalog(
+            &[],
+            Some(&self_declared),
+            "ollama:llama3.2:3b"
+        ));
+        // Unknown prefix does not strip.
+        let trap = serde_json::json!({
+            "availableModels": [ { "modelId": "3b", "name": "3b" } ]
+        });
+        assert!(!super::model_in_catalog(&[], Some(&trap), "llama3.2:3b"));
     }
 
     #[test]

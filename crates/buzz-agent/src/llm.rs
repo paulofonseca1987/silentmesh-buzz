@@ -146,7 +146,7 @@ impl Llm {
                     .await?;
                 parse_anthropic(v)
             }
-            Provider::OpenAi | Provider::Databricks => {
+            Provider::OpenAi | Provider::Databricks | Provider::Ollama => {
                 self.openai_request(
                     cfg,
                     effective_model,
@@ -248,7 +248,7 @@ impl Llm {
                 });
                 Ok(parse_anthropic(self.post_anthropic(cfg, &body).await?)?.text)
             }
-            Provider::OpenAi | Provider::Databricks => {
+            Provider::OpenAi | Provider::Databricks | Provider::Ollama => {
                 let r = self
                     .openai_request(
                         cfg,
@@ -1528,7 +1528,7 @@ where
 ///   flow; subsequent requests use the cache + refresh transparently.
 pub(crate) fn build_token_source(cfg: &Config) -> Result<Arc<dyn TokenSource>, AgentError> {
     match cfg.provider {
-        Provider::Anthropic | Provider::OpenAi => {
+        Provider::Anthropic | Provider::OpenAi | Provider::Ollama => {
             Ok(Arc::new(StaticTokenSource::new(cfg.api_key.clone())))
         }
         Provider::Databricks | Provider::DatabricksV2 => {
