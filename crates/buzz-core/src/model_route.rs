@@ -225,6 +225,38 @@ pub fn allowed_backends(tier: ChannelTier, purpose: InferencePurpose) -> Vec<Bac
         .collect()
 }
 
+/// Classify an agent's configured model **provider** — the `provider` half of
+/// a persona's `"provider:model-id"` string (see
+/// `buzz_persona::persona::split_model`) — into the [`Backend`] that serves
+/// it, so the harness can enforce the channel tier at the turn boundary.
+///
+/// Only providers we can *prove* keep content off third-party infrastructure
+/// map to [`Backend::Local`] (client-local / workspace-GPU runtimes) or
+/// [`Backend::Tee`]. **Everything else — including an absent (`None`) or
+/// unrecognized provider — is [`Backend::Vendor`]**, the most egress-exposed
+/// class. This is deliberately *fail-closed*: an unclassifiable model is
+/// refused in owned/private channels rather than silently permitted to
+/// egress. As real local/TEE backends land (Phase 3), their provider strings
+/// join the match arms below.
+///
+/// Matching is case-insensitive and ignores surrounding whitespace.
+pub fn provider_to_backend(provider: Option<&str>) -> Backend {
+    let Some(provider) = provider else {
+        // No provider prefix: the agent runs its built-in default, which we
+        // cannot prove is local. Fail closed to the most egress-exposed class.
+        return Backend::Vendor;
+    };
+    match provider.trim().to_ascii_lowercase().as_str() {
+        // Zero-egress: client-local or workspace-GPU inference runtimes.
+        "local" | "ollama" | "vllm" | "llamacpp" | "llama-cpp" => Backend::Local,
+        // Attested confidential compute.
+        "tee" => Backend::Tee,
+        // Cleartext third-party egress: anthropic, openai, databricks, and any
+        // other or unrecognized provider.
+        _ => Backend::Vendor,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +378,50 @@ mod tests {
             allowed_backends(Open, InferencePurpose::Copilot),
             vec![Backend::Local]
         );
+    }
+
+    #[test]
+    fn provider_to_backend_maps_known_and_fails_closed() {
+        use InferencePurpose::AgentTurn;
+
+        // Known third-party vendors → Vendor.
+        for p in ["anthropic", "openai", "databricks"] {
+            assert_eq!(provider_to_backend(Some(p)), Backend::Vendor, "{p}");
+        }
+        // Known zero-egress runtimes → Local.
+        for p in ["local", "ollama", "vllm", "llamacpp", "llama-cpp"] {
+            assert_eq!(provider_to_backend(Some(p)), Backend::Local, "{p}");
+        }
+        // TEE sentinel → Tee.
+        assert_eq!(provider_to_backend(Some("tee")), Backend::Tee);
+        // Case-insensitive + whitespace-trimmed. The trim/case probes must
+        // target a NON-Vendor arm — an unmatched string falls through to
+        // Vendor anyway, so only a Local-mapping probe can catch a dropped
+        // `.trim()`/`to_ascii_lowercase()`.
+        assert_eq!(provider_to_backend(Some("  ollama ")), Backend::Local);
+        assert_eq!(provider_to_backend(Some("Ollama")), Backend::Local);
+        assert_eq!(provider_to_backend(Some(" TEE ")), Backend::Tee);
+        // Unknown provider and an absent provider both fail closed to Vendor.
+        assert_eq!(provider_to_backend(Some("acme-cloud")), Backend::Vendor);
+        assert_eq!(provider_to_backend(None), Backend::Vendor);
+
+        // End-to-end at the policy layer: a vendor-backed agent turn is
+        // refused in owned/private channels and allowed only in open.
+        let vendor = provider_to_backend(Some("anthropic"));
+        assert!(matches!(
+            route(Owned, vendor, AgentTurn),
+            RouteDecision::Refuse(RefuseReason::BelowChannelMinimum { .. })
+        ));
+        assert!(matches!(
+            route(Private, vendor, AgentTurn),
+            RouteDecision::Refuse(RefuseReason::BelowChannelMinimum { .. })
+        ));
+        assert!(route(Open, vendor, AgentTurn).is_allowed());
+        // A local-backed turn is allowed at every tier.
+        let local = provider_to_backend(Some("ollama"));
+        for tier in TIERS {
+            assert!(route(tier, local, AgentTurn).is_allowed(), "{tier}");
+        }
     }
 
     #[test]

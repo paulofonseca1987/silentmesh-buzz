@@ -113,6 +113,7 @@ const GATED_OBSERVER_QUEUE_CAP: usize = 256;
 
 use std::time::Instant;
 
+use buzz_core::channel::ChannelTier;
 use buzz_core::kind::{
     KIND_AGENT_OBSERVER_FRAME, KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION,
     KIND_TYPING_INDICATOR,
@@ -133,6 +134,9 @@ use crate::config::ChannelFilter;
 pub struct ChannelInfo {
     pub name: String,
     pub channel_type: String,
+    /// Immutable privacy tier (D24), parsed from the kind:39000 `tier` tag.
+    /// Absent/unparseable ⇒ [`ChannelTier::Owned`] — see [`tier_from_tags`].
+    pub tier: ChannelTier,
 }
 
 pub(crate) fn channel_type_from_tags(tags: &[serde_json::Value]) -> String {
@@ -158,6 +162,31 @@ pub(crate) fn channel_type_from_tags(tags: &[serde_json::Value]) -> String {
     }
 }
 
+/// Parse the immutable privacy tier (D24) from kind:39000 metadata tags.
+///
+/// The relay stamps every channel-metadata event with a `["tier", <tier>]`
+/// tag (`owned`/`private`/`open`). A missing or unparseable tag yields
+/// [`ChannelTier::Owned`] — the most restrictive tier — so the harness's
+/// tier gate **fails closed**: it never assumes the loosest tier for a
+/// channel whose tier it cannot read. (This deliberately differs from the
+/// relay's *creation* default of `open`; that decides what tier a new
+/// channel gets, whereas here we decide what to assume for *enforcement*
+/// under uncertainty, where the safe assumption is the opposite.)
+pub(crate) fn tier_from_tags(tags: &[serde_json::Value]) -> ChannelTier {
+    for tag in tags {
+        if let Some(arr) = tag.as_array() {
+            if arr.first().and_then(|v| v.as_str()) == Some("tier") {
+                return arr
+                    .get(1)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(ChannelTier::Owned);
+            }
+        }
+    }
+    ChannelTier::Owned
+}
+
 /// Build the discovered-channel subscribe set from the membership UUIDs and the
 /// kind:39000 metadata events, **skipping any channel flagged `archived=true`**.
 ///
@@ -172,7 +201,7 @@ pub(crate) fn merge_discovered_channels(
     channel_uuids: Vec<Uuid>,
     meta_events: &serde_json::Value,
 ) -> HashMap<Uuid, ChannelInfo> {
-    let mut meta_map: HashMap<Uuid, (String, String)> = HashMap::new();
+    let mut meta_map: HashMap<Uuid, (String, String, ChannelTier)> = HashMap::new();
     let mut archived: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     if let Some(arr) = meta_events.as_array() {
         for ev in arr {
@@ -203,7 +232,8 @@ pub(crate) fn merge_discovered_channels(
                     }
                     let ch_name = name.unwrap_or("unknown").to_string();
                     let ch_type = channel_type_from_tags(tags);
-                    meta_map.insert(uuid, (ch_name, ch_type));
+                    let ch_tier = tier_from_tags(tags);
+                    meta_map.insert(uuid, (ch_name, ch_type, ch_tier));
                 }
             }
         }
@@ -214,10 +244,23 @@ pub(crate) fn merge_discovered_channels(
         if archived.contains(&uuid) {
             continue;
         }
-        let (name, channel_type) = meta_map
-            .remove(&uuid)
-            .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
-        map.insert(uuid, ChannelInfo { name, channel_type });
+        let (name, channel_type, tier) = meta_map.remove(&uuid).unwrap_or_else(|| {
+            // No metadata event for this channel — fail closed to the most
+            // restrictive tier so the gate never assumes `open` on a blind spot.
+            (
+                "unknown".to_string(),
+                "unknown".to_string(),
+                ChannelTier::Owned,
+            )
+        });
+        map.insert(
+            uuid,
+            ChannelInfo {
+                name,
+                channel_type,
+                tier,
+            },
+        );
     }
     map
 }
@@ -4158,6 +4201,36 @@ mod tests {
         let channel = Uuid::new_v4();
         let map = merge_discovered_channels(vec![channel], &serde_json::json!([]));
         assert_eq!(map[&channel].channel_type, "unknown");
+        // Fail-closed: a channel with no metadata gets the most restrictive tier.
+        assert_eq!(map[&channel].tier, ChannelTier::Owned);
+    }
+
+    #[test]
+    fn tier_from_tags_parses_known_and_fails_closed() {
+        let t = |v: &str| tier_from_tags(&[serde_json::json!(["tier", v])]);
+        assert_eq!(t("owned"), ChannelTier::Owned);
+        assert_eq!(t("private"), ChannelTier::Private);
+        assert_eq!(t("open"), ChannelTier::Open);
+        // Unknown value, absent tag, and a non-tier tag all fail closed to Owned.
+        assert_eq!(t("bogus"), ChannelTier::Owned);
+        assert_eq!(tier_from_tags(&[]), ChannelTier::Owned);
+        assert_eq!(
+            tier_from_tags(&[serde_json::json!(["name", "x"])]),
+            ChannelTier::Owned
+        );
+    }
+
+    #[test]
+    fn merge_discovered_channels_parses_tier_from_metadata() {
+        let owned = Uuid::new_v4();
+        let open = Uuid::new_v4();
+        let meta = serde_json::json!([
+            meta_event(owned, "secret", &["tier", "owned"]),
+            meta_event(open, "lobby", &["tier", "open"]),
+        ]);
+        let map = merge_discovered_channels(vec![owned, open], &meta);
+        assert_eq!(map[&owned].tier, ChannelTier::Owned);
+        assert_eq!(map[&open].tier, ChannelTier::Open);
     }
 
     #[test]

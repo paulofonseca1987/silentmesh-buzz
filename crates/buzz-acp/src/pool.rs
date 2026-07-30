@@ -28,6 +28,11 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use uuid::Uuid;
 
+use buzz_core::channel::ChannelTier;
+use buzz_core::model_route::{
+    provider_to_backend, route, InferencePurpose, RefuseReason, RouteDecision,
+};
+
 use crate::acp::{
     extract_model_config_options, extract_model_state, model_in_catalog,
     resolve_model_switch_method, AcpClient, AcpError, McpServer, ModelSwitchMethod, StopReason,
@@ -469,6 +474,7 @@ impl ChannelInfoResolver {
                     PromptChannelInfo {
                         name: info.name,
                         channel_type: info.channel_type,
+                        tier: info.tier,
                     },
                 ))
             })
@@ -862,16 +868,26 @@ async fn resolve_new_session_channel_context(
 /// Create a new ACP session via `session_new_full()`, populate model capabilities
 /// on the agent (first session only), and apply `desired_model` if set.
 ///
-/// On error from `session_new_full()`, returns the `AcpError` — caller handles
-/// error reporting. Model-switch failures are logged and gracefully ignored
-/// (the agent proceeds with its default model).
+/// Returns `(session_id, desired_model_verified)`. The bool answers the tier
+/// gate's question — "is the model I classified actually in effect?":
+/// * `desired_model == None` → `true`: nothing was declared, the gate already
+///   classified the agent's built-in default fail-closed (Vendor).
+/// * `desired_model == Some(_)` → `true` only when the subprocess **confirmed**
+///   the switch. Catalog misses and application-level switch failures return
+///   `false` — the agent silently runs its built-in default, a model the gate
+///   did *not* classify, so the caller must re-gate fail-closed before
+///   prompting (an unverified default egressing owned/private content is the
+///   exact leak the tier gate exists to prevent).
+///
+/// On error from `session_new_full()` (or a transport-class switch failure),
+/// returns the `AcpError` — caller handles error reporting.
 async fn create_session_and_apply_model(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
     agent_core: Option<&str>,
     agent_canvas: Option<&str>,
     channel_name: Option<&str>,
-) -> Result<String, AcpError> {
+) -> Result<(String, bool), AcpError> {
     // Build base_prompt + system_prompt + agent core + canvas metadata into a
     // single prompt. Standard protocol-v2 agents receive it in `session/new`;
     // Goose receives it through the custom request below. Legacy agents receive
@@ -938,13 +954,13 @@ async fn create_session_and_apply_model(
     }
 
     // Apply desired_model if set, matching against the fresh session/new response.
-    // Track whether the switch succeeded so session_config_captured reflects
-    // the post-switch state (not the pre-switch desired state).
+    // Track whether the switch was CONFIRMED applied: session_config_captured
+    // reflects the post-switch state, and the tier gate's re-check (see the
+    // caller) fails closed when the agent silently fell back to its default.
     let switch_succeeded = if let Some(ref desired) = agent.desired_model {
         match resolve_model_switch_method(&resp.raw, desired) {
             Some(method) => {
-                apply_model_switch(&mut agent.acp, &resp.session_id, desired, &method).await?;
-                true
+                apply_model_switch(&mut agent.acp, &resp.session_id, desired, &method).await?
             }
             None => {
                 tracing::warn!(
@@ -998,21 +1014,27 @@ async fn create_session_and_apply_model(
         apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
     }
 
-    Ok(resp.session_id)
+    // No declared model ⇒ the gate already classified the default fail-closed;
+    // a declared model is verified only by a confirmed switch.
+    let desired_model_verified = agent.desired_model.is_none() || switch_succeeded;
+    Ok((resp.session_id, desired_model_verified))
 }
 
 /// Send the appropriate ACP model-switch request with a timeout.
 ///
-/// On timeout or error, logs a warning and returns — the caller proceeds
-/// with the agent's default model. This is intentionally non-fatal: a stale
-/// response from a timed-out request is safely ignored by `read_until_response`
+/// Returns `Ok(true)` when the agent confirmed the switch, `Ok(false)` when
+/// an application-level error left the agent on its **default model** (the
+/// caller proceeds, but must not claim the declared model is in effect —
+/// the tier gate fails closed on that gap). Transport-class errors and
+/// timeouts propagate as `Err` so the caller can respawn: a stale response
+/// from a timed-out request is safely ignored by `read_until_response`
 /// (non-matching JSON-RPC IDs are skipped).
 async fn apply_model_switch(
     acp: &mut AcpClient,
     session_id: &str,
     desired: &str,
     method: &ModelSwitchMethod,
-) -> Result<(), AcpError> {
+) -> Result<bool, AcpError> {
     let method_label = match method {
         ModelSwitchMethod::ConfigOption { config_id, .. } => {
             format!("configOption (configId={config_id})")
@@ -1042,6 +1064,7 @@ async fn apply_model_switch(
                 target: "pool::model",
                 "applied model {desired} via {method_label} on session {session_id}"
             );
+            Ok(true)
         }
         // Transport-class errors may have corrupted the stdio stream — propagate
         // so the caller can respawn the agent instead of reusing a poisoned one.
@@ -1054,14 +1077,16 @@ async fn apply_model_switch(
                 target: "pool::model",
                 "fatal error setting model {desired} via {method_label}: {e}"
             );
-            return Err(e);
+            Err(e)
         }
-        // Application-level errors (Json, etc.) — agent is fine, just uses default model.
+        // Application-level errors (Json, etc.) — agent is fine, just uses the
+        // default model. Ok(false): the declared model is NOT in effect.
         Ok(Err(e)) => {
             tracing::warn!(
                 target: "pool::model",
                 "failed to set model {desired} via {method_label}: {e} — proceeding with agent default"
             );
+            Ok(false)
         }
         Err(_) => {
             // Outer timeout fired — the inner send_request may have left the
@@ -1070,10 +1095,9 @@ async fn apply_model_switch(
                 target: "pool::model",
                 "model set via {method_label} timed out ({MODEL_SWITCH_TIMEOUT:?}) — treating as fatal"
             );
-            return Err(AcpError::Timeout(MODEL_SWITCH_TIMEOUT));
+            Err(AcpError::Timeout(MODEL_SWITCH_TIMEOUT))
         }
     }
-    Ok(())
 }
 
 /// Set the session permission mode via `session/set_config_option`.
@@ -1421,6 +1445,62 @@ pub async fn run_prompt_task(
         .unwrap_or_default();
     let _reaction_guard = ReactionGuard::new(ctx.rest_client.clone(), reaction_ids.clone());
 
+    // ── Silent Mesh tier gate (D16/D24) ──────────────────────────────────
+    // Before any user content reaches the agent subprocess, refuse a channel
+    // turn whose configured model backend would egress below the channel's
+    // immutable privacy tier. Runs before session creation, so a refused turn
+    // never prompts the agent. Heartbeats carry no channel and are never
+    // gated. Fails closed on both inputs: an unresolvable tier is treated as
+    // `Owned` (see `tier_from_tags`) and an unclassifiable provider as
+    // `Vendor` (see `provider_to_backend`).
+    //
+    // The resolved tier is kept for the post-session re-check below: this
+    // first gate validates the *declared* model, and session creation can
+    // silently fall back to the agent's built-in default when the declared
+    // model isn't available — the re-check fails closed on that gap.
+    let mut gated_tier: Option<ChannelTier> = None;
+    if let PromptSource::Channel(channel_id) = &source {
+        let channel_id = *channel_id;
+        let tier = ctx
+            .channel_info
+            .resolve(channel_id)
+            .await
+            .map(|info| info.tier)
+            .unwrap_or(ChannelTier::Owned);
+        gated_tier = Some(tier);
+        if let RouteDecision::Refuse(reason) =
+            tier_gate_decision(tier, agent.desired_model.as_deref())
+        {
+            tracing::info!(
+                channel = %channel_id,
+                tier = %tier,
+                model = agent.desired_model.as_deref().unwrap_or("<agent-default>"),
+                "tier gate refused turn: {reason}"
+            );
+            let thread_tags = batch
+                .as_ref()
+                .and_then(|b| b.events.last())
+                .map(|be| crate::queue::parse_thread_tags(&be.event))
+                .unwrap_or_default();
+            post_failure_notice(
+                &ctx.rest_client,
+                channel_id,
+                &thread_tags,
+                &format_tier_refusal_notice(&reason),
+            )
+            .await;
+            send_prompt_result(
+                &result_tx,
+                &turn_id,
+                agent,
+                source,
+                PromptOutcome::Cancelled,
+                None,
+            );
+            return;
+        }
+    }
+
     //
     // Core memory is delivered inside the system prompt the harness already
     // builds (system role for protocol >= 2, the `[System]` user-message
@@ -1556,7 +1636,52 @@ pub async fn run_prompt_task(
                 )
                 .await
                 {
-                    Ok(sid) => {
+                    Ok((sid, desired_model_verified)) => {
+                        // Tier-gate re-check (D16/D24): the pre-turn gate
+                        // validated the *declared* model, but the subprocess
+                        // can silently fall back to its built-in default when
+                        // that model isn't in its catalog or the switch fails
+                        // at the application level. The default is a model the
+                        // gate never classified — re-gate it fail-closed
+                        // (no declared model ⇒ Vendor). Refusing here still
+                        // precedes any prompt: no user content has reached the
+                        // subprocess. The session is deliberately NOT stored,
+                        // so a reused session can never be an unverified one.
+                        if !desired_model_verified {
+                            let tier = gated_tier.unwrap_or(ChannelTier::Owned);
+                            if let RouteDecision::Refuse(reason) = tier_gate_decision(tier, None) {
+                                tracing::warn!(
+                                    channel = %cid,
+                                    tier = %tier,
+                                    declared_model = agent.desired_model.as_deref().unwrap_or("<none>"),
+                                    "tier gate refused turn after model fallback: {reason}"
+                                );
+                                let thread_tags = batch
+                                    .as_ref()
+                                    .and_then(|b| b.events.last())
+                                    .map(|be| crate::queue::parse_thread_tags(&be.event))
+                                    .unwrap_or_default();
+                                post_failure_notice(
+                                    &ctx.rest_client,
+                                    *cid,
+                                    &thread_tags,
+                                    &format_model_fallback_refusal_notice(
+                                        agent.desired_model.as_deref(),
+                                        &reason,
+                                    ),
+                                )
+                                .await;
+                                send_prompt_result(
+                                    &result_tx,
+                                    &turn_id,
+                                    agent,
+                                    source,
+                                    PromptOutcome::Cancelled,
+                                    None,
+                                );
+                                return;
+                            }
+                        }
                         tracing::info!(
                             target: "pool::session",
                             "created session {sid} for channel {cid}"
@@ -1600,8 +1725,10 @@ pub async fn run_prompt_task(
             if let Some(sid) = &agent.state.heartbeat_session {
                 (sid.clone(), false)
             } else {
+                // Heartbeats are self-prompts with no channel content, so the
+                // tier gate (and its model-fallback re-check) does not apply.
                 match create_session_and_apply_model(&mut agent, &ctx, None, None, None).await {
-                    Ok(sid) => {
+                    Ok((sid, _)) => {
                         tracing::info!(
                             target: "pool::session",
                             "created heartbeat session {sid} for agent {}",
@@ -2344,9 +2471,11 @@ pub(crate) async fn fetch_channel_info(
                     }
                 }
                 let channel_type = crate::relay::channel_type_from_tags(tags);
+                let tier = crate::relay::tier_from_tags(tags);
                 Some(PromptChannelInfo {
                     name: name.unwrap_or(UNKNOWN_CHANNEL_NAME).to_string(),
                     channel_type,
+                    tier,
                 })
             }
             Ok(Err(e)) => {
@@ -3565,6 +3694,73 @@ pub(crate) async fn reaction_add(rest: &crate::relay::RestClient, event_id: &str
     }
 }
 
+/// The tier-gate decision for a channel turn: may an agent configured with
+/// `desired_model` (a persona `"provider:model-id"` string, or `None` for the
+/// agent's built-in default) run in a channel of `tier`?
+///
+/// Pure composition of `split_model` → [`provider_to_backend`] → [`route`],
+/// extracted from `run_prompt_task` so the gate's policy is unit-testable
+/// without a live turn. Both inputs fail closed: an absent/prefix-less model
+/// classifies as `Vendor`, so it is refused everywhere but `open`.
+fn tier_gate_decision(tier: ChannelTier, desired_model: Option<&str>) -> RouteDecision {
+    let provider = desired_model.and_then(|m| buzz_persona::persona::split_model(m).0);
+    let backend = provider_to_backend(provider);
+    route(tier, backend, InferencePurpose::AgentTurn)
+}
+
+/// User-facing wording for a tier-gate refusal (Silent Mesh D16/D24),
+/// posted to the channel as a kind:9 notice via [`post_failure_notice`].
+fn format_tier_refusal_notice(reason: &RefuseReason) -> String {
+    use buzz_core::model_route::allowed_backends;
+    match reason {
+        RefuseReason::BelowChannelMinimum { tier, backend } => {
+            let permitted = allowed_backends(*tier, InferencePurpose::AgentTurn)
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "⚠️ This turn was blocked by privacy-tier enforcement: a `{backend}` model \
+                 may not run in a `{tier}`-tier channel. Permitted here: {permitted}. \
+                 Switch this agent to a permitted backend to run in this channel."
+            )
+        }
+        RefuseReason::OwnedPinnedPurpose { purpose, backend } => format!(
+            "⚠️ This turn was blocked by privacy-tier enforcement: `{purpose}` inference is \
+             pinned to local-only and may not use a `{backend}` backend."
+        ),
+    }
+}
+
+/// User-facing wording for the post-session tier-gate re-check refusal: the
+/// declared model passed the gate, but the subprocess fell back to its
+/// built-in default, which the gate must treat as vendor-class.
+fn format_model_fallback_refusal_notice(declared: Option<&str>, reason: &RefuseReason) -> String {
+    use buzz_core::model_route::allowed_backends;
+    let declared = declared.unwrap_or("<none>");
+    let permitted_for = |tier: &ChannelTier| {
+        allowed_backends(*tier, InferencePurpose::AgentTurn)
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match reason {
+        RefuseReason::BelowChannelMinimum { tier, backend } => format!(
+            "⚠️ This turn was blocked by privacy-tier enforcement: the configured model \
+             `{declared}` isn't available to this agent, and its fallback default counts \
+             as a `{backend}` backend, which may not run in a `{tier}`-tier channel. \
+             Permitted here: {}.",
+            permitted_for(tier)
+        ),
+        RefuseReason::OwnedPinnedPurpose { purpose, backend } => format!(
+            "⚠️ This turn was blocked by privacy-tier enforcement: the configured model \
+             `{declared}` isn't available to this agent, and `{purpose}` inference may \
+             not fall back to a `{backend}` backend (local-only)."
+        ),
+    }
+}
+
 /// Best-effort: post a visible failure notice (kind:9) to a channel after a
 /// batch is dead-lettered. Replies into the thread of `thread_tags` when the
 /// triggering event was threaded. Errors are logged and swallowed — the
@@ -3727,6 +3923,93 @@ async fn clear_reactions(rest: crate::relay::RestClient, event_ids: Vec<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tier_gate_refuses_vendor_in_restricted_tiers_allows_local_everywhere() {
+        use ChannelTier::{Open, Owned, Private};
+
+        // A vendor model (the only provider class that ships today) may run
+        // only in an open channel; owned and private refuse it.
+        let vendor = Some("anthropic:claude-sonnet-4");
+        assert!(tier_gate_decision(Open, vendor).is_allowed());
+        assert!(matches!(
+            tier_gate_decision(Owned, vendor),
+            RouteDecision::Refuse(_)
+        ));
+        assert!(matches!(
+            tier_gate_decision(Private, vendor),
+            RouteDecision::Refuse(_)
+        ));
+
+        // A local runtime is allowed at every tier.
+        let local = Some("ollama:llama3");
+        for tier in [Owned, Private, Open] {
+            assert!(tier_gate_decision(tier, local).is_allowed(), "{tier}");
+        }
+
+        // Fail-closed inputs: no configured model (agent default) and a bare
+        // model id with no provider prefix both classify as Vendor, so they
+        // are refused in owned and allowed only in open.
+        assert!(matches!(
+            tier_gate_decision(Owned, None),
+            RouteDecision::Refuse(_)
+        ));
+        assert!(tier_gate_decision(Open, None).is_allowed());
+        assert!(matches!(
+            tier_gate_decision(Owned, Some("claude-sonnet-4")),
+            RouteDecision::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn model_fallback_regate_fails_closed_outside_open_channels() {
+        use ChannelTier::{Open, Owned, Private};
+
+        // The post-session re-check runs `tier_gate_decision(tier, None)`:
+        // an unverified fallback default is classified Vendor, so it is
+        // refused in owned/private and allowed only in open. This is the
+        // guard against a declared-local model silently falling back to the
+        // agent's built-in vendor default (the declared-vs-effective gap).
+        assert!(matches!(
+            tier_gate_decision(Owned, None),
+            RouteDecision::Refuse(RefuseReason::BelowChannelMinimum { .. })
+        ));
+        assert!(matches!(
+            tier_gate_decision(Private, None),
+            RouteDecision::Refuse(RefuseReason::BelowChannelMinimum { .. })
+        ));
+        assert!(tier_gate_decision(Open, None).is_allowed());
+    }
+
+    #[test]
+    fn model_fallback_notice_names_declared_model_and_tier() {
+        use ChannelTier::Owned;
+        let RouteDecision::Refuse(reason) = tier_gate_decision(Owned, None) else {
+            panic!("fallback in an owned channel must refuse");
+        };
+        let notice = format_model_fallback_refusal_notice(Some("ollama:llama3"), &reason);
+        assert!(notice.contains("ollama:llama3"), "notice: {notice}");
+        assert!(notice.contains("owned"), "notice: {notice}");
+        assert!(notice.contains("vendor"), "notice: {notice}");
+        // Owned permits only local — the guidance must say so.
+        assert!(notice.contains("local"), "notice: {notice}");
+    }
+
+    #[test]
+    fn tier_refusal_notice_names_tier_and_permitted_backends() {
+        use ChannelTier::Private;
+        let RouteDecision::Refuse(reason) =
+            tier_gate_decision(Private, Some("anthropic:claude-sonnet-4"))
+        else {
+            panic!("expected a refusal for a vendor model in a private channel");
+        };
+        let notice = format_tier_refusal_notice(&reason);
+        assert!(notice.contains("private"), "notice: {notice}");
+        assert!(notice.contains("vendor"), "notice: {notice}");
+        // Private permits local + tee — both must appear in the guidance.
+        assert!(notice.contains("local"), "notice: {notice}");
+        assert!(notice.contains("tee"), "notice: {notice}");
+    }
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use serde_json::json;
 

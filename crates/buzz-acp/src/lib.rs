@@ -4689,6 +4689,7 @@ mod author_gate_tests {
                 relay::ChannelInfo {
                     name: "dm".into(),
                     channel_type: "dm".into(),
+                    tier: buzz_core::channel::ChannelTier::Open,
                 },
             ),
             (
@@ -4696,6 +4697,7 @@ mod author_gate_tests {
                 relay::ChannelInfo {
                     name: "stream".into(),
                     channel_type: "stream".into(),
+                    tier: buzz_core::channel::ChannelTier::Open,
                 },
             ),
         ]);
@@ -4712,6 +4714,7 @@ mod author_gate_tests {
             relay::ChannelInfo {
                 name: "unknown".into(),
                 channel_type: "unknown".into(),
+                tier: buzz_core::channel::ChannelTier::Open,
             },
         )]);
         assert!(
