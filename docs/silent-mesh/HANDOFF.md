@@ -18,6 +18,30 @@ new session cannot learn from those.
 
 ## Shipped so far
 
+**Phase 3 slice 6 — Privacy Gate assist (D30), the gateway's first
+consumer (2026-07-31).** New kind:47022 asks, before promoting, what a
+promotion *would* expose; relay-only kind:47023 answers with deterministic
+findings + advisory notes + a suggested summary. Pre-flight, not another
+blocker (D30's wording is "local summary + redaction suggestions") —
+kind:47021 is unchanged. Three rules make an advisory model safe here: the
+**deterministic scanners stay authoritative** (the model may only ADD
+findings, never clear one, so hallucination/injection cannot open the
+gate); the **model's own output is re-scanned** before publication (a
+suggested summary that trips the rules is dropped whole — the review can
+never become a new leak path); and the request is pinned to
+`InferencePurpose::Gate`, owned-pinned → Local at every tier. `assist`
+status (`ok|unavailable|unusable|failed`) keeps "no findings" distinct
+from "no model ran". Off by default (`BUZZ_GATE_ASSIST_MODEL`). Review
+caught two: side effects are awaited **inline** before the ingest ack, so
+the model call stalled the member's ack for a full inference (29 s → 41 ms
+once detached, spawned inside the fresh-insert branch so replay dedup
+survives); and attribution hardcoded tier Owned instead of the channel's
+declared tier. Live on qwen3:14b: scanners caught the planted AWS key,
+the model added four notes regexes cannot see (customer name, a person,
+an internal host, the key needing rotation) and drafted a clean summary
+omitting all four — metered `purpose=gate backend=local`, 453/664 tokens.
+See phase3-gate-assist.md.
+
 **Phase 3 slice 5 — the gateway's real `local` backend (2026-07-31).**
 `sm-gateway` stops being a skeleton: `ollama::OllamaBackend` is the first
 non-stub `ModelBackend`. Chosen first because the policy leaves no choice —
@@ -308,12 +332,19 @@ slice; its **harness wiring** is the one remaining Phase-2 follow-up.
    backend; live-turn attribution 44201 + owner usage read; the gateway's
    real `local` backend). The Phase 3 exit criterion is closed. What is
    left, roughly in dependency order:
-   - **A gateway consumer.** Nothing calls `sm-gateway` yet — the harness
-     still runs its own turns and meters them via 44201. Copilot (D25),
-     Privacy Gate assist (D30), and embeddings (D37) are the callers the
-     local backend exists for; they are owned-pinned, so they can only be
-     built on it. Embeddings additionally need a trait seam —
-     `RawInference { text, tokens }` cannot express a vector.
+   - **Personal channels default to `tier=open`** (found while validating
+     slice 6). `visibility` is forced private and membership is locked to
+     the member, but no tier tag is set on the `create-personal` path, so
+     D24's creation default applies — meaning an **agent turn** in a
+     member's personal channel passes the slice-2 tier gate for a vendor
+     backend. The gate assist is unaffected (its purpose pin ignores
+     channel tier). Fixing it is a product decision: `owned` forbids
+     anything but local models there, `private` allows TEE. Smallest
+     high-value next slice.
+   - **More gateway consumers.** Slice 6 wired the first (the gate
+     assist). Copilot (D25) and embeddings (D37) remain; embeddings
+     additionally need a trait seam — `RawInference { text, tokens }`
+     cannot express a vector.
    - **Owner budgets.** `Gateway::with_budget` exists and is tested, but
      nothing sets a budget or enforces one on the live (harness) path. The
      hard part is placement, not policy: the relay holds the spend data,
