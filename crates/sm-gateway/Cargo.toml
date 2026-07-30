@@ -1,0 +1,21 @@
+[package]
+name = "sm-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Silent Mesh model gateway: tier-aware routing + per-request metering"
+
+[dependencies]
+buzz-core = { workspace = true }
+buzz-db   = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+uuid      = { workspace = true }
+chrono    = { workspace = true }
+tracing   = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+sqlx  = { workspace = true }

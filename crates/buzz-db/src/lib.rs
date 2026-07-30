@@ -33,6 +33,8 @@ pub mod feed;
 pub mod git_repo;
 /// Embedded database migrations.
 pub mod migration;
+/// Per-request model-usage attribution (Silent Mesh D16, model plane).
+pub mod model_usage;
 /// Community moderation: reports, bans/timeouts, audit actions.
 pub mod moderation;
 /// Monthly table partition management.
@@ -2976,6 +2978,33 @@ impl Db {
         owner_pubkey: &[u8],
     ) -> Result<Option<Uuid>> {
         personal_channel::get_personal_channel_for(&self.pool, community_id, owner_pubkey).await
+    }
+
+    /// Record one routed model request (D16 metering). Returns the row id.
+    pub async fn record_model_usage(
+        &self,
+        params: model_usage::RecordModelUsageParams<'_>,
+    ) -> Result<i64> {
+        model_usage::record_model_usage(&self.pool, params).await
+    }
+
+    /// Per-user model-usage totals by tier and backend (owner metering read).
+    pub async fn user_usage_totals(
+        &self,
+        community_id: CommunityId,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<model_usage::UsageTotal>> {
+        model_usage::user_usage_totals(&self.pool, community_id, since).await
+    }
+
+    /// A single user's total token spend since a cutoff (budget input).
+    pub async fn user_token_spend(
+        &self,
+        community_id: CommunityId,
+        user_pubkey: &[u8],
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<i64> {
+        model_usage::user_token_spend(&self.pool, community_id, user_pubkey, since).await
     }
 
     /// Close the winner and archive its fork family in one family-locked

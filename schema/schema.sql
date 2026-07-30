@@ -220,6 +220,31 @@ CREATE INDEX idx_work_threads_forked_from
     ON work_threads (community_id, forked_from)
     WHERE forked_from IS NOT NULL;
 
+-- ── Model usage ───────────────────────────────────────────────────────────────
+-- Per-request model-usage attribution (D16, model plane): one row per
+-- gateway-routed request. The metering substrate for usage totals and
+-- budgets. Keep in sync with migrations/0032.
+
+CREATE TABLE model_usage (
+    community_id      UUID NOT NULL REFERENCES communities(id),
+    id                BIGSERIAL,
+    user_pubkey       BYTEA NOT NULL CHECK (length(user_pubkey) = 32),
+    agent_pubkey      BYTEA CHECK (agent_pubkey IS NULL OR length(agent_pubkey) = 32),
+    channel_id        UUID,
+    thread_id         BYTEA CHECK (thread_id IS NULL OR length(thread_id) = 32),
+    model             TEXT NOT NULL CHECK (char_length(model) BETWEEN 1 AND 128),
+    tier              channel_tier NOT NULL,
+    backend           TEXT NOT NULL CHECK (backend IN ('local', 'tee', 'vendor')),
+    purpose           TEXT NOT NULL CHECK (purpose IN ('agent_turn', 'copilot', 'gate', 'embedding')),
+    prompt_tokens     BIGINT NOT NULL DEFAULT 0 CHECK (prompt_tokens >= 0),
+    completion_tokens BIGINT NOT NULL DEFAULT 0 CHECK (completion_tokens >= 0),
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (community_id, id)
+);
+
+CREATE INDEX idx_model_usage_rollup
+    ON model_usage (community_id, user_pubkey, tier, backend, created_at DESC);
+
 -- ── Channel members ───────────────────────────────────────────────────────────
 -- Conformance: "Channels and channel membership". PK leads with community_id.
 

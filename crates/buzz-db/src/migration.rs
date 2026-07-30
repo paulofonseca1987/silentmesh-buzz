@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 31);
+        assert_eq!(migrations.len(), 32);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -986,6 +986,20 @@ mod tests {
         assert!(personal.contains("REFERENCES channels (community_id, id) ON DELETE CASCADE"));
         assert!(!personal.contains("_operator_global_tables"));
 
+        // Phase 3: the model-usage attribution table (D16) — one
+        // tenant-scoped table with the community-led PK, reusing the
+        // channel_tier enum; a backend/purpose CHECK keeps rollups clean.
+        assert_eq!(migrations[31].version, 32);
+        let usage = migrations[31].sql.as_str();
+        assert!(usage.contains("CREATE TABLE model_usage"));
+        assert!(usage.contains("PRIMARY KEY (community_id, id)"));
+        assert!(usage.contains("tier              channel_tier NOT NULL"));
+        assert!(usage.contains(
+            "backend           TEXT NOT NULL CHECK (backend IN ('local', 'tee', 'vendor'))"
+        ));
+        assert!(usage.contains("CREATE INDEX idx_model_usage_rollup"));
+        assert!(!usage.contains("_operator_global_tables"));
+
         let desired_schema = include_str!("../../../schema/schema.sql");
         assert!(
             desired_schema.contains("CREATE TABLE join_policy_acceptances"),
@@ -1025,6 +1039,11 @@ mod tests {
         assert!(
             desired_schema.contains("CREATE TABLE personal_channels"),
             "desired-state schema must include the personal-channel registry",
+        );
+        assert!(
+            desired_schema.contains("CREATE TABLE model_usage")
+                && desired_schema.contains("idx_model_usage_rollup"),
+            "desired-state schema must include the model-usage attribution table",
         );
     }
 
@@ -1268,7 +1287,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(31));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(32));
     }
 
     #[tokio::test]

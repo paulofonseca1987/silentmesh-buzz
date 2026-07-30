@@ -24,6 +24,8 @@ pub mod git_perms;
 pub mod invite;
 /// Buzz kind number registry — custom event type constants.
 pub mod kind;
+/// Tier-aware model routing policy (Silent Mesh D16/D24, model plane).
+pub mod model_route;
 /// Network utilities — SSRF-safe IP classification.
 pub mod network;
 /// Agent observer frame helpers.

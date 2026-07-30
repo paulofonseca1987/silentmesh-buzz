@@ -26,6 +26,7 @@ members = [
     "crates/buzz-pair-relay",
     "crates/buzz-relay-mesh",
     "crates/buzz-dev-mcp",
+    "crates/sm-gateway",
     "examples/countdown-bot",
 ]
 exclude = ["desktop/src-tauri"]
@@ -84,6 +85,7 @@ metrics-util        = "0.20"
 # Error handling
 thiserror = "2"
 anyhow    = "1"
+async-trait = "0.1"
 
 # Utilities
 uuid    = { version = "1", features = ["v4", "serde"] }
@@ -131,6 +133,7 @@ buzz-search = { path = "crates/buzz-search" }
 buzz-audit = { path = "crates/buzz-audit" }
 buzz-workflow = { path = "crates/buzz-workflow" }
 buzz-media = { path = "crates/buzz-media" }
+sm-gateway = { path = "crates/sm-gateway" }
 buzz-sdk = { path = "crates/buzz-sdk" }
 buzz-ws-client = { path = "crates/buzz-ws-client" }
 buzz-relay-mesh = { path = "crates/buzz-relay-mesh" }
