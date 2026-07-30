@@ -18,6 +18,17 @@ new session cannot learn from those.
 
 ## Shipped so far
 
+**Phase 3 slice 1 — tier-aware router + metering.** `buzz_core::model_route`
+(pure policy: Backend {local,tee,vendor} × ChannelTier {owned,private,open}
+× InferencePurpose, owned-pinned copilot/gate/embedding; exhaustive matrix
+test). `buzz_db::model_usage` + migration 0032 — per-request attribution
+table (community-scoped, channel_tier enum reused, backend/purpose CHECKed)
+with `user_usage_totals` (per-user by tier+backend) and `user_token_spend`.
+New `sm-gateway` crate: `ModelBackend` trait + stub local/tee/vendor impls,
+`Gateway::route_and_record` (policy gate → budget → dispatch → meter; a
+refused request records nothing). Backends are stubs; the harness/relay
+wiring that calls the gateway is a later slice. See phase3-model-plane.md.
+
 **Phase 1 — governance (complete).** Workflow approval gate (WF-08) with
 kinds 46010/46011/46012; agent permission requests (relay HTTP create/list +
 hashed-token store); grant/deny via kind 46030/46031 commands (workflow and
@@ -198,8 +209,13 @@ slice; its **harness wiring** is the one remaining Phase-2 follow-up.
    Must be validated against a **live** claude-code turn in a 47000-rooted
    thread pushing to a running relay's forge — the whole value is that
    round trip, unexercisable in the dev sandbox.
-2. Phase 3 (model plane) per roadmap: tier-aware router, per-request
-   attribution, local serving on the GPUs, TEE spike, native harness.
+2. **Phase 3 continues** — slice 1 (tier-aware router + attribution +
+   sm-gateway skeleton) shipped; see phase3-model-plane.md. Next: real
+   `ModelBackend` impls (server-GPU serving spike, TEE
+   attestation-then-send, per-user vendor CLIs), the harness/relay wiring
+   that *calls* the gateway, the owner usage read surface, then seals /
+   copilot / retrieval — all pinned owned-tier in the router by
+   construction.
 
 ## Suggested kickoff prompt for a fresh session
 
