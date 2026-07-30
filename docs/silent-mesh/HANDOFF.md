@@ -249,12 +249,19 @@ serialize so exactly one winner survives) and emits kind:47013 notices.
 - Don't start `redis-server` with the repo as cwd (it drops `dump.rdb` into
   the working tree).
 - **Ollama** is a sudo-less user install at `~/ollama/bin/ollama` (not on
-  `PATH`, nothing in `/usr/local`) — `nohup ~/ollama/bin/ollama serve &`,
-  then check `curl -s localhost:11434/api/tags`. It does **not** survive a
-  reboot, so a session that needs a local model must start it first. Models
-  present: `qwen3:14b` (the harness workhorse), `qwen2.5:14b`, `qwen2.5:7b`,
-  `llama3.2:3b` (fast enough for probes, ~2 s). No embedding model is
-  pulled yet — D37 will need one.
+  `PATH`, nothing in `/usr/local`), run as the **systemd user service
+  `ollama.service`** (`~/.config/systemd/user/ollama.service`, lingering
+  enabled, `Restart=always`) — so it comes back on boot.
+  `systemctl --user status|restart ollama.service`; verify with
+  `curl -s localhost:11434/api/tags`. Bound **loopback-only**
+  (`OLLAMA_HOST=127.0.0.1:11434`) to match the gateway's strictest local
+  guard, with `OLLAMA_KEEP_ALIVE=30m` so a 14B stays resident between
+  turns. Models present: `qwen3:14b` (the harness workhorse),
+  `qwen2.5:14b`, `qwen2.5:7b`, `llama3.2:3b` (fast enough for probes,
+  ~2 s). No embedding model is pulled yet — D37 will need one.
+  Gotcha: don't stop it with `pkill -f "ollama/bin/ollama serve"` — the
+  pattern matches your own shell and kills it; use
+  `systemctl --user stop ollama.service`.
 - `git_sign_nostr::tests::test_parse_envelope_rejects_invalid_oa_pubkey`
   fails on this branch **and on a stashed clean tree** — an upstream test
   expecting an all-zero pubkey to be refused as an invalid BIP-340 key,
