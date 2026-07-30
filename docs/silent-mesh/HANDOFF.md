@@ -18,6 +18,24 @@ new session cannot learn from those.
 
 ## Shipped so far
 
+**Phase 3 slice 5 — the gateway's real `local` backend (2026-07-31).**
+`sm-gateway` stops being a skeleton: `ollama::OllamaBackend` is the first
+non-stub `ModelBackend`. Chosen first because the policy leaves no choice —
+`Copilot`/`Gate`/`Embedding` are owned-pinned to `Backend::Local`, so D25 /
+D30 / D37 all block on this one impl. **Locality is proven, not asserted**:
+`check_local_base_url` (pure) admits only loopback and the tailnet
+(`100.64.0.0/10`, `fd7a:115c:a1e0::/48`, `*.ts.net`; RFC1918 deliberately
+excluded), applied at construction so a misconfiguration fails at startup,
+not at request time. Review's finding, and the load-bearing half: the URL
+check alone is insufficient — reqwest **follows redirects** (a loopback
+`302 → api.openai.com` egresses the prompt from an endpoint that passed the
+check) and **honors proxy env vars** with no loopback bypass; both pinned
+off, with a raw one-shot-server test proving the 302 is surfaced rather than
+followed. Real `usage` token counts replace the stub's word estimate, and an
+unmeterable response is an error rather than a fabricated number. Validated
+live on the 2× RTX 4060s: gateway-mediated owned-tier inference wrote a
+`model_usage` row (36/3 tokens, owned/local). See phase3-gateway-local.md.
+
 **Phase 3 slice 1 — tier-aware router + metering.** `buzz_core::model_route`
 (pure policy: Backend {local,tee,vendor} × ChannelTier {owned,private,open}
 × InferencePurpose, owned-pinned copilot/gate/embedding; exhaustive matrix
@@ -230,6 +248,18 @@ serialize so exactly one winner survives) and emits kind:47013 notices.
   2f session — the merged-path behavior is now covered end-to-end.
 - Don't start `redis-server` with the repo as cwd (it drops `dump.rdb` into
   the working tree).
+- **Ollama** is a sudo-less user install at `~/ollama/bin/ollama` (not on
+  `PATH`, nothing in `/usr/local`) — `nohup ~/ollama/bin/ollama serve &`,
+  then check `curl -s localhost:11434/api/tags`. It does **not** survive a
+  reboot, so a session that needs a local model must start it first. Models
+  present: `qwen3:14b` (the harness workhorse), `qwen2.5:14b`, `qwen2.5:7b`,
+  `llama3.2:3b` (fast enough for probes, ~2 s). No embedding model is
+  pulled yet — D37 will need one.
+- `git_sign_nostr::tests::test_parse_envelope_rejects_invalid_oa_pubkey`
+  fails on this branch **and on a stashed clean tree** — an upstream test
+  expecting an all-zero pubkey to be refused as an invalid BIP-340 key,
+  which the current secp/nostr version accepts. Pre-existing, not caused by
+  Silent Mesh work; don't chase it when running the workspace unit gate.
 - Production git is 2.39 (bookworm): no `merge-tree --merge-base`, which is
   why canonicalize uses read-tree/commit-tree plumbing.
 - `cargo clippy/check --workspace --all-targets` needs OpenSSL headers
@@ -266,15 +296,26 @@ slice; its **harness wiring** is the one remaining Phase-2 follow-up.
    Must be validated against a **live** claude-code turn in a 47000-rooted
    thread pushing to a running relay's forge — the whole value is that
    round trip, unexercisable in the dev sandbox.
-2. **Phase 3 continues** — slice 1 (tier-aware router + attribution +
-   sm-gateway skeleton, phase3-model-plane.md) and slice 2 (buzz-acp pre-turn
-   tier enforcement, phase3-tier-enforcement.md) shipped. Next: real
-   `ModelBackend` impls (server-GPU serving spike, TEE
-   attestation-then-send, per-user vendor CLIs) — these also populate the
-   Local/TEE arms of `provider_to_backend` and unblock owned/private agent
-   turns; the attribution-from-live-turns half (blocked today by 44200
-   owner-encryption); the owner usage read surface; then seals / copilot /
-   retrieval — all pinned owned-tier in the router by construction.
+2. **Phase 3 continues** — slices 1–5 shipped (tier-aware router +
+   attribution store; pre-turn tier enforcement; the local Ollama agent
+   backend; live-turn attribution 44201 + owner usage read; the gateway's
+   real `local` backend). The Phase 3 exit criterion is closed. What is
+   left, roughly in dependency order:
+   - **A gateway consumer.** Nothing calls `sm-gateway` yet — the harness
+     still runs its own turns and meters them via 44201. Copilot (D25),
+     Privacy Gate assist (D30), and embeddings (D37) are the callers the
+     local backend exists for; they are owned-pinned, so they can only be
+     built on it. Embeddings additionally need a trait seam —
+     `RawInference { text, tokens }` cannot express a vector.
+   - **Owner budgets.** `Gateway::with_budget` exists and is tested, but
+     nothing sets a budget or enforces one on the live (harness) path. The
+     hard part is placement, not policy: the relay holds the spend data,
+     the harness is the only component that can *prevent* a turn.
+   - **Member-facing usage reads** (today `buzz-admin usage` is
+     operator-only), the **desktop bare-model-id gap** (desktop writes bare
+     ids into `BUZZ_ACP_MODEL`, so desktop-launched local agents classify
+     as vendor and are refused in owned/private), then **TEE**
+     (attestation-then-send) and **per-user vendor CLIs** (D23).
 
 ## Suggested kickoff prompt for a fresh session
 
