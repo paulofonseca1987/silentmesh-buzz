@@ -224,6 +224,58 @@ party that knows, and it is a one-line symmetry with the path right next to
 it. The client fails safe in the meantime — the relay refuses, and the
 refusal is shown.
 
+## Reconnect (2026-07-31)
+
+A dropped tailnet route used to be permanent: the reader told every waiter
+the socket had died, ended each subscription's stream, and the app's
+`for await` loop simply returned. Nothing ever asked again, so the window
+kept showing a workspace that had stopped updating — the worst shape of
+failure, because it looks exactly like a quiet channel.
+
+The fix rests on one distinction:
+
+> A query or a publish is a **request**. A subscription is a **standing
+> intent**.
+
+So one-shot waiters still fail with the socket — only the caller can decide
+whether repeating a publish is safe, and a client that retried on its own
+would be deciding to send a member's message twice. Live subscriptions are
+kept, and the client re-opens, re-authenticates, and re-sends their REQs.
+
+Three details that are easy to get wrong, and each of which silently loses
+data rather than erroring:
+
+- **Re-authenticate.** A new socket starts unauthenticated. Skip it and
+  every private channel comes back empty, which reads as "nothing here"
+  rather than "not allowed".
+- **Replay from the gap, not from now.** The re-sent REQ sets `since` to the
+  last event that subscription delivered. It is inclusive, so the last event
+  usually arrives twice — deliberately, because a duplicate is visible to a
+  client that dedups and a gap is visible to nobody.
+- **Clear `limit`.** Live subscriptions are opened with `limit: 0` ("no
+  history, I already loaded it"). Carry that into the replay and the relay
+  sends nothing stored — so the replay exists but returns exactly zero
+  events. This one passes every test that only checks the stream survived.
+
+`disconnect()` is final: `wantsConnection` goes false, and a cancelled
+reader returns instead of reporting a transport failure. Without that check
+the deliberate close was immediately overwritten by the socket error it
+caused, so the state named a network fault for something the app asked for.
+
+The app mirrors `MeshConnectionState` into its status line and the sidebar
+dot — previously that dot was green unless the status *text* contained
+"failed", which is green beside a stale workspace. On recovery it also
+re-reads the channel list and folds: the subscription replays its own gap,
+but the one-shot queries behind the channel list have nothing replaying them.
+
+**Proven against a real outage, not a mock.** `simulateTransportFailure()`
+drops the transport under a live subscription; an event published *during*
+the outage still arrives. Three mutants confirm the test can fail: ending
+subscriptions on failure, keeping `limit: 0`, and replaying from now. Then
+the same thing end to end — the dev relay was killed under the running app,
+which backed off 0.5s → 15s across ten attempts, reconnected by itself, and
+re-read the workspace.
+
 ## Live interop (2026-07-31)
 
 From the MacBook, over Tailscale, against the WSL relay:
@@ -361,8 +413,5 @@ secret and an app that keeps one.
    checkpoints.
 2. **The channel repo browser** — file tree and blob view over git smart
    HTTP, so a work thread's checkpoints can be read where they happened.
-3. **Reconnect** — the reader tells every waiter when the socket dies, but
-   nothing yet re-establishes it. A dropped tailnet route currently means
-   restarting the app.
-4. **Emit an event on approval withdrawal** (relay-side, small) — closes the
+3. **Emit an event on approval withdrawal** (relay-side, small) — closes the
    gap above.

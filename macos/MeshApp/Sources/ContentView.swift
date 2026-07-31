@@ -188,6 +188,14 @@ struct MessageRow: View {
 struct ContentView: View {
     @ObservedObject var model: WorkspaceModel
 
+    private var connectionColor: Color {
+        switch model.connection {
+        case .connected: return .green
+        case .connecting, .reconnecting: return .orange
+        case .closed: return .red
+        }
+    }
+
     var body: some View {
         NavigationSplitView {
             List(model.channels, selection: $model.selectedChannel) { channel in
@@ -202,8 +210,12 @@ struct ContentView: View {
             .navigationSplitViewColumnWidth(min: 200, ideal: 230)
             .safeAreaInset(edge: .bottom) {
                 HStack(spacing: 6) {
+                    // Driven by the transport's own state rather than by
+                    // searching the status text for "failed" — a green dot
+                    // beside a stale channel list is the failure mode this
+                    // indicator exists to rule out.
                     Circle()
-                        .fill(model.status.contains("failed") ? Color.red : Color.green)
+                        .fill(connectionColor)
                         .frame(width: 7, height: 7)
                     Text(model.status).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                 }

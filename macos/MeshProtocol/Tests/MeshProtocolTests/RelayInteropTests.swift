@@ -246,6 +246,124 @@ struct RelayLiveTests {
         _ = iterator  // the stream is closed by disconnect below
         await client.disconnect()
     }
+
+    /// The socket dies; the subscription does not.
+    ///
+    /// This is the one behaviour that cannot be tested against a mock —
+    /// asserting it there would only prove the mock reconnects. So the real
+    /// transport is dropped underneath a real subscription, and the event
+    /// that proves it is published *during the outage*: recovering the
+    /// stream but resuming from "now" would look identical here and lose
+    /// every message sent while the route was down.
+    @Test("a subscription survives a dropped socket and replays the gap")
+    func reconnectReplaysTheGap() async throws {
+        let (url, keyHex, channel) = try env()
+        let keys = try MeshKeys(privateKeyHex: keyHex)
+
+        let watcher = MeshRelayClient(url: url, keys: keys)
+        try await watcher.connect()
+        try await watcher.authenticate()
+        let stream = try await watcher.subscribe(
+            MeshFilter(kinds: [MeshKind.chatMessage], limit: 0, tags: ["#h": [channel]]))
+
+        let publisher = MeshRelayClient(url: url, keys: keys)
+        try await publisher.connect()
+        try await publisher.authenticate()
+
+        func publish(_ marker: String) async throws {
+            var event = try MeshEvent.chatMessage(
+                channel: channel, content: marker, pubkey: keys.publicKeyHex)
+            try event.sign(with: keys)
+            try await publisher.publish(event)
+        }
+
+        // One task owns the stream — an `AsyncIterator` is not `Sendable`,
+        // and passing it between tasks is a data race Swift 6 rejects
+        // outright. Arrivals land in an actor; the waits poll it against an
+        // explicit bound, so a deadline never depends on an event arriving.
+        let seen = MarkerLog()
+        let consumer = Task {
+            for await event in stream { await seen.record(event.content) }
+        }
+        defer { consumer.cancel() }
+
+        // 1. Prove the subscription is live before breaking anything —
+        //    otherwise a subscription that never worked would "pass".
+        let before = "pre-drop \(UUID().uuidString)"
+        try await publish(before)
+        #expect(
+            await seen.wait(for: before, seconds: 20),
+            "the subscription was not delivering before the socket was dropped")
+
+        // 2. Drop the transport the way a dead tailnet route would, and
+        //    publish while it is down. The client backs off before its first
+        //    retry, so this lands squarely inside the outage.
+        await watcher.simulateTransportFailure()
+        let during = "mid-outage \(UUID().uuidString)"
+        try await publish(during)
+
+        #expect(
+            await seen.wait(for: during, seconds: 40),
+            "an event published during the outage never arrived — the gap was skipped")
+        #expect(await watcher.isAuthenticated, "the reconnected socket was left unauthenticated")
+
+        await watcher.disconnect()
+        await publisher.disconnect()
+    }
+
+    /// A deliberate `disconnect()` must not be retried. Reconnecting after
+    /// the app asked to stop would keep a relay fanning out to a window that
+    /// has gone away — and would make the state a lie.
+    @Test("a deliberate disconnect stays disconnected")
+    func disconnectIsFinal() async throws {
+        let (url, keyHex, channel) = try env()
+        let client = MeshRelayClient(url: url, keys: try MeshKeys(privateKeyHex: keyHex))
+        try await client.connect()
+        try await client.authenticate()
+        let stream = try await client.subscribe(
+            MeshFilter(kinds: [MeshKind.chatMessage], limit: 0, tags: ["#h": [channel]]))
+
+        await client.disconnect()
+
+        // The stream must END, not merely go quiet: a consumer's `for await`
+        // has to return, or the app waits forever on a connection nobody
+        // intends to restore. Draining it inline would hang instead of fail
+        // if that were broken, so the drain gets its own task and a bound.
+        let drained = Task { for await _ in stream {} ; return true }
+        let finished = await withTaskGroup(of: Bool.self) { group in
+            group.addTask { await drained.value }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(5))
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        #expect(finished, "the subscription stream never ended after disconnect()")
+        #expect(await client.state == .closed("disconnected"))
+
+        try? await Task.sleep(for: .seconds(3))
+        #expect(
+            await client.state == .closed("disconnected"),
+            "the client reconnected after being told to stop")
+    }
+}
+
+/// Records what a subscription delivered, so a test can wait for a marker
+/// against an explicit bound rather than by blocking on the stream itself.
+actor MarkerLog {
+    private var seen: Set<String> = []
+
+    func record(_ marker: String) { seen.insert(marker) }
+
+    func wait(for marker: String, seconds: Int) async -> Bool {
+        for _ in 0..<(seconds * 10) {
+            if seen.contains(marker) { return true }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return seen.contains(marker)
+    }
 }
 
 /// Supervised approvals, end to end against a live relay.

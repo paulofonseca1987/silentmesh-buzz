@@ -63,7 +63,18 @@ final class WorkspaceModel: ObservableObject {
     /// already accepted it. The record replaces it as soon as it lands.
     private var decidedLocally: [String: MeshApprovalOutcome] = [:]
 
+    /// What the transport is doing. Distinct from `status`, which describes
+    /// what the workspace contains — "3 channels" while nothing is getting
+    /// through is exactly the lie this exists to prevent.
+    @Published private(set) var connection: MeshConnectionState = .closed("not started")
+
     private var client: MeshRelayClient?
+    private var connectionTask: Task<Void, Never>?
+    /// Has the connection dropped at least once? A reconnect has to re-read
+    /// the workspace, not just resume the stream: the live subscription
+    /// replays the gap for the kinds it covers, but the channel list and the
+    /// folds were built from one-shot queries that nothing replays.
+    private var recoveredFromOutage = false
     /// The live subscription for the selected channel. One at a time: a
     /// stream left running for a channel nobody is looking at keeps the
     /// relay fanning out to a window that will never show it.
@@ -122,6 +133,7 @@ final class WorkspaceModel: ObservableObject {
     func connect() async {
         let client = MeshRelayClient(url: relayURL, keys: keys)
         self.client = client
+        watchConnection(client)
         do {
             status = "connecting to \(relayURL.host ?? "relay")"
             try await client.connect()
@@ -138,7 +150,46 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
-    func loadChannels() async {
+    /// Mirror the client's connection state, and rebuild the workspace when
+    /// it comes back.
+    private func watchConnection(_ client: MeshRelayClient) {
+        connectionTask?.cancel()
+        connectionTask = Task { [weak self] in
+            for await state in await client.connectionStates() {
+                guard let self else { return }
+                await self.apply(connection: state)
+            }
+        }
+    }
+
+    private func apply(connection state: MeshConnectionState) async {
+        connection = state
+        switch state {
+        case .connecting:
+            status = "connecting to \(relayURL.host ?? "relay")"
+        case .reconnecting(let attempt, let retryIn):
+            recoveredFromOutage = true
+            // Kept short on purpose: the sidebar is ~230pt and the line is
+            // truncated to one, so a longer phrasing cuts off the countdown —
+            // the only part that tells a member whether to wait or act.
+            status = "reconnecting… #\(attempt) in \(Int(retryIn.rounded()))s"
+        case .closed(let reason):
+            status = "disconnected: \(reason)"
+        case .connected:
+            guard recoveredFromOutage else { return }
+            recoveredFromOutage = false
+            // The subscription replays its own gap; these do not. Without
+            // this a channel created — or a thread closed — during the
+            // outage stays invisible until the member switches channels.
+            status = "reconnected"
+            // Not `startingLive`: the client re-sent every REQ itself when
+            // it reconnected. Opening another would leave two subscriptions
+            // on the same filter and double every push.
+            await loadChannels(startingLive: false)
+        }
+    }
+
+    func loadChannels(startingLive: Bool = true) async {
         guard let client else { return }
         do {
             let events = try await client.query(
@@ -162,7 +213,7 @@ final class WorkspaceModel: ObservableObject {
                 await loadMessages(channel: selected)
                 await loadThreads(channel: selected)
                 await loadApprovals(channel: selected)
-                startLive(channel: selected)
+                if startingLive { startLive(channel: selected) }
             }
         } catch {
             status = "channel load failed: \(describe(error))"

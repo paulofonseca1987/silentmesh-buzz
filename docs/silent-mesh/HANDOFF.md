@@ -42,6 +42,14 @@ all in `macos/`, all validated against the live relay from the MacBook.
 - **The app** — channels with tier badges, work threads with status/fork/
   checkpoint/deadline, thread detail, gate-review cards, a composer, a
   new-thread field, and a **refusal banner** carrying the relay's own words.
+- **Reconnect** — a dropped socket no longer ends the app. The rule: a query
+  or publish is a *request* (fails with the socket; only the caller may
+  decide to repeat it), a subscription is a *standing intent* (kept, and its
+  REQ re-sent after re-auth). The replay sets `since` to the last event seen
+  **and clears `limit`** — live subs open with `limit: 0`, so keeping it
+  makes the replay return zero events while every "did the stream survive"
+  test still passes. Proven by killing the dev relay under the running app:
+  backoff 0.5s → 15s, ten attempts, recovered by itself.
 - **Supervised approvals** — the Phase 4 exit criterion's named surface.
   The lifecycle is entirely on the wire (relay signs the 46010 request and
   the 46011/46012 outcome; the member signs the 46030/46031 decision), so
@@ -493,9 +501,10 @@ slice; its **harness wiring** is the one remaining Phase-2 follow-up.
      app, and the first place the Mac client does more than observe.
    - **The channel repo browser** — file tree and blob view over git smart
      HTTP, so a work thread's checkpoints can be read where they happened.
-   - **Reconnect.** The reader now tells every waiter when the socket dies
-     (`failAllPending`), but nothing re-establishes it — a dropped tailnet
-     route means restarting the app.
+   - **Emit an event when an agent withdraws an approval request** (relay
+     side, small): `POST /api/approvals/resolve` updates the row and emits
+     nothing, unlike the decision path beside it, so a withdrawn request
+     renders as pending until it expires.
 
 ## Suggested kickoff prompt for a fresh session
 

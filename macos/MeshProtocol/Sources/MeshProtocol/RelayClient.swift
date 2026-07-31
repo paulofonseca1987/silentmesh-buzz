@@ -42,6 +42,18 @@ public struct MeshFilter: Sendable {
     }
 }
 
+/// What the client is doing about its connection, for a UI that should not
+/// have to guess whether silence means "nothing is happening" or "nothing
+/// is getting through".
+public enum MeshConnectionState: Sendable, Equatable {
+    case connecting
+    case connected
+    /// The socket died and the client is waiting before trying again.
+    case reconnecting(attempt: Int, retryIn: TimeInterval)
+    /// Closed on purpose, or given up.
+    case closed(String)
+}
+
 /// A live connection to a Silent Mesh relay.
 ///
 /// **One task reads the socket.** Everything else waits to be handed the
@@ -76,8 +88,26 @@ public actor MeshRelayClient {
     }
 
     private var pendingQueries: [String: PendingQuery] = [:]
-    /// Live subscriptions, which keep receiving after EOSE.
-    private var liveSubscriptions: [String: AsyncStream<MeshEvent>.Continuation] = [:]
+
+    /// A live subscription, which keeps receiving after EOSE — and which
+    /// outlives the socket it was opened on.
+    ///
+    /// The filter is kept because a subscription is a standing intent, not
+    /// a request: a relay that never heard the REQ (because this is a new
+    /// connection) has to be told again. `lastSeen` is kept so the replay
+    /// asks for the gap rather than starting from now.
+    private struct LiveSubscription {
+        let filter: MeshFilter
+        let continuation: AsyncStream<MeshEvent>.Continuation
+        /// `created_at` of the newest event delivered here.
+        var lastSeen: Int64?
+        /// When this subscription opened — the replay floor until something
+        /// arrives, so a subscription that has seen nothing yet still does
+        /// not silently skip the outage.
+        let openedAt: Int64
+    }
+
+    private var liveSubscriptions: [String: LiveSubscription] = [:]
     /// The relay's verdict on a submitted event.
     ///
     /// A struct rather than the raw frame because a `[Any]` cannot cross
@@ -101,6 +131,40 @@ public actor MeshRelayClient {
     /// failure that reads as "the network is broken".
     private var bufferedChallenge: String?
 
+    // MARK: - Reconnection
+
+    /// Should a dead socket be re-opened? False until the first successful
+    /// `connect()`, and false again after a deliberate `disconnect()` — so
+    /// closing on purpose is never mistaken for a failure worth retrying.
+    private var wantsConnection = false
+    /// Did `authenticate()` succeed on this client? A reconnect must repeat
+    /// it, or the new socket comes back unauthenticated and every private
+    /// channel silently reads as empty.
+    private var wantsAuthentication = false
+    private var reconnectTask: Task<Void, Never>?
+
+    public private(set) var state: MeshConnectionState = .closed("not started")
+    private var stateContinuation: AsyncStream<MeshConnectionState>.Continuation?
+
+    /// Watch what the connection is doing.
+    ///
+    /// One consumer: a second call replaces the first, because this exists
+    /// for a status line rather than as a general event bus.
+    public func connectionStates() -> AsyncStream<MeshConnectionState> {
+        AsyncStream { continuation in
+            continuation.yield(state)
+            stateContinuation?.finish()
+            stateContinuation = continuation
+        }
+    }
+
+    private func setState(_ next: MeshConnectionState) {
+        guard next != state else { return }
+        state = next
+        stateContinuation?.yield(next)
+        MeshLog.write("state: \(next)")
+    }
+
     public init(url: URL, keys: MeshKeys, session: URLSession = .shared) {
         self.url = url
         self.keys = keys
@@ -108,19 +172,46 @@ public actor MeshRelayClient {
     }
 
     public func connect() async throws {
+        wantsConnection = true
+        setState(.connecting)
+        openSocket()
+        setState(.connected)
+    }
+
+    /// Open a socket and start a reader on it. Deliberately not `throws`:
+    /// `resume()` returns before the handshake completes, so failure shows
+    /// up in the reader, which is the one place equipped to react to it.
+    private func openSocket() {
+        readerTask?.cancel()
         let task = session.webSocketTask(with: url)
         task.resume()
         self.task = task
+        isAuthenticated = false
         readerTask = Task { [weak self] in await self?.readLoop() }
     }
 
     public func disconnect() {
+        wantsConnection = false
+        wantsAuthentication = false
+        reconnectTask?.cancel()
+        reconnectTask = nil
         readerTask?.cancel()
         readerTask = nil
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         isAuthenticated = false
+        setState(.closed("disconnected"))
         failAllPending(with: MeshProtocolError.transport("disconnected"))
+        stateContinuation?.finish()
+        stateContinuation = nil
+    }
+
+    /// Drop the transport without telling the relay, as a dead tailnet route
+    /// would. Test seam: reconnection is the one behaviour that cannot be
+    /// exercised without a connection that fails, and asserting it against a
+    /// mock would only prove the mock reconnects.
+    func simulateTransportFailure() {
+        task?.cancel(with: .abnormalClosure, reason: nil)
     }
 
     // MARK: - The reader
@@ -155,6 +246,13 @@ public actor MeshRelayClient {
                 else { continue }
                 dispatch(frame)
             } catch {
+                // A cancelled reader is a teardown this client asked for,
+                // not a connection that broke. Without this check
+                // `disconnect()` cancels the socket, the reader reports the
+                // resulting error as a transport failure, and the state ends
+                // up naming a socket error for what was a deliberate close —
+                // and on the warm-up path it would even retry.
+                if Task.isCancelled { return }
                 if warmupRetries > 0 {
                     warmupRetries -= 1
                     try? await Task.sleep(for: .milliseconds(100))
@@ -170,7 +268,7 @@ public actor MeshRelayClient {
                 // or every caller hangs forever on a connection that will
                 // never answer — the same failure shape as a receive with no
                 // timeout, one level up.
-                failAllPending(with: MeshProtocolError.transport(error.localizedDescription))
+                handleTransportFailure(error.localizedDescription)
                 return
             }
         }
@@ -209,7 +307,10 @@ public actor MeshRelayClient {
             if pendingQueries[sub] != nil {
                 pendingQueries[sub]?.events.append(event)
             } else if let live = liveSubscriptions[sub] {
-                live.yield(event)
+                // Remember how far this subscription has got, so a reconnect
+                // asks for the gap instead of resuming from now.
+                liveSubscriptions[sub]?.lastSeen = max(live.lastSeen ?? 0, event.createdAt)
+                live.continuation.yield(event)
             }
 
         case "EOSE":
@@ -228,7 +329,10 @@ public actor MeshRelayClient {
                 pending.continuation.resume(
                     throwing: MeshProtocolError.relay("subscription closed: \(reason)"))
             }
-            liveSubscriptions.removeValue(forKey: sub)?.finish()
+            // A relay-sent CLOSED is a decision about this subscription (a
+            // bad filter, a revoked permission), not a transport blip — so
+            // it ends the stream rather than being retried forever.
+            liveSubscriptions.removeValue(forKey: sub)?.continuation.finish()
 
         default:
             return
@@ -236,14 +340,107 @@ public actor MeshRelayClient {
     }
 
     private func failAllPending(with error: Error) {
+        failOneShots(with: error)
+        for (_, live) in liveSubscriptions { live.continuation.finish() }
+        liveSubscriptions.removeAll()
+    }
+
+    /// Fail everything that was waiting for a single answer.
+    ///
+    /// One-shot work dies with the socket: a query or a publish belongs to
+    /// whoever asked, and only they can decide whether repeating it is safe.
+    /// Silently retrying a publish would be a client deciding on its own to
+    /// send a member's message twice.
+    private func failOneShots(with error: Error) {
         for (_, pending) in pendingQueries { pending.continuation.resume(throwing: error) }
         pendingQueries.removeAll()
         for (_, waiter) in pendingOKs { waiter.resume(throwing: error) }
         pendingOKs.removeAll()
-        for (_, live) in liveSubscriptions { live.finish() }
-        liveSubscriptions.removeAll()
         pendingChallenge?.resume(throwing: error)
         pendingChallenge = nil
+        bufferedChallenge = nil
+    }
+
+    /// The socket died on its own.
+    ///
+    /// One-shot waiters are failed; live subscriptions are **kept**, because
+    /// they are a standing intent rather than a request. Ending them here is
+    /// what made a dropped tailnet route permanent: the app's `for await`
+    /// loop returned, and nothing ever asked again.
+    private func handleTransportFailure(_ reason: String) {
+        let error = MeshProtocolError.transport(reason)
+        failOneShots(with: error)
+        isAuthenticated = false
+
+        guard wantsConnection else {
+            for (_, live) in liveSubscriptions { live.continuation.finish() }
+            liveSubscriptions.removeAll()
+            setState(.closed(reason))
+            return
+        }
+        startReconnecting(after: reason)
+    }
+
+    private func startReconnecting(after reason: String) {
+        guard reconnectTask == nil else { return }
+        reconnectTask = Task { [weak self] in await self?.reconnectLoop(reason: reason) }
+    }
+
+    /// Re-open, re-authenticate, and re-subscribe, backing off between
+    /// attempts.
+    ///
+    /// It does not give up. A Silent Mesh relay lives on a tailnet, so the
+    /// usual reason for failure is a route that will come back — a laptop
+    /// that slept, a network that changed. An app that stopped trying would
+    /// have to be restarted to notice.
+    private func reconnectLoop(reason: String) async {
+        var attempt = 0
+        while wantsConnection && !Task.isCancelled {
+            attempt += 1
+            // 0.5s doubling to a 15s ceiling: fast enough that a blip is
+            // invisible, slow enough that an hour offline is not a spin.
+            let delay = min(0.5 * pow(2, Double(attempt - 1)), 15)
+            setState(.reconnecting(attempt: attempt, retryIn: delay))
+            try? await Task.sleep(for: .seconds(delay))
+            if Task.isCancelled || !wantsConnection { break }
+
+            openSocket()
+            do {
+                if wantsAuthentication { try await authenticate() }
+                try await resubscribeAll()
+                setState(.connected)
+                MeshLog.write("reconnected after \(attempt) attempt(s) (was: \(reason))")
+                reconnectTask = nil
+                return
+            } catch {
+                MeshLog.write("reconnect attempt \(attempt) failed: \(error)")
+                // Leave the loop's own state alone and try again: a half-open
+                // socket here is exactly the case the next attempt handles.
+                failOneShots(with: MeshProtocolError.transport("reconnecting"))
+            }
+        }
+        reconnectTask = nil
+    }
+
+    /// Re-send every live subscription's REQ on the new socket.
+    ///
+    /// Two changes to the original filter, both load-bearing:
+    ///
+    /// - `since` is set to the last event seen, so the relay replays what
+    ///   was missed. Inclusive, so the last event usually arrives twice —
+    ///   deliberately, because a duplicate is visible to a client that dedups
+    ///   and a gap is not visible to anyone.
+    /// - `limit` is cleared. Live subscriptions are opened with `limit: 0`
+    ///   ("no history, I already loaded it"), and keeping that would make the
+    ///   relay send nothing stored — so the replay this whole method exists
+    ///   for would return exactly zero events.
+    private func resubscribeAll() async throws {
+        for (sub, live) in liveSubscriptions {
+            var replay = live.filter
+            replay.since = live.lastSeen ?? live.openedAt
+            replay.limit = nil
+            try await send(["REQ", sub, replay.jsonObject()])
+        }
     }
 
     // MARK: - Operations
@@ -282,6 +479,7 @@ public actor MeshRelayClient {
                 "auth refused: \(ok.detail.isEmpty ? "refused" : ok.detail)")
         }
         isAuthenticated = true
+        wantsAuthentication = true
     }
 
     /// Publish a signed event, returning once the relay accepts it.
@@ -332,7 +530,7 @@ public actor MeshRelayClient {
         subscriptionCounter += 1
         let sub = "s-\(subscriptionCounter)"
         let stream = AsyncStream<MeshEvent> { continuation in
-            self.registerLive(sub: sub, continuation: continuation)
+            self.registerLive(sub: sub, filter: filter, continuation: continuation)
             continuation.onTermination = { _ in
                 Task { await self.closeLive(sub) }
             }
@@ -344,8 +542,14 @@ public actor MeshRelayClient {
 
     // MARK: - Internals
 
-    private func registerLive(sub: String, continuation: AsyncStream<MeshEvent>.Continuation) {
-        liveSubscriptions[sub] = continuation
+    private func registerLive(
+        sub: String, filter: MeshFilter, continuation: AsyncStream<MeshEvent>.Continuation
+    ) {
+        liveSubscriptions[sub] = LiveSubscription(
+            filter: filter,
+            continuation: continuation,
+            lastSeen: nil,
+            openedAt: Int64(Date().timeIntervalSince1970))
     }
 
     private func closeLive(_ sub: String) {
