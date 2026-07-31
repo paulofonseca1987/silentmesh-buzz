@@ -5295,15 +5295,17 @@ mod tests {
         // to alibi itself: break `channel()` for `Thread` and the entries
         // leak while this test still reads clean. A mutation run caught
         // exactly that.
+        //
+        // `contains_key` keeps that property: it resolves through the key's
+        // `Hash`/`Eq`, which `channel()` has no part in.
         for scope in [scope_a, scope_b] {
             assert!(
-                s.sessions
-                    .get(&SessionKey::Thread { channel: ch, scope })
-                    .is_none(),
+                !s.sessions
+                    .contains_key(&SessionKey::Thread { channel: ch, scope }),
                 "a thread session outlived its channel — the prototype's leak"
             );
         }
-        assert!(s.sessions.get(&SessionKey::Channel(ch)).is_none());
+        assert!(!s.sessions.contains_key(&SessionKey::Channel(ch)));
 
         // And the sweep is surgical: nothing else goes with it.
         assert!(s.sessions.contains_key(&SessionKey::Channel(neighbour)));
