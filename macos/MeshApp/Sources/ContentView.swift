@@ -226,7 +226,12 @@ struct ContentView: View {
                     }
                     .tag(Optional<String>.none)
                 }
-                Section("Work threads") {
+                Section {
+                    NewThreadField(model: model)
+                } header: {
+                    Text("Work threads")
+                }
+                Section {
                     if model.threads.isEmpty {
                         Text("No threads yet").font(.caption).foregroundStyle(.secondary)
                     }
@@ -254,7 +259,7 @@ struct ContentView: View {
                 if let selectedThread = model.selectedThread,
                     let thread = model.threads.first(where: { $0.id == selectedThread })
                 {
-                    ThreadDetailView(thread: thread)
+                    ThreadDetailView(thread: thread, model: model)
                 } else if model.messages.isEmpty {
                     ContentUnavailableView(
                         "No messages", systemImage: "text.bubble",
@@ -266,6 +271,25 @@ struct ContentView: View {
                         }
                         .padding(12)
                     }
+                }
+                if model.selectedThread == nil { Composer(model: model) }
+            }
+            .safeAreaInset(edge: .top) {
+                // A refusal is the relay explaining a policy — a tier
+                // mismatch, the privacy gate, missing authority. It is the
+                // most useful thing on screen when it happens, so it sits
+                // above the content rather than in a status line.
+                if let refusal = model.lastRefusal {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text(refusal).font(.callout).textSelection(.enabled)
+                        Spacer()
+                        Button("Dismiss") { model.lastRefusal = nil }
+                            .buttonStyle(.link).font(.caption)
+                    }
+                    .padding(10)
+                    .background(Color.orange.opacity(0.10))
                 }
             }
         }
@@ -294,5 +318,62 @@ struct NeedsConfigurationView: View {
         }
         .padding(40)
         .frame(minWidth: 520, minHeight: 300)
+    }
+}
+
+
+/// Send a message to the selected channel.
+struct Composer: View {
+    @ObservedObject var model: WorkspaceModel
+    @State private var draft = ""
+
+    var body: some View {
+        Divider()
+        HStack(spacing: 8) {
+            TextField("Message this channel", text: $draft, axis: .vertical)
+                .textFieldStyle(.plain)
+                .lineLimit(1...5)
+                .onSubmit(send)
+            Button(action: send) {
+                Image(systemName: "arrow.up.circle.fill").font(.title3)
+            }
+            .buttonStyle(.plain)
+            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isSending)
+        }
+        .padding(10)
+    }
+
+    private func send() {
+        let content = draft
+        guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        // Clear immediately: leaving the text in place after a send makes a
+        // double-send one keystroke away, and the refusal banner is what
+        // reports a rejection.
+        draft = ""
+        Task { await model.send(content: content) }
+    }
+}
+
+/// Open a work thread without leaving the column it appears in.
+struct NewThreadField: View {
+    @ObservedObject var model: WorkspaceModel
+    @State private var goal = ""
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "plus.circle").foregroundStyle(.secondary).font(.caption)
+            TextField("New thread — what needs doing?", text: $goal)
+                .textFieldStyle(.plain)
+                .font(.callout)
+                .onSubmit(open)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func open() {
+        let text = goal
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        goal = ""
+        Task { await model.openThread(goal: text, deadline: nil) }
     }
 }

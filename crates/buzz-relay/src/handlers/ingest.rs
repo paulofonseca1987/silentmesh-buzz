@@ -2541,12 +2541,41 @@ async fn ingest_event_inner(
             validate_work_thread_checkpoint(&event)
                 .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
         } else {
-            // silent-mesh: gate review (47022, D30) — same membership and
-            // thread-exists checks as a checkpoint; the tighter
-            // personal-channel-owner rule is applied in the side effect,
-            // where the personal registry is already being read.
+            // silent-mesh: gate review (47022, D30).
             validate_gate_review(&event)
                 .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+            // The personal-channel-owner rule is enforced HERE, not only in
+            // the side effect. A side effect can decline to act, but it
+            // cannot tell the member why: the event is already stored and
+            // the ack already sent, so a review requested on a team channel
+            // was accepted and then silently never arrived. Waiting forever
+            // for an answer that cannot come is worse than a refusal, so
+            // the refusal happens where a reason can still travel back.
+            if let Some(ch_id) = channel_id {
+                let owner = state
+                    .db
+                    .get_personal_channel_owner(tenant.community(), ch_id)
+                    .await
+                    .map_err(|e| IngestError::Internal(format!("error: personal lookup: {e}")))?;
+                match owner {
+                    Some(owner) if owner == event.pubkey.to_bytes().to_vec() => {}
+                    Some(_) => {
+                        return Err(IngestError::Rejected(
+                            "forbidden: only the personal channel's owner may request a gate \
+                             review of its threads"
+                                .into(),
+                        ));
+                    }
+                    None => {
+                        return Err(IngestError::Rejected(
+                            "invalid: a gate review previews what PROMOTING a personal thread \
+                             would expose — this channel is a team channel, so its content is \
+                             already shared with its members"
+                                .into(),
+                        ));
+                    }
+                }
+            }
         }
         if let Some(ch_id) = channel_id {
             let role = state

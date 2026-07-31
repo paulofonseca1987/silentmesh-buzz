@@ -88,6 +88,7 @@ struct ThreadRow: View {
 /// everything the relay said about it.
 struct ThreadDetailView: View {
     let thread: MeshThread
+    var model: WorkspaceModel?
 
     var body: some View {
         ScrollView {
@@ -113,6 +114,27 @@ struct ThreadDetailView: View {
                     }
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                    if let model {
+                        // The D30 pre-flight, where the member actually
+                        // stands: about to share private work, before
+                        // deciding what the summary says.
+                        HStack(spacing: 8) {
+                            Button("Check what promoting would expose") {
+                                Task {
+                                    await model.requestGateReview(
+                                        thread: thread.id, draftSummary: "")
+                                }
+                            }
+                            .controlSize(.small)
+                            .disabled(model.isSending)
+                            Button("Refresh") { Task { await model.refreshThreads() } }
+                                .controlSize(.small)
+                                .buttonStyle(.link)
+                                .font(.caption)
+                        }
+                        .padding(.top, 2)
+                    }
                 }
 
                 if thread.forkedFrom != nil || thread.promotedFrom != nil {

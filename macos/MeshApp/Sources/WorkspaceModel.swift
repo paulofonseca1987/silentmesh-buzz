@@ -41,6 +41,12 @@ final class WorkspaceModel: ObservableObject {
     @Published var selectedChannel: String?
     @Published private(set) var threads: [MeshThread] = []
     @Published var selectedThread: String?
+    /// The relay's own words when it refuses something. Silent Mesh
+    /// refuses for reasons a member needs to read — a tier mismatch, the
+    /// privacy gate, missing authority — so a refusal is surfaced rather
+    /// than logged.
+    @Published var lastRefusal: String?
+    @Published private(set) var isSending = false
 
     private var client: MeshRelayClient?
     private let relayURL: URL
@@ -167,6 +173,73 @@ final class WorkspaceModel: ObservableObject {
         } catch {
             status = "message load failed: \(describe(error))"
         }
+    }
+
+    /// Post a message to the selected channel.
+    ///
+    /// Reloads afterwards rather than appending optimistically: the relay
+    /// decides what is stored, and an optimistic row that the relay
+    /// refused would be a lie the member acts on.
+    func send(content: String) async {
+        guard let client, let channel = selectedChannel else { return }
+        isSending = true
+        defer { isSending = false }
+        do {
+            var event = try MeshEvent.chatMessage(
+                channel: channel, content: content, pubkey: keys.publicKeyHex)
+            try event.sign(with: keys)
+            try await client.publish(event)
+            lastRefusal = nil
+            await loadMessages(channel: channel)
+        } catch {
+            lastRefusal = describe(error)
+        }
+    }
+
+    /// Open a work thread in the selected channel.
+    func openThread(goal: String, deadline: Date?) async {
+        guard let client, let channel = selectedChannel else { return }
+        isSending = true
+        defer { isSending = false }
+        do {
+            var event = try MeshEvent.openThread(
+                channel: channel, goal: goal, deadline: deadline, pubkey: keys.publicKeyHex)
+            try event.sign(with: keys)
+            let id = try await client.publish(event)
+            lastRefusal = nil
+            await loadThreads(channel: channel)
+            selectedThread = id
+        } catch {
+            lastRefusal = describe(error)
+        }
+    }
+
+    /// Ask the Privacy Gate what promoting this thread would expose (D30).
+    ///
+    /// The answer arrives as a relay-signed kind:47023 attached to the
+    /// thread, so this only submits the request and reloads; the review
+    /// appears among the thread's notices when the local model is done.
+    func requestGateReview(thread: String, draftSummary: String) async {
+        guard let client, let channel = selectedChannel else { return }
+        isSending = true
+        defer { isSending = false }
+        do {
+            var event = try MeshEvent.gateReview(
+                channel: channel, threadRoot: thread, draftSummary: draftSummary,
+                pubkey: keys.publicKeyHex)
+            try event.sign(with: keys)
+            try await client.publish(event)
+            lastRefusal = nil
+        } catch {
+            lastRefusal = describe(error)
+        }
+    }
+
+    /// Poll for a thread's new notices — the gate review lands seconds
+    /// later, since a local model is doing real work in between.
+    func refreshThreads() async {
+        guard let channel = selectedChannel else { return }
+        await loadThreads(channel: channel)
     }
 
     /// Load every work-thread event in the channel and fold them.
