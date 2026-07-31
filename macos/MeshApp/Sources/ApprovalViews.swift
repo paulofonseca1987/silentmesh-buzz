@@ -33,6 +33,11 @@ struct ApprovalCard: View {
         }
     }
 
+    /// What the decision is about, said once so both buttons agree.
+    private var spokenSubject: String {
+        approval.detail.isEmpty ? kindLabel : approval.detail
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
@@ -61,10 +66,18 @@ struct ApprovalCard: View {
             switch approval.outcome {
             case .pending:
                 HStack(spacing: 8) {
+                    // Labelled with what is being decided, not just the
+                    // verb. These buttons publish no title of their own —
+                    // an accessibility dump shows four anonymous "button"
+                    // elements — so without this a screen-reader user is
+                    // asked to approve something they were never told, and
+                    // two cards on screen are indistinguishable.
                     Button("Approve") { decide(true) }
                         .buttonStyle(.borderedProminent)
+                        .accessibilityLabel("Approve: \(spokenSubject)")
                     Button("Deny") { decide(false) }
                         .buttonStyle(.bordered)
+                        .accessibilityLabel("Deny: \(spokenSubject)")
                     Spacer()
                     if let expires = approval.expiresAt {
                         // A deadline the member cannot see is a decision

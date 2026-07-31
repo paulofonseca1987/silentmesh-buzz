@@ -19,6 +19,25 @@ struct ThreadFoldTests {
             sig: String(repeating: "00", count: 64))
     }
 
+    /// Two captures of an unchanged channel, from two app launches, listed
+    /// the same four threads in two different orders. `Dictionary.values`
+    /// has no defined order and Swift's sort is not stable, so any threads
+    /// opened in the same second are free to swap — which reads as the
+    /// workspace rearranging itself for no reason.
+    @Test("threads opened in the same second are ordered by id, not by chance")
+    func sameSecondThreadOrderIsDeterministic() {
+        let ids = (0..<6).map { "root-\($0)" }
+        let roots = ids.shuffled().map {
+            event(id: $0, kind: MeshKind.workThreadOpen, at: 100, tags: [["h", "c"]])
+        }
+        // The specified order, not just "two folds agree" — within one
+        // process a dictionary hands back the same order either way, so
+        // self-consistency would pass with the bug in place.
+        #expect(
+            MeshFold.threads(from: roots).map(\.id) == ids.sorted(),
+            "same-second threads came back in an unspecified order")
+    }
+
     @Test("a root becomes an open thread carrying its task framing")
     func rootFold() {
         let root = event(

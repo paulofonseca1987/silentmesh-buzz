@@ -42,6 +42,15 @@ all in `macos/`, all validated against the live relay from the MacBook.
 - **The app** — channels with tier badges, work threads with status/fork/
   checkpoint/deadline, thread detail, gate-review cards, a composer, a
   new-thread field, and a **refusal banner** carrying the relay's own words.
+- **Supervised approvals** — the Phase 4 exit criterion's named surface.
+  The lifecycle is entirely on the wire (relay signs the 46010 request and
+  the 46011/46012 outcome; the member signs the 46030/46031 decision), so
+  `MeshApprovalFold` rebuilds the queue like `MeshFold` does threads.
+  **Kind 46010 is shared with workflow gates** — discriminated only by a
+  `domain` field in content — and the `d` tag is a *hash* of the approval
+  token, so a member decides without ever holding the secret. Proven by
+  clicking Approve in the running app and watching the relay's rows go
+  4 pending → 3 with that request `granted`.
 - **Live subscriptions** — one reader task owns `receive()` and
   demultiplexes every frame to its waiter (by subscription id, by event id,
   or to the challenge waiter). Serialized exchanges could not express a
@@ -74,16 +83,34 @@ of failing it. A wait whose escape hatch depends on the thing being waited
 for is not a timeout. Transport diagnostics now live behind `MESH_LOG=1`;
 one log line found what three rounds of theorising did not.
 
+**Both folds ordered non-deterministically** — found by two screenshots of
+an unchanged channel listing the same four threads in two different orders.
+`Dictionary.values` has no defined order and Swift's `sort` is not stable,
+so anything sharing a second is free to swap; on the approval queue that
+means **a card can move between reading it and clicking it**. Both folds now
+break ties on the id. The first test written for it passed with the bug in
+place (one process hands back the same dictionary order either way), so the
+tests assert the *specified* order rather than self-consistency — the
+recurring lesson, in a third form: **check a new test fails against the old
+code before trusting it.**
+
 **Mac working agreement.** SSH in with `ssh -i ~/.ssh/sm_e2e_mac
 paulofonseca@macbook.tail94f67c.ts.net`. Screen Recording **and**
 Accessibility are granted to sshd, so `macos/scripts/ui-select.sh` can
 select rows and capture the window headlessly (`click at` does NOT work on
 SwiftUI lists — set `selected` on the row; and the window moves, so read
-its position every call). **Signed builds still need a human**: a
-keychain-held signing key is unreachable from SSH (`User interaction is
-not allowed`) and unlock state is per-session, so each Swift change needs
-one `xcodebuild` run from a Terminal on the Mac. Everything after that —
-running, testing, screenshotting, driving the UI — is headless.
+its position every call). **Only vault work needs a human now**: the SSH
+gate is *codesigning*, not compiling, and only the Secure Enclave needs a
+real signature — so `CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY=""` with a
+separate `-derivedDataPath` builds, launches, connects, and captures
+entirely headlessly. A signed `xcodebuild` from a Terminal is still
+required before testing `MESH_VAULT=1`. Two traps: the swift-secp256k1
+build plugin leaves mode-`444` sources so the *next* build dies with 21
+`cp: Permission denied` lines and no Swift error (clear
+`BuildToolPluginIntermediates`), and the app's own `MESH_SNAPSHOT` capture
+prefers a PDF display list whenever it exceeds 20 KB — a near-blank
+`NavigationSplitView` render clears that bar, so prefer
+`screencapture -l<window-id>`.
 
 **Phase 3 slice 8 — the member owns their space's tier; promotion must
 satisfy the destination (2026-07-31).** Personal channels still start

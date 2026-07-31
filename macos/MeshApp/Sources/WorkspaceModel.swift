@@ -417,7 +417,12 @@ final class WorkspaceModel: ObservableObject {
         do {
             let events = try await client.query(
                 MeshFilter(kinds: kinds, limit: 500, tags: ["#h": [channel]]))
-            threads = MeshFold.threads(from: events).sorted { $0.createdAt > $1.createdAt }
+            // Newest first, ties by id — re-sorting without the tie-break
+            // would throw away the deterministic order the fold just
+            // established, since `sort` is not stable.
+            threads = MeshFold.threads(from: events).sorted {
+                $0.createdAt != $1.createdAt ? $0.createdAt > $1.createdAt : $0.id < $1.id
+            }
             FileHandle.standardError.write(
                 Data("mesh: threads query -> \(events.count) events, \(threads.count) threads\n".utf8))
             if let selected = selectedThread, !threads.contains(where: { $0.id == selected }) {

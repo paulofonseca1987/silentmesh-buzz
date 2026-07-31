@@ -188,6 +188,29 @@ struct ApprovalFoldTests {
         let approvals = MeshApprovalFold.approvals(from: [old, new])
         #expect(approvals.map(\.requestedAt) == [300, 100])
     }
+
+    /// Requests made in the same second must not shuffle between folds.
+    ///
+    /// The queue re-folds on every relay push, and it is built through a
+    /// dictionary — whose `values` have no defined order — then sorted with
+    /// a sort that is not stable. Without a tie-break a card can move
+    /// between the moment a member reads it and the moment they click, which
+    /// on this surface means approving the wrong thing. Three requests 150 ms
+    /// apart, as the live tests create, all land in the same second.
+    @Test("same-second requests are ordered by token hash, not by chance")
+    func sameSecondOrderIsDeterministic() {
+        let tokens = (0..<8).map { String(repeating: String(format: "%02x", $0 + 0x10), count: 32) }
+        let events = tokens.shuffled().map { requestEvent(token: $0, at: 500) }
+        let folded = MeshApprovalFold.approvals(from: events).map(\.tokenHash)
+        // Assert the *specified* order, not merely that two folds agree.
+        // Re-folding the same events in one process gives the same
+        // dictionary order whether or not the tie-break exists, so a
+        // self-consistency check passes with the bug in place — it did.
+        // The cross-process reordering that motivated this cannot be
+        // reproduced in a single test process, so the contract is what gets
+        // asserted.
+        #expect(folded == tokens.sorted(), "same-second requests came back in an unspecified order")
+    }
 }
 
 @Suite("Approval decisions")

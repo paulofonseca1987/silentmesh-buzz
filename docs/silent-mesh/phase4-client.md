@@ -174,6 +174,42 @@ Unit tests alone could not have caught the timestamp or the domain trap —
 both are properties of what the *relay* emits, not of what the client
 believes.
 
+### Driving the real UI found two things tests did not
+
+Approving from the app is the exit criterion, so the button was clicked
+through the accessibility API against the live relay, and the relay's own
+rows checked before and after: pending went 4 → 3 and that exact request
+became `granted`. Two findings came out of doing it rather than reasoning
+about it.
+
+**The fold ordering was non-deterministic.** Two captures of an unchanged
+channel, from two launches, listed the same four threads in two different
+orders. Both folds build a dictionary and sort on a second-granularity
+timestamp — and `Dictionary.values` has no defined order while Swift's
+`sort` is not stable, so anything sharing a second is free to swap. On the
+thread list that reads as the workspace rearranging itself. **On the
+approval queue it is worse than cosmetic: a card can move between the moment
+a member reads it and the moment they click**, and the three live tests
+create their requests 150 ms apart — all in the same second. Both folds now
+break ties on the id.
+
+The first test written for it *passed with the bug in place*: re-folding the
+same events inside one process gives the same dictionary order whether or
+not the tie-break exists, so self-consistency proved nothing. The cross-
+process variation that caused the symptom cannot be reproduced in a single
+test process, so the tests now assert the **specified** order instead. Both
+were then mutation-checked. Verified against the symptom too: three launches
+now produce byte-identical windows apart from the live expiry countdown.
+
+**The decision buttons publish no accessible name.** An accessibility dump
+of the approval cards shows four buttons whose only description is
+"button" — no `AXTitle`, no `AXDescription`. A screen-reader user is asked
+to approve something they were never told, and two cards on screen are
+indistinguishable. `.accessibilityLabel("Approve: <detail>")` is now set on
+both buttons; it did not make a name readable through System Events, so
+whether it reaches VoiceOver is **unverified** and worth checking with
+Accessibility Inspector on the Mac.
+
 ### Known gap: withdrawal is invisible
 
 `POST /api/approvals/resolve` lets the requesting agent cancel its own
@@ -271,19 +307,52 @@ secret and an app that keeps one.
 
 ## What still needs a human
 
-- **Signed builds.** A keychain-held signing key is unreachable from an SSH
-  session (`errSecInternalComponent`, and `security` reports "User
+- **Only vault work.** A keychain-held signing key is unreachable from an
+  SSH session (`errSecInternalComponent`, and `security` reports "User
   interaction is not allowed") — unlock state is per-session, so unlocking
-  in a console Terminal does not carry over. Each Swift change therefore
-  needs one `xcodebuild` run from a Terminal on the Mac. Everything after
-  that — running, testing, screenshotting, driving the UI — is headless,
-  because Screen Recording *and* Accessibility are granted to sshd.
+  in a console Terminal does not carry over.
+
+  But that gate is *codesigning*, not compiling, and only the Secure Enclave
+  needs a real signature. Building ad-hoc skips it entirely:
+
+  ```bash
+  xcodebuild -project MeshApp.xcodeproj -scheme MeshApp -configuration Debug \
+    -derivedDataPath /tmp/meshapp-adhoc \
+    CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" build
+  ```
+
+  The result launches, connects, renders, and can be driven and captured
+  headlessly. So everything except vault behaviour — which genuinely needs
+  the enclave, hence a real identity — no longer needs a human at the Mac.
+  A signed `xcodebuild` from a Terminal is still required before testing
+  `MESH_VAULT=1`.
+
+  One trap on repeat builds: the swift-secp256k1 build-tool plugin copies
+  its sources in as mode `444`, and the next build's `cp` fails with
+  `Permission denied` — 21 of them, and not one mentions Swift. Clear
+  `DerivedData/…/BuildToolPluginIntermediates` rather than hunting a
+  compile error that is not there.
 - **Nothing else.** `macos/scripts/ui-select.sh` selects rows and captures
   the window without a person present. Two traps it encodes: `click at`
   does not change a SwiftUI `List` selection (three byte-identical
   screenshots is how that was found — set `selected` via the accessibility
   API instead), and the window moves, so its position must be read on every
   call rather than cached.
+
+  Two more, learned driving the approval buttons. **Index by class, not by
+  position**: `UI element 5` and `group 3` are the same node, because groups
+  are interleaved with splitters — asking for `group 5` errors with "Invalid
+  index" and reads like the pane is missing. And **`entire contents of
+  window 1` finds nothing** in this app; navigate the explicit path
+  (`scroll area 1 of group 3 of splitter group 1 of group 1`) instead.
+
+- **The app's own `MESH_SNAPSHOT` self-capture is not trustworthy for this
+  UI.** It prefers the PDF display list whenever that exceeds 20 KB, and a
+  near-blank render of a `NavigationSplitView` clears that bar easily — it
+  produced a 23 KB image containing two text fields and nothing else. Size
+  is a poor proxy for "did it draw". Prefer `screencapture -l<window-id>`,
+  which needs Screen Recording (granted to sshd) but shows what is actually
+  on screen.
 
 ## Suggested next slices
 

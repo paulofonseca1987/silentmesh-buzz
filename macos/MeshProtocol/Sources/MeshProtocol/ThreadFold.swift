@@ -130,7 +130,16 @@ public enum MeshFold {
             threads[root] = thread
         }
 
-        return threads.values.sorted { $0.createdAt < $1.createdAt }
+        // Ties broken by id, for the same reason `foldKey` breaks them
+        // above: `Dictionary.values` has no defined order and Swift's sort
+        // is not stable, so threads opened in the same second come out in a
+        // different order on every fold. Two screenshots of an unchanged
+        // channel, taken from two launches, listed four threads in two
+        // different orders — which reads as the workspace rearranging
+        // itself.
+        return threads.values.sorted {
+            $0.createdAt != $1.createdAt ? $0.createdAt < $1.createdAt : $0.id < $1.id
+        }
     }
 
     private static func root(from event: MeshEvent) -> MeshThread {

@@ -118,7 +118,20 @@ public enum MeshApprovalFold {
             }
         }
 
-        return byToken.values.sorted { $0.requestedAt > $1.requestedAt }
+        // Newest first, ties broken by token hash.
+        //
+        // The tie-break is not tidiness. `Dictionary.values` has no defined
+        // order and Swift's `sort` is not stable, so two requests made in
+        // the same second come back in a different order on every fold —
+        // and this list re-folds on every relay push. A card that moves
+        // between the moment a member reads it and the moment they click
+        // approves the wrong thing, which is the one failure this surface
+        // must not have.
+        return byToken.values.sorted {
+            $0.requestedAt != $1.requestedAt
+                ? $0.requestedAt > $1.requestedAt
+                : $0.tokenHash < $1.tokenHash
+        }
     }
 
     /// Decode a kind:46010 into an agent-domain request, or `nil`.
