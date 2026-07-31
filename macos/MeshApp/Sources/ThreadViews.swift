@@ -191,6 +191,47 @@ struct NoticeRow: View {
         }
     }
 
+    /// Relay notices carry a small JSON body — the winning thread of a
+    /// fork family, the commit a canonicalization produced, where a
+    /// promotion went. Rendering the raw payload makes a member read JSON
+    /// to learn what happened to their own thread, so the known fields are
+    /// named and anything unrecognised falls back to the raw text rather
+    /// than being dropped.
+    private var readableBody: String? {
+        guard !notice.body.isEmpty else { return nil }
+        guard let data = notice.body.data(using: .utf8),
+            let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return notice.body }
+        var parts: [String] = []
+        // The overdue notice repeats the thread's goal and status, both
+        // already on screen a few points above. Only the deadline itself
+        // is news, so that is what is shown.
+        if let deadline = (payload["deadline"] as? NSNumber)?.doubleValue {
+            parts.append(
+                "deadline was "
+                    + Date(timeIntervalSince1970: deadline)
+                        .formatted(date: .abbreviated, time: .shortened))
+        }
+        if let winner = payload["winner"] as? String {
+            parts.append("winner: \(String(winner.prefix(12)))…")
+        }
+        if let commit = payload["commit"] as? String {
+            parts.append("commit: \(String(commit.prefix(12)))")
+        }
+        if let outcome = payload["outcome"] as? String { parts.append(outcome) }
+        if let to = payload["to"] as? String { parts.append("to: \(to)") }
+        if let thread = payload["thread"] as? String {
+            parts.append("new thread: \(String(thread.prefix(12)))…")
+        }
+        if parts.isEmpty {
+            // Nothing recognised: show the payload rather than hiding it.
+            // A notice whose meaning this client does not know yet is
+            // still information the member is entitled to see.
+            return notice.body
+        }
+        return parts.joined(separator: " · ")
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
@@ -204,8 +245,8 @@ struct NoticeRow: View {
                 let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             {
                 GateReviewCard(payload: payload)
-            } else if !notice.body.isEmpty {
-                Text(notice.body).font(.caption).foregroundStyle(.secondary)
+            } else if let summary = readableBody {
+                Text(summary).font(.caption).foregroundStyle(.secondary)
                     .textSelection(.enabled)
             }
         }
