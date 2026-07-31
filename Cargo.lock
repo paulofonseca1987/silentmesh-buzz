@@ -805,6 +805,7 @@ dependencies = [
  "buzz-db",
  "buzz-media",
  "buzz-pubsub",
+ "buzz-sdk",
  "buzz-search",
  "buzz-workflow",
  "chrono",

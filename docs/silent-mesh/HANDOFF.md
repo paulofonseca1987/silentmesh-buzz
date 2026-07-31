@@ -18,6 +18,44 @@ new session cannot learn from those.
 
 ## Shipped so far
 
+**A real agent turn ran end to end (2026-07-31).** Until now every claim
+about agent interaction rested on events *I synthesized*; the database had
+zero kind:44200/44201/24200 rows. A live turn now runs: `@mention` →
+kind:7 👀 → kind:7 💬 → local model → answer → kind:5 clearing both
+reactions → kind:44200/44201 telemetry, metered by `buzz-admin usage` as
+**private / local**. Harness: `buzz-acp` spawning in-tree `buzz-agent`
+against Ollama.
+
+Three things only a real turn could find:
+
+1. **The tier gate refused the first two turns — correctly.** `BUZZ_ACP_MODEL`
+   must be the *qualified* `ollama:qwen2.5:7b`, and the harness only accepts a
+   Local-class prefix when the AGENT ADVERTISES IT EXACTLY — locality must be
+   self-declared, never inferred by stripping (`ollama:claude-x` must not
+   confirm against a vendor agent advertising bare `claude-x`). So
+   `buzz-agent` needs `BUZZ_AGENT_PROVIDER=ollama` (its `Provider::Ollama`
+   arm advertises the prefixed id); with `=openai` it advertises a bare id,
+   the switch cannot be confirmed, and the gate fails closed rather than let
+   an unverified fallback serve a private channel.
+2. **Telemetry was refused 403 while the turn succeeded.** The relay accepts
+   kind:44200/44201 only when the `p` tag is the agent's *registered* owner,
+   and that mapping is materialized only from a verified **NIP-OA auth tag**.
+   `BUZZ_ACP_AGENT_OWNER` is an assertion; the auth tag is the proof. Without
+   it every turn works and no metering ever lands — silent, and exactly the
+   data the model plane bills on.
+3. **Nothing could mint that tag headlessly.** `buzz-sdk` could verify but not
+   issue; the only path was the owner's Desktop. Added
+   `buzz-admin mint-auth-tag --agent <hex>`, signed with the OWNER's
+   `BUZZ_PRIVATE_KEY` (an agent cannot attest to owning itself).
+
+Testbed runbook: `/tmp/agent-env.sh` shape — `BUZZ_ACP_AGENT_COMMAND`,
+`BUZZ_ACP_AGENT_OWNER`, `BUZZ_ACP_MODEL=ollama:<tag>`,
+`BUZZ_AGENT_PROVIDER=ollama`, `OLLAMA_MODEL`, `OLLAMA_BASE_URL`, and
+`BUZZ_AUTH_TAG` from `mint-auth-tag`. The agent needs a kind:0 profile
+(`buzz users set-profile --name Mesh`) or `@mention` never resolves to the
+`p` tag that wakes it. **Never `pkill -f buzz-acp`** — it matches the
+invoking shell; filter `pgrep -x` by `/proc/<pid>/exe`.
+
 **Phase 4 — the macOS client works end to end (2026-07-31).** Five pieces,
 all in `macos/`, all validated against the live relay from the MacBook.
 68 Swift tests — 55 run anywhere, 13 only against a relay (the "Test run

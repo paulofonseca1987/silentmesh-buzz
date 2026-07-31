@@ -74,6 +74,28 @@ enum Command {
     ListMembers,
     /// Generate a new Nostr keypair (for bootstrapping).
     GenerateKey,
+    /// Mint a NIP-OA `auth` tag binding an agent to its owner.
+    ///
+    /// The relay refuses an agent's turn telemetry (kind:44200/44201) unless
+    /// the `p` tag names that agent's *registered* owner, and the mapping is
+    /// materialized only from a verified auth tag. Telling the harness who
+    /// the owner is (`BUZZ_ACP_AGENT_OWNER`) is an assertion; this is the
+    /// proof — so without it every attribution publish is refused 403 while
+    /// the turn itself succeeds, and the metering the model plane depends on
+    /// silently never lands.
+    ///
+    /// Signs with the OWNER's key (`BUZZ_PRIVATE_KEY`), because only the
+    /// owner can attest to owning an agent. Set the printed value as
+    /// `BUZZ_AUTH_TAG` on the harness.
+    MintAuthTag {
+        /// The agent's public key (64-char hex).
+        #[arg(long)]
+        agent: String,
+        /// Optional NIP-OA condition string (e.g. `kind=44201`). Empty means
+        /// unconditional.
+        #[arg(long, default_value = "")]
+        conditions: String,
+    },
     /// Run pending database migrations.
     Migrate,
     /// Inspect deployment-wide Buzz product feedback.
@@ -144,6 +166,26 @@ async fn run(cli: Cli) -> Result<i32> {
             println!("Public key:  {}", keys.public_key().to_hex());
             println!("Secret key:  {}", keys.secret_key().display_secret());
             println!("\nSet BUZZ_PRIVATE_KEY to the secret key to use this identity.");
+            Ok(0)
+        }
+        Command::MintAuthTag { agent, conditions } => {
+            let owner_hex = std::env::var("BUZZ_PRIVATE_KEY").map_err(|_| {
+                anyhow::anyhow!(
+                    "BUZZ_PRIVATE_KEY must be the OWNER's secret key — an agent cannot attest to owning itself"
+                )
+            })?;
+            let owner_keys = Keys::parse(&owner_hex)
+                .map_err(|e| anyhow::anyhow!("invalid BUZZ_PRIVATE_KEY: {e}"))?;
+            let agent_pubkey = nostr::PublicKey::parse(&agent)
+                .map_err(|e| anyhow::anyhow!("invalid --agent pubkey: {e}"))?;
+            let tag = buzz_sdk::nip_oa::compute_auth_tag(&owner_keys, &agent_pubkey, &conditions)
+                .map_err(|e| anyhow::anyhow!("mint failed: {e}"))?;
+            println!("{tag}");
+            eprintln!(
+                "\nowner {} attests agent {}\nSet this as BUZZ_AUTH_TAG on the agent's harness.",
+                owner_keys.public_key().to_hex(),
+                agent_pubkey.to_hex()
+            );
             Ok(0)
         }
         Command::Migrate => {
