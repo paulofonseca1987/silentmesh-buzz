@@ -286,6 +286,10 @@ struct ContentView: View {
                     let thread = model.threads.first(where: { $0.id == selectedThread })
                 {
                     ThreadDetailView(thread: thread, model: model)
+                    // A thread without this is read-only: the channel
+                    // composer is hidden while one is open, so there would
+                    // be no way to speak in it — or to summon an agent.
+                    ThreadComposer(threadRoot: thread.id, model: model)
                 } else if model.messages.isEmpty {
                     ContentUnavailableView(
                         "No messages", systemImage: "text.bubble",

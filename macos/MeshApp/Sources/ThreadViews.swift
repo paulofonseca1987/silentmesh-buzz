@@ -86,6 +86,44 @@ struct ThreadRow: View {
 
 /// A thread's full state: framing, provenance, the checkpoint trail, and
 /// everything the relay said about it.
+/// Talk inside a work thread — and the only way to summon an agent into
+/// one.
+///
+/// The channel composer is hidden while a thread is open, so without this a
+/// thread is read-only: a member can create it and watch it, but cannot
+/// address anyone in it. That is not a cosmetic gap — an `@mention` in the
+/// thread's *goal* is a `p` tag on a kind:47000, and the harness does not
+/// subscribe to that kind.
+struct ThreadComposer: View {
+    let threadRoot: String
+    @ObservedObject var model: WorkspaceModel
+    @State private var draft = ""
+
+    var body: some View {
+        Divider()
+        HStack(spacing: 8) {
+            TextField("Message this thread — @mention to bring in an agent", text: $draft, axis: .vertical)
+                .textFieldStyle(.plain)
+                .lineLimit(1...5)
+                .onSubmit(send)
+            Button(action: send) {
+                Image(systemName: "arrow.up.circle.fill").font(.title3)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Send to this thread")
+            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isSending)
+        }
+        .padding(10)
+    }
+
+    private func send() {
+        let content = draft
+        guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        draft = ""
+        Task { await model.sendToThread(threadRoot, content: content) }
+    }
+}
+
 struct ThreadDetailView: View {
     let thread: MeshThread
     var model: WorkspaceModel?

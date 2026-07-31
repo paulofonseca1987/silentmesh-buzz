@@ -442,6 +442,31 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
+    /// Post a message into a work thread.
+    ///
+    /// A kind:9 carrying an `e` tag at the thread root — which is also the
+    /// only way to summon an agent into a thread. The harness subscribes to
+    /// kind:9 (plus 46010/40007) and **not** to kind:47000, so an
+    /// `@mention` typed into the thread's *goal* produces a `p` tag nothing
+    /// listens for. It has to be said in the thread, not in its title.
+    func sendToThread(_ threadRoot: String, content: String) async {
+        guard let client, let channel = selectedChannel else { return }
+        isSending = true
+        defer { isSending = false }
+        do {
+            let mentions = MeshMentions.resolve(content: content, profiles: memberProfiles)
+            var event = try MeshEvent.chatMessage(
+                channel: channel, content: content, replyTo: threadRoot,
+                mentions: mentions, pubkey: keys.publicKeyHex)
+            try event.sign(with: keys)
+            try await client.publish(event)
+            lastRefusal = nil
+            await loadMessages(channel: channel)
+        } catch {
+            lastRefusal = describe(error)
+        }
+    }
+
     /// Open a work thread in the selected channel.
     func openThread(goal: String, deadline: Date?) async {
         guard let client, let channel = selectedChannel else { return }
