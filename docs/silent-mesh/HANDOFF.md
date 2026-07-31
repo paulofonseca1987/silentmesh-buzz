@@ -18,6 +18,39 @@ new session cannot learn from those.
 
 ## Shipped so far
 
+**Phase 4 foundation — MeshProtocol (2026-07-31).** `macos/MeshProtocol`,
+an SPM library (no UI, no entitlements — the half provable headlessly over
+SSH). Event id computed by hand from NIP-01's canonical array (an encoder
+that sorts keys produces unverifiable events); `isValid()` recomputes the
+id AND checks the signature over it. Relay client is an actor that waits
+for the matching OK and verifies query results. Kind mirror is tested
+**against `kind.rs` itself**. 11 tests pass on Swift 6.3.3, incl. 2 gated
+interop tests run live from the MacBook against the WSL relay. Blocked
+next: MeshVault needs entitlements (Xcode now installed) and the app needs
+an Xcode project — recommend `xcodegen`. See phase4-client.md.
+
+**Phase 3 slice 8 — the member owns their space's tier; promotion must
+satisfy the destination (2026-07-31).** Personal channels still start
+`owned` but the member may re-tier (kind:9002 + `tier` tag, which buys the
+39000 re-emission the harness reads); team channels keep D26 immutability.
+Migration 0035 **narrows** the trigger (exemption is data-driven off
+`personal_channels`), and `set_personal_channel_tier`'s SQL joins the
+registry on the owner pubkey so it cannot reach a team channel or someone
+else's space. Promotion refuses loose→strict, **and** consults
+`model_usage`: a source channel that actually ran a backend the target's
+tier forbids is refused regardless of declared tiers — otherwise flipping
+the source tier a second before promoting would bypass the rule.
+
+**Phase 3 E2E + gate-assist fix (2026-07-31).** `phase3-e2e.sh` (24 checks)
+green, `phase2-exit-dryrun.sh` still 30/30, cross-machine with the MacBook
+as client. The run found a real defect: the assist's suggested summary
+NAMED the customer its own advisory flagged, invisible to the scanners
+(no credential shape). Fixed by asking the model for **findings** not
+advice, and by replacing the judgment self-check ("does this leak?" — both
+models said no) with an **extraction** one ("list every name and
+credential in this summary"). Withheld summaries are reported via
+`summaryVetting`. See phase3-e2e-findings.md for the decisions taken.
+
 **Phase 3 slice 7 — personal channels are the `owned` tier (2026-07-31).**
 Closes the D24/D29 gap slice 6's live run surfaced: personal channels were
 created at the `open` default, so an **agent turn** in a member's most
