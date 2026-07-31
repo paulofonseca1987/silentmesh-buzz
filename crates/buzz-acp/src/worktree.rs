@@ -636,6 +636,55 @@ pub fn repo_binding_from_events(
     None
 }
 
+/// Decide whether a turn earns a worktree, and which repo it binds to.
+///
+/// This is the whole admission rule in one place, so the harness call site
+/// cannot get the ordering wrong and so every clause is testable without a
+/// relay. Both inputs are query results the caller already has to fetch:
+/// `root_events` is whatever came back for the thread-root id, and
+/// `repo_events` the channel's kind:30617 announcements.
+///
+/// Returns `Some((repo_owner_hex, repo_name))` only when **every** clause
+/// holds; any doubt returns `None` and the turn runs in the harness cwd as it
+/// does today. That is the safe direction: a turn that should have had a
+/// worktree and didn't merely loses its per-turn checkpoint, while a turn
+/// given the *wrong* worktree pushes a private channel's work to someone
+/// else's repo.
+///
+/// The clauses, in order:
+///
+/// 1. **There is a thread root at all.** A bare channel message has none, and
+///    an empty or non-hex id is treated as absent rather than looked up.
+/// 2. **The root is a work-thread root** (kind:47000 or :47020). An ordinary
+///    NIP-10 thread on a kind:9 message is a conversation, not a task, and
+///    must not provision a branch. If the root event was not returned by the
+///    query its kind is unknown — fail closed, because "unknown kind" and
+///    "not a work thread" must not be distinguishable in the safe direction.
+/// 3. **The channel has a repo bound by a relay-signed announcement**, via
+///    [`repo_binding_from_events`], which is where the author check lives.
+///
+/// `relay_self_hex` is the relay's own signing pubkey — see
+/// [`crate::relay::RestClient::relay_self_pubkey`]. `None` (undiscoverable)
+/// fails closed here rather than at the git layer, so a relay whose NIP-11 is
+/// unreachable simply never provisions worktrees.
+pub fn worktree_target_for_turn(
+    channel_id: Uuid,
+    thread_root_hex: Option<&str>,
+    root_events: &[serde_json::Value],
+    repo_events: &[serde_json::Value],
+    relay_self_hex: Option<&str>,
+) -> Option<(String, String)> {
+    let root = thread_root_hex?.trim();
+    if root.len() != 64 || !root.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let kind = event_kind_by_id(root_events, root)?;
+    if !is_work_thread_root_kind(kind) {
+        return None;
+    }
+    repo_binding_from_events(repo_events, channel_id, relay_self_hex?)
+}
+
 /// Extract the kind of the event with id `id_hex` from a query result set.
 pub fn event_kind_by_id(events: &[serde_json::Value], id_hex: &str) -> Option<u64> {
     events.iter().find_map(|ev| {
@@ -735,6 +784,147 @@ mod tests {
         assert_eq!(event_kind_by_id(evs, "zz"), None);
         assert!(is_work_thread_root_kind(47000) && is_work_thread_root_kind(47020));
         assert!(!is_work_thread_root_kind(9) && !is_work_thread_root_kind(47001));
+    }
+
+    // ── worktree_target_for_turn: the admission rule ────────────────────
+    //
+    // Each test below kills exactly one clause. They are written so that
+    // deleting any single check in `worktree_target_for_turn` turns one of
+    // them red — a suite where the happy path alone passes would let the
+    // whole rule be silently removed.
+
+    fn relay_self() -> String {
+        "6e32e3a8".repeat(8)
+    }
+
+    fn root_id() -> String {
+        "ab".repeat(32)
+    }
+
+    fn root_event(kind: u64) -> serde_json::Value {
+        serde_json::json!([{ "id": root_id(), "kind": kind }])
+    }
+
+    fn repo_event(channel: Uuid, signer: &str) -> serde_json::Value {
+        serde_json::json!([{ "id": "repo", "kind": 30617, "pubkey": signer, "tags": [
+            ["d", "chan-repo"], ["buzz-channel", channel.to_string()]
+        ]}])
+    }
+
+    #[test]
+    fn a_work_thread_root_with_a_relay_signed_repo_gets_a_worktree() {
+        let channel = Uuid::from_u128(11);
+        for kind in [47000, 47020] {
+            assert_eq!(
+                worktree_target_for_turn(
+                    channel,
+                    Some(&root_id()),
+                    root_event(kind).as_array().unwrap(),
+                    repo_event(channel, &relay_self()).as_array().unwrap(),
+                    Some(&relay_self()),
+                ),
+                Some((relay_self(), "chan-repo".into())),
+                "kind {kind} is a work-thread root"
+            );
+        }
+    }
+
+    /// An ordinary NIP-10 thread on a chat message is a conversation, not a
+    /// task. Provisioning a branch for one would put a worktree behind every
+    /// reply in the channel.
+    #[test]
+    fn an_ordinary_message_thread_gets_no_worktree() {
+        let channel = Uuid::from_u128(11);
+        assert_eq!(
+            worktree_target_for_turn(
+                channel,
+                Some(&root_id()),
+                root_event(9).as_array().unwrap(),
+                repo_event(channel, &relay_self()).as_array().unwrap(),
+                Some(&relay_self()),
+            ),
+            None
+        );
+    }
+
+    /// "The root event wasn't in the query result" must be indistinguishable
+    /// from "not a work thread" — both are absence of proof, and only proof
+    /// may provision.
+    #[test]
+    fn an_unresolvable_root_kind_fails_closed() {
+        let channel = Uuid::from_u128(11);
+        let empty: Vec<serde_json::Value> = vec![];
+        assert_eq!(
+            worktree_target_for_turn(
+                channel,
+                Some(&root_id()),
+                &empty,
+                repo_event(channel, &relay_self()).as_array().unwrap(),
+                Some(&relay_self()),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_turn_with_no_thread_root_gets_no_worktree() {
+        let channel = Uuid::from_u128(11);
+        for root in [None, Some(""), Some("not-hex"), Some("abc")] {
+            assert_eq!(
+                worktree_target_for_turn(
+                    channel,
+                    root,
+                    root_event(47000).as_array().unwrap(),
+                    repo_event(channel, &relay_self()).as_array().unwrap(),
+                    Some(&relay_self()),
+                ),
+                None,
+                "root {root:?} must not provision"
+            );
+        }
+    }
+
+    /// If the relay's own key could not be discovered there is nothing to
+    /// check an announcement's author against, so no binding may be trusted —
+    /// the redirect hole is exactly what an unknown expected-owner reopens.
+    ///
+    /// This asserts the *behaviour*, not a specific layer, and deliberately
+    /// so: the guard here is redundant with `repo_binding_from_events`'s own
+    /// empty-`expected_owner_hex` check. A mutation run confirms it —
+    /// replacing `relay_self_hex?` with `unwrap_or("")` leaves this test
+    /// green, because the engine still refuses. Two independent refusals are
+    /// worth keeping; claiming this test pins the outer one would not be.
+    #[test]
+    fn an_undiscoverable_relay_identity_fails_closed() {
+        let channel = Uuid::from_u128(11);
+        assert_eq!(
+            worktree_target_for_turn(
+                channel,
+                Some(&root_id()),
+                root_event(47000).as_array().unwrap(),
+                repo_event(channel, &relay_self()).as_array().unwrap(),
+                None,
+            ),
+            None
+        );
+    }
+
+    /// The author check must still bite through this entry point, not only
+    /// when `repo_binding_from_events` is called directly.
+    #[test]
+    fn a_forged_repo_announcement_is_refused_through_the_admission_rule() {
+        let channel = Uuid::from_u128(11);
+        let attacker = "deadbeef".repeat(8);
+        assert_eq!(
+            worktree_target_for_turn(
+                channel,
+                Some(&root_id()),
+                root_event(47000).as_array().unwrap(),
+                repo_event(channel, &attacker).as_array().unwrap(),
+                Some(&relay_self()),
+            ),
+            None
+        );
     }
 
     /// The redirection this resolver exists to refuse.

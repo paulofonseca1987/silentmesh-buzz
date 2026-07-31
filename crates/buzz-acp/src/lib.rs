@@ -1367,6 +1367,27 @@ async fn tokio_main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("membership notification subscribe error: {e}"))?;
     tracing::info!("subscribed to membership notifications");
 
+    // The relay's own signing pubkey, from NIP-11 `self` (NIP-43).
+    //
+    // Resolved once at startup because it is the expected author of the
+    // kind:30617 announcements that bind a channel to its forge repo, and a
+    // binding from any other author is a redirection hole (see
+    // `worktree::repo_binding_from_events`). Reported here rather than
+    // discovered lazily so an operator learns at boot whether work-thread
+    // worktrees can ever provision, instead of finding out from turns that
+    // silently never checkpoint.
+    //
+    // Not fatal when absent: the harness runs exactly as it does today, and
+    // `worktree::worktree_target_for_turn` fails closed on a `None`.
+    let relay_self_pubkey = relay.rest_client().relay_self_pubkey().await;
+    match relay_self_pubkey.as_deref() {
+        Some(pk) => tracing::info!("relay identity (NIP-11 self): {pk}"),
+        None => tracing::info!(
+            "relay identity unavailable (NIP-11 `self` absent or unreachable) — \
+             work-thread worktrees cannot be bound"
+        ),
+    }
+
     let presence_publisher = relay.event_publisher();
     let presence_keys = config.keys.clone();
 

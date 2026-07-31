@@ -448,6 +448,48 @@ impl RestClient {
             .map_err(|e| RelayError::Http(e.to_string()))
     }
 
+    /// The relay's **own signing pubkey** (hex), read from the NIP-11 document's
+    /// `self` field (NIP-43).
+    ///
+    /// This is the identity that signs relay-authored events — notably the
+    /// kind:30617 repo announcements that bind a channel to a forge repo.
+    /// Resolving it is a prerequisite for trusting such a binding: publishing a
+    /// 30617 needs only `Scope::ReposWrite`, which ordinary members hold, so
+    /// without an author check any member could redirect a channel's agent
+    /// worktrees to a repo they control (see
+    /// [`crate::worktree::repo_binding_from_events`]).
+    ///
+    /// **Read `self`, not `pubkey`.** NIP-11 carries two different keys and
+    /// only one is the signer: `pubkey` is the operator's *contact* key and is
+    /// commonly unset (it is `None` on our own deployments), while `self` is
+    /// the relay's signing key. Reaching for the obvious-looking field yields
+    /// `None`, and a `None` expected-owner makes every binding resolve to
+    /// nothing — the failure would look like "no repo bound" rather than
+    /// "asked the wrong question".
+    ///
+    /// NIP-11 is public metadata, so this is deliberately an unauthenticated
+    /// plain GET: no NIP-98 signature, no `x-auth-tag`, and no retry. Any
+    /// failure returns `None` and the caller must fail closed rather than
+    /// proceed with an unverified binding.
+    pub async fn relay_self_pubkey(&self) -> Option<String> {
+        let resp = self
+            .http
+            .get(format!("{}/", self.base_url))
+            .header("Accept", "application/nostr+json")
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let doc: Value = resp.json().await.ok()?;
+        let key = doc.get("self")?.as_str()?.trim();
+        // A 64-hex key or nothing: a truncated or malformed value must not
+        // become an `expected_owner_hex` that quietly matches nothing.
+        (key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| key.to_ascii_lowercase())
+    }
+
     /// Submit a signed event via the HTTP bridge: `POST /events` with NIP-98 auth.
     ///
     /// The event must already be signed. Returns the relay response JSON.
@@ -4101,6 +4143,45 @@ async fn wait_for_any_ok(
             Message::Close(_) => return Err(RelayError::ConnectionClosed),
             _ => {}
         }
+    }
+}
+
+/// Live probe for relay-identity discovery.
+///
+/// Gated because it needs a running relay. It exists because the value this
+/// reads is load-bearing for trust — it is the author every kind:30617 repo
+/// binding is checked against — and the field is easy to get wrong: NIP-11
+/// carries both `pubkey` (operator contact, commonly unset) and `self` (the
+/// signing key), and reaching for the wrong one yields `None`, which reads
+/// as "no repo bound" rather than "asked the wrong question".
+///
+/// Run: `BUZZ_ACP_RELAY_PROBE=1 BUZZ_RELAY_URL=ws://<host>:<port> \
+/// cargo test -p buzz-acp --lib relay::probe_tests -- --ignored`
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires a running relay; BUZZ_ACP_RELAY_PROBE=1"]
+    async fn relay_self_pubkey_is_a_64_hex_key() {
+        if std::env::var("BUZZ_ACP_RELAY_PROBE").as_deref() != Ok("1") {
+            return;
+        }
+        let url = std::env::var("BUZZ_RELAY_URL").expect("BUZZ_RELAY_URL");
+        let client = RestClient {
+            http: reqwest::Client::new(),
+            base_url: relay_ws_to_http(&url),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+        let key = client
+            .relay_self_pubkey()
+            .await
+            .expect("relay must advertise NIP-11 `self`");
+        assert_eq!(key.len(), 64, "got {key:?}");
+        assert!(key
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
     }
 }
 
