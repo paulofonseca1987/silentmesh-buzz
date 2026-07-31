@@ -201,6 +201,11 @@ public struct MeshVault: Sendable {
     /// which is the point.
     public func destroy() throws {
         try? FileManager.default.removeItem(at: storeURL)
+        // A software vault has no enclave key, and asking the keychain
+        // about one is not merely pointless: in an unentitled process the
+        // query fails with -34018, so destroying a software vault would
+        // report an enclave error it never had.
+        guard protection != .softwarePassphrase else { return }
         let query: [String: Any] = [
             kSecClass as String: kSecClassKey,
             kSecAttrApplicationTag as String: keyTag,
