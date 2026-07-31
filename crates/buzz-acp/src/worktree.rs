@@ -26,12 +26,22 @@
 //! Every git subprocess has a wall-clock timeout and runs with system and
 //! user gitconfig neutralized.
 //!
-//! Testability: the full git lifecycle (authenticated provision from a
-//! bound source repo → worktree add → commit-or-skip → push → idempotent
-//! re-entry → re-provision after external deletion → empty-repo soft-fail)
-//! is exercised against local bare repos by the gated `probe_tests`; the
-//! pure helpers have unit tests. Live NIP-98 push auth to the *relay's*
-//! smart-HTTP forge needs a running relay + the `git-credential-nostr`
+//! Testability: the full git lifecycle (provision from a bound source repo
+//! → worktree add → commit-or-skip → push → idempotent re-entry →
+//! re-provision after external deletion → empty-repo soft-fail) is
+//! exercised against local bare repos by the gated `probe_tests`; the pure
+//! helpers have unit tests.
+//!
+//! **The auth path is not covered by any test.** Every `probe_tests` call
+//! passes a `repo_url_override`, which is precisely the branch that skips
+//! `auth_cli_flags` and `apply_push_auth` (see `ensure_worktree`) — a local
+//! bare repo needs no credentials. So `ensure_keyfile`, `auth_cli_flags`
+//! and `apply_push_auth` have no coverage at all; only the pure
+//! `push_auth_config` is unit-tested. That matters more than it looks: the
+//! reverted wiring prototype cloned *unauthenticated* and 401'd against
+//! every live relay, and this is the gap that would have caught it. Live
+//! NIP-98 push auth to the *relay's* smart-HTTP forge needs a running relay
+//! + the `git-credential-nostr`
 //! helper on PATH, like the promote/canonicalize S3 probes.
 
 use std::path::{Path, PathBuf};
