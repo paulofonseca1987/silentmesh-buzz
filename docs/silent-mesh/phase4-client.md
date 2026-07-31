@@ -61,12 +61,66 @@ MESH_RELAY_URL=ws://<relay> MESH_PRIVATE_KEY=<64-hex> MESH_CHANNEL=<uuid> \
   swift test            # gated; without MESH_RELAY_URL only the 9 pure tests run
 ```
 
+## MeshVault — verified on hardware (2026-07-31)
+
+`macos/MeshProtocol/Sources/MeshVault`. The identity is sealed at rest by
+a **non-extractable P-256 key generated inside the Secure Enclave**; the
+enclave never holds the identity itself (it does P-256 only, and a Nostr
+identity is secp256k1), so it wraps rather than stores. Encryption uses
+the enclave key's public half — saving needs no prompt — while decryption
+uses the private half, so unlocking does.
+
+Getting there took three separate gates, each of which reports the same
+useless error (`-34018`) and so is easy to mistake for the previous one:
+
+| Gate | Symptom | Fix |
+|---|---|---|
+| Ad-hoc signature | ephemeral enclave keys work, persisting fails | a real signing identity |
+| No team identifier | still -34018 once signed | `DEVELOPMENT_TEAM` (pinned in `project.yml`, since `xcodegen` rewrites the project) |
+| No keychain access group | still -34018 with a team | `keychain-access-groups` entitlement **plus** `kSecUseDataProtectionKeychain: true` |
+
+The last two must land together: an enclave key lives in the
+data-protection keychain and must belong to an access group the app is
+entitled to. Without the flag the call targets the legacy file keychain,
+which cannot hold one at all.
+
+**The relaunch test.** Sealing and unlocking in one process proves the
+wrapping works and nothing about being locked at rest — macOS can treat a
+key's creator as already authenticated, so it may never prompt. The claim
+the roadmap makes ("the app relaunches locked") is cross-process, so the
+self-test runs as two launches:
+
+```
+$ MESH_VAULT_SELFTEST=presence-seal   …/MeshApp   # process A
+vault: seal: ok
+$ MESH_VAULT_SELFTEST=presence-unlock …/MeshApp   # process B, fresh
+vault: unlock: ok — identity round-tripped in 6.9s
+vault: result: PASS
+```
+
+Process B showed the system prompt — *"Silent Mesh is trying to Unlock
+your Silent Mesh identity"* — and 6.9 s is a human reaching for the
+sensor. The elapsed time is reported precisely because a cached grant
+returns instantly, and pass/fail alone could not tell the two apart.
+
+`.userPresence` rather than `.biometryCurrentSet`: Touch ID *or* the login
+password. A member whose finger is not read should be inconvenienced, not
+locked out of their workspace.
+
+With `MESH_VAULT=1` the app now imports an environment key into the vault
+on first launch and never reads it again; later launches have no identity
+until the member unlocks. That is the difference between an app handed a
+secret and an app that keeps one.
+
 ## What is blocked, and on what
 
-- **`MeshVault`** (SE-wrapped master key, biometric/PIN unlock) needs
-  entitlements and a signed build. Xcode is now installed, so this is
-  unblocked — but note it cannot be *proven* over SSH: biometric unlock
-  needs a human at the machine.
+- **Signed builds still need a human.** A keychain-held signing key is
+  unreachable from an SSH session (`errSecInternalComponent`, and
+  `security` reports "User interaction is not allowed") — unlock state is
+  per-session, so unlocking in a console Terminal does not carry over.
+  Swift changes therefore need one `xcodebuild` run from a Terminal on the
+  Mac; everything after that (running, testing, screenshotting) works
+  headlessly.
 - **The SwiftUI app** needs an Xcode project. Recommend `xcodegen`
   (`brew install xcodegen`) so the project is a YAML file that can be
   edited and regenerated deterministically; hand-editing `project.pbxproj`

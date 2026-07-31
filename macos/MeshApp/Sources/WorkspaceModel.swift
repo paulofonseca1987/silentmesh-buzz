@@ -1,5 +1,6 @@
 import Foundation
 import MeshProtocol
+import MeshVault
 import SwiftUI
 
 /// One channel as the client understands it, folded from the relay's
@@ -51,11 +52,28 @@ final class WorkspaceModel: ObservableObject {
     let isConfigured: Bool
 
     init?(environment: [String: String] = ProcessInfo.processInfo.environment) {
-        guard let urlString = environment["MESH_RELAY_URL"],
-              let url = URL(string: urlString),
-              let keyHex = environment["MESH_PRIVATE_KEY"],
-              let keys = try? MeshKeys(privateKeyHex: keyHex)
+        guard let urlString = environment["MESH_RELAY_URL"], let url = URL(string: urlString)
         else { return nil }
+        // With MESH_VAULT=1 the app holds its own identity instead of being
+        // handed one: an env key is imported into the vault on first run and
+        // never read again, so a later launch has nothing to run on until
+        // the member unlocks. That is the difference between an app given a
+        // secret and an app that keeps one.
+        let keys: MeshKeys
+        if environment["MESH_VAULT"] == "1" {
+            let vault = MeshVault(protection: .secureEnclaveWithUserPresence)
+            if !vault.vaultExists, let seed = environment["MESH_PRIVATE_KEY"] {
+                try? vault.seal(identityHex: seed)
+            }
+            guard let unlocked = try? vault.unlock(reason: "Unlock your Silent Mesh workspace")
+            else { return nil }
+            keys = unlocked
+        } else {
+            guard let keyHex = environment["MESH_PRIVATE_KEY"],
+                let fromEnvironment = try? MeshKeys(privateKeyHex: keyHex)
+            else { return nil }
+            keys = fromEnvironment
+        }
         relayURL = url
         self.keys = keys
         identity = String(keys.publicKeyHex.prefix(8))

@@ -87,6 +87,7 @@ public struct MeshVault: Sendable {
             kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
             kSecAttrKeySizeInBits as String: 256,
             kSecAttrTokenID as String: kSecAttrTokenIDSecureEnclave,
+            kSecUseDataProtectionKeychain as String: true,
             kSecPrivateKeyAttrs as String: [
                 kSecAttrIsPermanent as String: false,
                 kSecAttrAccessControl as String: access,
@@ -203,6 +204,7 @@ public struct MeshVault: Sendable {
         let query: [String: Any] = [
             kSecClass as String: kSecClassKey,
             kSecAttrApplicationTag as String: keyTag,
+            kSecUseDataProtectionKeychain as String: true,
         ]
         let status = SecItemDelete(query as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
@@ -217,6 +219,7 @@ public struct MeshVault: Sendable {
             kSecClass as String: kSecClassKey,
             kSecAttrApplicationTag as String: keyTag,
             kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+            kSecUseDataProtectionKeychain as String: true,
             kSecReturnRef as String: true,
         ]
         if let reason {
@@ -255,6 +258,13 @@ public struct MeshVault: Sendable {
             kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
             kSecAttrKeySizeInBits as String: 256,
             kSecAttrTokenID as String: kSecAttrTokenIDSecureEnclave,
+            // Enclave keys live in the data-protection keychain, and the
+            // app must be entitled to the access group that owns them.
+            // Without this flag the request lands in the legacy file
+            // keychain, which cannot hold an enclave key — the failure
+            // reads as -34018 "failed to add key to keychain" and looks
+            // like a signing problem long after signing is correct.
+            kSecUseDataProtectionKeychain as String: true,
             kSecPrivateKeyAttrs as String: [
                 kSecAttrIsPermanent as String: true,
                 kSecAttrApplicationTag as String: keyTag,

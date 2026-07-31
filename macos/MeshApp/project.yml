@@ -42,4 +42,11 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "6.0"
         CODE_SIGN_STYLE: Automatic
+        # Signing is not cosmetic here: the Secure Enclave refuses to
+        # persist a key for an app with no team identifier (-34018), so an
+        # unsigned build silently loses the vault. Pinned in the spec
+        # because `xcodegen generate` rewrites the project and would drop
+        # a team set through Xcode's UI.
+        DEVELOPMENT_TEAM: 2AK3972Z54
+        CODE_SIGN_ENTITLEMENTS: Sources/MeshApp.entitlements
         ENABLE_HARDENED_RUNTIME: YES
