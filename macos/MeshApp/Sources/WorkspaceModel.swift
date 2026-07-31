@@ -63,6 +63,19 @@ final class WorkspaceModel: ObservableObject {
     /// already accepted it. The record replaces it as soon as it lands.
     private var decidedLocally: [String: MeshApprovalOutcome] = [:]
 
+    /// Agent turns in flight in the selected channel.
+    @Published private(set) var turns: [MeshTurn] = []
+
+    /// The events `turns` is folded from, accumulated rather than re-queried.
+    ///
+    /// Not an optimisation. The relay soft-deletes a reaction when a turn
+    /// ends and every query filters those out, so re-querying returns a turn
+    /// that has already vanished — the accumulated stream is the only place
+    /// the lifecycle exists. Bounded, because a channel that never sleeps
+    /// would otherwise grow this forever.
+    private var turnEvents: [MeshEvent] = []
+    private static let turnEventBudget = 600
+
     /// What the transport is doing. Distinct from `status`, which describes
     /// what the workspace contains — "3 channels" while nothing is getting
     /// through is exactly the lie this exists to prevent.
@@ -213,6 +226,7 @@ final class WorkspaceModel: ObservableObject {
                 await loadMessages(channel: selected)
                 await loadThreads(channel: selected)
                 await loadApprovals(channel: selected)
+                await loadTurns(channel: selected)
                 if startingLive { startLive(channel: selected) }
             }
         } catch {
@@ -270,6 +284,10 @@ final class WorkspaceModel: ObservableObject {
                 // reload to be noticed.
                 MeshKind.approvalRequested, MeshKind.approvalGranted,
                 MeshKind.approvalDenied, MeshKind.approvalWithdrawn,
+                // Agent turn lifecycle. Neither carries an `h` tag; they
+                // match this channel-scoped filter through the relay's
+                // stored-channel_id fallback, which applies to live fan-out.
+                MeshKind.reaction, MeshKind.deletion,
             ]
             do {
                 // `limit: 0` asks for no history: the load already fetched
@@ -290,6 +308,18 @@ final class WorkspaceModel: ObservableObject {
     /// Fold one pushed event into what is on screen.
     private func absorb(_ event: MeshEvent, channel: String) async {
         guard selectedChannel == channel else { return }
+
+        // Turn lifecycle: accumulate and re-fold locally. Replies count too —
+        // an agent's answer is what resolves its own turn — so this runs
+        // before the timeline handling below rather than instead of it.
+        switch event.kind {
+        case MeshKind.reaction, MeshKind.deletion, MeshKind.chatMessage,
+            MeshKind.channelMessage:
+            recordTurnEvent(event)
+        default:
+            break
+        }
+
         switch event.kind {
         case MeshKind.approvalRequested, MeshKind.approvalGranted, MeshKind.approvalDenied,
             MeshKind.approvalWithdrawn:
@@ -317,6 +347,42 @@ final class WorkspaceModel: ObservableObject {
                 createdAt: Date(timeIntervalSince1970: TimeInterval(event.createdAt)),
                 kind: event.kind))
         messages.sort { $0.createdAt < $1.createdAt }
+    }
+
+    /// Add one event to the turn buffer and re-fold.
+    ///
+    /// Deduped by id because the reconnect replay is deliberately inclusive
+    /// of the last event seen, so the same reaction can legitimately arrive
+    /// twice — and a duplicate 👀 would otherwise keep a finished turn alive.
+    private func recordTurnEvent(_ event: MeshEvent) {
+        guard !turnEvents.contains(where: { $0.id == event.id }) else { return }
+        turnEvents.append(event)
+        if turnEvents.count > Self.turnEventBudget {
+            turnEvents.removeFirst(turnEvents.count - Self.turnEventBudget)
+        }
+        turns = MeshTurnFold.turns(from: turnEvents)
+    }
+
+    /// Seed the turn buffer with whatever is still in flight.
+    ///
+    /// Only *live* turns can be seeded: a finished turn's reactions are
+    /// soft-deleted and no query returns them. That is the correct outcome —
+    /// the turn is over, and its answer is in the timeline like any message.
+    func loadTurns(channel: String) async {
+        guard let client else { return }
+        do {
+            let events = try await client.query(
+                MeshFilter(
+                    kinds: [MeshKind.reaction, MeshKind.deletion, MeshKind.chatMessage],
+                    limit: 300, tags: ["#h": [channel]]))
+            turnEvents = events
+            turns = MeshTurnFold.turns(from: events)
+        } catch {
+            if !(error is CancellationError) {
+                FileHandle.standardError.write(
+                    Data("mesh: turn seed failed: \(describe(error))\n".utf8))
+            }
+        }
     }
 
     /// Post a message to the selected channel.

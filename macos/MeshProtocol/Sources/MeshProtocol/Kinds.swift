@@ -10,7 +10,13 @@ import Foundation
 public enum MeshKind {
     // Chat + channel surface
     public static let textNote = 1
+    public static let deletion = 5
+    public static let reaction = 7
     public static let chatMessage = 9
+    /// Ephemeral "someone is typing" — and, from an agent, a coarse sign of
+    /// life during a turn. Republished every few seconds; **absence proves
+    /// nothing**, because it is sent best-effort and dropped under load.
+    public static let typingIndicator = 20002
     public static let channelMessage = 40002
     public static let channelMetadata = 39000
     public static let channelMembers = 39002

@@ -7,9 +7,9 @@ was made by running it from the MacBook against the WSL relay.
 
 ## What shipped
 
-`macos/` holds five pieces. **57 tests — 45 run anywhere, 12 more only
+`macos/` holds five pieces. **68 tests — 55 run anywhere, 13 more only
 against a live relay.** (Swift Testing's "Test run with N tests" line counts
-skipped ones, so a green run without a relay is not 57 executed.)
+skipped ones, so a green run without a relay is not 68 executed.)
 
 | Piece | Responsibility |
 |---|---|
@@ -17,6 +17,7 @@ skipped ones, so a green run without a relay is not 57 executed.)
 | `MeshVault` | Secure-Enclave-wrapped identity at rest |
 | `ThreadFold` | D41 work-thread state rebuilt from signed events |
 | `MeshApprovalFold` | The supervised-approval decision queue |
+| `MeshTurnFold` | Agent turn lifecycle, folded from cleartext reactions |
 | `MeshApp` | SwiftUI shell — channels, threads, timeline, approvals, composer, refusals |
 
 Three decisions worth keeping:
@@ -239,6 +240,81 @@ Proven by the order of operations rather than by assertion alone: the new
 live test was run first against the **old** relay still in memory, where the
 withdrawn request stayed `pending` and actionable — the gap, reproduced —
 and then against the rebuilt relay, where it retires.
+
+## Agent turns, the cleartext half (2026-07-31)
+
+The roadmap's remaining Phase 4 UI item is "agent interaction (streaming,
+approvals, per-turn diffs)". Approvals shipped. This is the part of
+*streaming* that needs no streaming — and, it turns out, the only part an
+ordinary member can see at all.
+
+A turn broadcasts its lifecycle in cleartext, as reactions on the message
+that woke it:
+
+| Event | Meaning | Shape |
+|---|---|---|
+| kind:7 `👀` | queued — an agent took it | `e` = **the message**, content = emoji |
+| kind:7 `💬` | the model is being prompted | same |
+| kind:5 | that reaction withdrawn | `e` = **the reaction event** |
+| kind:9 from the agent | the answer | NIP-10 `e` back at the trigger |
+| kind:9 opening `⚠️` | the harness refused | replaces the answer entirely |
+
+`MeshTurnFold` folds those into `queued → working → answered | refused |
+ended`. Three things it must get right:
+
+**Ending a turn is a two-hop correlation.** The kind:5 names the *reaction*,
+not the message. A fold that matched deletions against the message id finds
+nothing and shows every turn as permanently working. Both directions are
+mutation-tested.
+
+**The answer outranks the reactions.** `clear_reactions` is fire-and-forget
+and may lag or be lost, so waiting for the 💬 to disappear before showing an
+answer that has already arrived leaves the turn reading as "working" forever.
+
+**A `⚠️` reply is a distinct state.** On the Silent Mesh tier-gate paths it is
+the *only* thing a turn emits — no answer, no metrics — so rendering it as an
+ordinary chat line buries the one message explaining why nothing happened.
+
+### Turn state is live-only, and the relay forces that
+
+Neither kind:7 nor kind:5 carries an `h` tag. They still reach a
+channel-scoped subscription, because the relay falls back to the stored
+`channel_id` when an event has no `h` tag at all
+(`buzz-core/src/filter.rs`) — a fallback whose comment names these two kinds.
+
+But the relay honours NIP-09 by **soft-deleting** the reaction: `deleted_at`
+is set on the kind:7 row, and every query filters `deleted_at IS NULL`
+(`buzz-db/src/event.rs`). So the instant a turn ends its 👀/💬 stop coming
+back from queries, and the kind:5 that retired them names an event nobody can
+fetch any more.
+
+**A completed turn is therefore not reconstructible from a query.** Only a
+client that watched it happen holds the reaction ids needed to correlate the
+ending. The app accumulates turn events from the live stream and re-folds
+locally; it never re-queries them. This was found by writing the live test
+the obvious way — assert `.answered` from a fresh query — and watching it
+fail against a relay that had done nothing wrong. The suite now asserts the
+*absence*: a cold query yields no turn once it has finished.
+
+That is the right shape anyway. Turn state is what is happening now; the
+durable record of a turn is its answer, which is an ordinary message in the
+timeline.
+
+### What a member still cannot see
+
+Real streaming — token-by-token text, thoughts, tool calls — is kind:24200,
+which is ephemeral (never stored), NIP-44-encrypted to the agent's **owner**,
+p-gated, and published with no channel scope. A Mac signed in as an ordinary
+channel member sees none of it regardless of what it subscribes to. Reaching
+it is a deployment decision (bind the agent's owner pubkey to this member's
+key), not a client change. Same for kind:44200/44201 turn cost.
+
+Per-turn **diffs** are further off than they look, and not for client
+reasons: `ThreadWorktrees`/`ensure_worktree` have **no callers outside
+`worktree.rs`**, so there are no per-turn commits yet — `commit^..commit`
+does not yet mean "what the agent changed this turn". (Kinds for carrying a
+patch do already exist — `KIND_GIT_PATCH` 1617 and `KIND_STREAM_MESSAGE_DIFF`
+40008 — so this needs wiring, not a new kind.)
 
 ## Reconnect (2026-07-31)
 

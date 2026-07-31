@@ -156,6 +156,9 @@ func kindParity() throws {
         ("KIND_WORKFLOW_APPROVAL_WITHDRAWN", MeshKind.approvalWithdrawn),
         ("KIND_APPROVAL_GRANT", MeshKind.approvalGrant),
         ("KIND_APPROVAL_DENY", MeshKind.approvalDeny),
+        ("KIND_DELETION", MeshKind.deletion),
+        ("KIND_REACTION", MeshKind.reaction),
+        ("KIND_TYPING_INDICATOR", MeshKind.typingIndicator),
     ]
     for (rustName, swiftValue) in expected {
         let rustValue = rustKind(rustName)

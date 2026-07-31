@@ -126,6 +126,58 @@ private struct ResolvedLabel: View {
     }
 }
 
+/// What an agent is doing right now, in one line per turn.
+///
+/// Only live turns are shown. A finished turn's answer is an ordinary
+/// message and already appears in the timeline, and its reactions are
+/// soft-deleted by the relay the moment it ends — so there is nothing to
+/// show and nothing to show it from.
+struct TurnStrip: View {
+    @ObservedObject var model: WorkspaceModel
+
+    private var live: [MeshTurn] { model.turns.filter(\.isLive) }
+    /// Refusals are kept briefly even though the turn is over: on the
+    /// tier-gate paths this is the only thing the turn ever emits, and it
+    /// explains why nothing happened.
+    private var refusals: [MeshTurn] {
+        Array(
+            model.turns.filter {
+                if case .refused = $0.state { return true }
+                return false
+            }.prefix(2))
+    }
+
+    var body: some View {
+        if !live.isEmpty || !refusals.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(live) { turn in
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(turn.state == .queued ? "Agent queued this" : "Agent is working")
+                            .font(.caption)
+                        Text(String(turn.agentPubkey.prefix(8)))
+                            .font(.caption2.monospaced()).foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                }
+                ForEach(refusals) { turn in
+                    if case .refused(let reason) = turn.state {
+                        Label {
+                            Text(reason).font(.caption).textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } icon: {
+                            Image(systemName: "hand.raised.slash").foregroundStyle(.orange)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(Color.blue.opacity(0.05))
+        }
+    }
+}
+
 /// The channel's approval queue.
 ///
 /// Pending requests are shown in full because they need a decision.

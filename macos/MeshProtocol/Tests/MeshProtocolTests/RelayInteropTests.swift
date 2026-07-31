@@ -512,6 +512,107 @@ struct RelayApprovalTests {
         }
     }
 
+    /// The turn lifecycle, against the real relay.
+    ///
+    /// The fold is unit-tested against hand-built events; this proves the
+    /// client reads what the relay actually stores and fans out. It matters
+    /// because neither kind:7 nor kind:5 carries an `h` tag — they reach a
+    /// channel-scoped filter only through the relay's stored-`channel_id`
+    /// fallback, which is a relay behaviour no client-side test can confirm.
+    ///
+    /// The events are produced with the same shapes `buzz-acp` produces via
+    /// `buzz-sdk` (verified by reading both), signed by the agent identity.
+    @Test("a turn folds from reactions the relay actually stored")
+    func turnLifecycleRoundTrip() async throws {
+        let env = try environment()
+        let member = try await connected(env, as: env.member)
+        let agent = try await connected(env, as: env.agent)
+
+        // The member says something that wakes an agent.
+        var trigger = try MeshEvent.chatMessage(
+            channel: env.channel, content: "turn fold interop \(UUID().uuidString)",
+            pubkey: env.member.publicKeyHex)
+        try trigger.sign(with: env.member)
+        try await member.publish(trigger)
+
+        // Accumulate from the LIVE stream rather than re-querying.
+        //
+        // This is forced by the relay, not a preference: it honours NIP-09 by
+        // setting `deleted_at` on the reaction, and every query filters
+        // `deleted_at IS NULL`. So the moment a turn ends its 👀/💬 become
+        // invisible, and the kind:5 that retired them points at an event
+        // nobody can fetch any more. Only a client that watched the turn
+        // happen holds the reaction ids needed to correlate its ending.
+        let log = EventLog()
+        let watcher = Task {
+            let stream = try await member.subscribe(
+                MeshFilter(
+                    kinds: [MeshKind.reaction, MeshKind.deletion, MeshKind.chatMessage],
+                    limit: 0, tags: ["#h": [env.channel]]))
+            for await event in stream { await log.record(event) }
+        }
+        defer { watcher.cancel() }
+
+        func awaitTurn(_ expected: MeshTurnState, seconds: Int = 20) async -> MeshTurnState? {
+            for _ in 0..<(seconds * 10) {
+                let state = MeshTurnFold.turns(from: await log.events)
+                    .first { $0.triggerEventID == trigger.id }?.state
+                if state == expected { return state }
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            return MeshTurnFold.turns(from: await log.events)
+                .first { $0.triggerEventID == trigger.id }?.state
+        }
+
+        // 👀 — queued.
+        var seen = try MeshEvent.reaction(
+            to: trigger.id, emoji: "👀", pubkey: env.agent.publicKeyHex)
+        try seen.sign(with: env.agent)
+        try await agent.publish(seen)
+        #expect(await awaitTurn(.queued) == .queued, "the 👀 did not fold into a queued turn")
+
+        // 💬 — working.
+        var working = try MeshEvent.reaction(
+            to: trigger.id, emoji: "💬", pubkey: env.agent.publicKeyHex)
+        try working.sign(with: env.agent)
+        try await agent.publish(working)
+        #expect(await awaitTurn(.working) == .working)
+
+        // The agent answers, and clears its reactions the way ReactionGuard
+        // does — by deleting the reaction events, not the message.
+        var answer = try MeshEvent.chatMessage(
+            channel: env.channel, content: "done — folded from real events",
+            replyTo: trigger.id, pubkey: env.agent.publicKeyHex)
+        try answer.sign(with: env.agent)
+        try await agent.publish(answer)
+
+        for reaction in [seen, working] {
+            var removal = try MeshEvent.removeReaction(
+                reaction.id, pubkey: env.agent.publicKeyHex)
+            try removal.sign(with: env.agent)
+            try await agent.publish(removal)
+        }
+
+        #expect(
+            await awaitTurn(.answered(eventID: answer.id)) == .answered(eventID: answer.id),
+            "the answer did not resolve the turn")
+
+        // And the architectural consequence, asserted rather than assumed: a
+        // client that only queries sees no turn at all once it has ended.
+        // The answer is still in the timeline — which is the right place for
+        // it — but turn *state* is inherently live-only.
+        let cold = try await member.query(
+            MeshFilter(
+                kinds: [MeshKind.reaction, MeshKind.deletion, MeshKind.chatMessage],
+                limit: 300, tags: ["#h": [env.channel]]))
+        #expect(
+            MeshTurnFold.turns(from: cold).first { $0.triggerEventID == trigger.id } == nil,
+            "a completed turn should not be reconstructible from a query — its reactions are soft-deleted")
+
+        await member.disconnect()
+        await agent.disconnect()
+    }
+
     /// A request the agent takes back must stop being actionable.
     ///
     /// Before kind:46013 the relay updated the row and emitted nothing, so a
@@ -652,4 +753,12 @@ struct RelayApprovalTests {
         await agent.disconnect()
         await member.disconnect()
     }
+}
+
+/// Accumulates what a live subscription delivered, so a test can fold the
+/// same way a watching client must.
+actor EventLog {
+    private(set) var events: [MeshEvent] = []
+
+    func record(_ event: MeshEvent) { events.append(event) }
 }

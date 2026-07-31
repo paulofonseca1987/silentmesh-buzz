@@ -279,6 +279,9 @@ struct ContentView: View {
                         .frame(maxHeight: 320)
                     Divider()
                 }
+                // Directly above the content, because a turn in flight is
+                // the answer to "why is nothing happening yet".
+                TurnStrip(model: model)
                 if let selectedThread = model.selectedThread,
                     let thread = model.threads.first(where: { $0.id == selectedThread })
                 {
@@ -323,6 +326,7 @@ struct ContentView: View {
                 await model.loadMessages(channel: selected)
                 await model.loadThreads(channel: selected)
                 await model.loadApprovals(channel: selected)
+                await model.loadTurns(channel: selected)
                 model.startLive(channel: selected)
             }
         }

@@ -20,7 +20,7 @@ new session cannot learn from those.
 
 **Phase 4 — the macOS client works end to end (2026-07-31).** Five pieces,
 all in `macos/`, all validated against the live relay from the MacBook.
-57 Swift tests — 45 run anywhere, 12 only against a relay (the "Test run
+68 Swift tests — 55 run anywhere, 13 only against a relay (the "Test run
 with N" line counts skipped ones, so it overstates what executed):
 
 - **`MeshProtocol`** (SPM library, no UI/entitlements — the half provable
@@ -43,6 +43,16 @@ with N" line counts skipped ones, so it overstates what executed):
 - **The app** — channels with tier badges, work threads with status/fork/
   checkpoint/deadline, thread detail, gate-review cards, a composer, a
   new-thread field, and a **refusal banner** carrying the relay's own words.
+- **Agent turns (cleartext half)** — `MeshTurnFold` folds kind:7 👀/💬,
+  the kind:5 that retires them, and the agent's reply into
+  queued → working → answered | refused | ended. Two hazards: the kind:5
+  names the **reaction**, not the message (a one-hop fold shows every turn
+  as permanently working), and **turn state is live-only** — the relay
+  soft-deletes the reaction and every query filters `deleted_at IS NULL`, so
+  a finished turn is not reconstructible from a query. Accumulate from the
+  stream; never re-query. Real streaming (kind:24200) is ephemeral and
+  NIP-44-encrypted to the agent's *owner*, so an ordinary member cannot see
+  it at all — that is a deployment decision, not a client change.
 - **Reconnect** — a dropped socket no longer ends the app. The rule: a query
   or publish is a *request* (fails with the socket; only the caller may
   decide to repeat it), a subscription is a *standing intent* (kept, and its
@@ -502,11 +512,16 @@ slice; its **harness wiring** is the one remaining Phase-2 follow-up.
      app, and the first place the Mac client does more than observe.
    - **The channel repo browser** — file tree and blob view over git smart
      HTTP, so a work thread's checkpoints can be read where they happened.
-   - **Agent turn rendering** — see the verified event map in
-     phase4-client.md. Turn liveness is cleartext (kind:7 👀/💬 plus the
-     kind:5 that removes them); real streaming is kind:24200 only, which is
-     ephemeral, NIP-44-encrypted to the owner, and **must not** carry an
-     `#h` tag.
+   - **Per-turn diffs are blocked upstream, not on the client.**
+     `ThreadWorktrees`/`ensure_worktree` have no callers outside
+     `worktree.rs`, so there are no per-turn commits and `commit^..commit`
+     does not yet mean "what the agent changed this turn". Kinds to carry a
+     patch already exist (`KIND_GIT_PATCH` 1617,
+     `KIND_STREAM_MESSAGE_DIFF` 40008) — this needs the Phase-2 harness
+     wiring, not a new kind.
+   - **Streaming needs an owner binding**, not client work: kind:24200 is
+     NIP-44-encrypted to the agent's owner and p-gated, so the Mac sees
+     nothing until its member key is bound as that agent's owner.
 
 ## Suggested kickoff prompt for a fresh session
 

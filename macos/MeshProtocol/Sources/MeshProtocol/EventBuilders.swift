@@ -96,6 +96,53 @@ extension MeshEvent {
             content: draftSummary)
     }
 
+    /// A NIP-25 reaction (kind 7) to an event.
+    ///
+    /// Mirrors `buzz_sdk::build_reaction`: content is the emoji, and the only
+    /// tag is `e` at the target. Note there is **no `h` tag** — the relay
+    /// derives the channel from the target event, and a channel-scoped
+    /// subscription still matches through its stored-`channel_id` fallback.
+    public static func reaction(
+        to eventID: String,
+        emoji: String,
+        pubkey: String,
+        at: Date = Date()
+    ) throws -> MeshEvent {
+        guard eventID.count == 64, eventID.allSatisfy(\.isHexDigit) else {
+            throw MeshProtocolError.malformed("a reaction needs a 64-hex target event id")
+        }
+        guard !emoji.isEmpty, emoji.count <= 64 else {
+            throw MeshProtocolError.malformed("a reaction's emoji must be 1...64 characters")
+        }
+        return MeshEvent(
+            pubkey: pubkey,
+            createdAt: Int64(at.timeIntervalSince1970),
+            kind: MeshKind.reaction,
+            tags: [["e", eventID]],
+            content: emoji)
+    }
+
+    /// A NIP-09 deletion (kind 5) retiring one's own earlier event.
+    ///
+    /// Mirrors `buzz_sdk::build_remove_reaction`. The `e` tag names the
+    /// **reaction** being withdrawn, not whatever that reaction was about —
+    /// the indirection `MeshTurnFold` has to follow to know a turn ended.
+    public static func removeReaction(
+        _ reactionEventID: String,
+        pubkey: String,
+        at: Date = Date()
+    ) throws -> MeshEvent {
+        guard reactionEventID.count == 64, reactionEventID.allSatisfy(\.isHexDigit) else {
+            throw MeshProtocolError.malformed("a deletion needs a 64-hex reaction event id")
+        }
+        return MeshEvent(
+            pubkey: pubkey,
+            createdAt: Int64(at.timeIntervalSince1970),
+            kind: MeshKind.deletion,
+            tags: [["e", reactionEventID]],
+            content: "")
+    }
+
     /// A member's decision on a pending approval — kind 46030 (grant) or
     /// 46031 (deny).
     ///
