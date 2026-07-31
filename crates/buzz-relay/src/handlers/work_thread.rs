@@ -2465,7 +2465,7 @@ async fn run_gate_review(tenant: &TenantContext, event: &Event, state: &Arc<AppS
 
     let draft_summary = event.content.trim().to_owned();
     let deterministic = deterministic_findings(&draft_summary, &messages);
-    let (findings, status, model_used) = run_gate_assist(
+    let (findings, status, model_used, summary_vetting) = run_gate_assist(
         tenant,
         state,
         &draft_summary,
@@ -2487,6 +2487,7 @@ async fn run_gate_review(tenant: &TenantContext, event: &Event, state: &Arc<AppS
             findings,
             status,
             model: model_used,
+            summary_vetting,
             thread_status: thread.status,
         },
     )
@@ -2555,14 +2556,20 @@ async fn run_gate_assist(
     sm_gateway::assist::ReviewFindings,
     sm_gateway::assist::AssistStatus,
     Option<String>,
+    sm_gateway::assist::SummaryVetting,
 ) {
-    use sm_gateway::assist::{AssistStatus, ContextMessage, ReviewFindings};
+    use sm_gateway::assist::{AssistStatus, ContextMessage, ReviewFindings, SummaryVetting};
 
     let (Some(gateway), Some(model)) = (
         state.gate_assist.as_ref(),
         state.config.gate_assist_model.as_deref(),
     ) else {
-        return (ReviewFindings::default(), AssistStatus::Unavailable, None);
+        return (
+            ReviewFindings::default(),
+            AssistStatus::Unavailable,
+            None,
+            SummaryVetting::None,
+        );
     };
 
     let context: Vec<ContextMessage> = messages
@@ -2594,19 +2601,21 @@ async fn run_gate_assist(
     match gateway.route_and_record(&request).await {
         Ok(resp) => match sm_gateway::assist::parse_findings(&resp.text) {
             Some(findings) => {
-                let (vetted, dropped) = findings.vetted();
+                let (mut vetted, dropped) = findings.vetted();
                 if !dropped.is_empty() {
                     warn!(
                         rules = ?dropped,
                         "gate assist: dropped model output that tripped the deterministic scanners"
                     );
                 }
-                (vetted, AssistStatus::Ok, Some(resp.model))
+                let vetting = self_check_summary(gateway, &request, &mut vetted).await;
+                (vetted, AssistStatus::Ok, Some(resp.model), vetting)
             }
             None => (
                 ReviewFindings::default(),
                 AssistStatus::Unusable,
                 Some(resp.model),
+                SummaryVetting::None,
             ),
         },
         Err(e) => {
@@ -2615,7 +2624,57 @@ async fn run_gate_assist(
                 ReviewFindings::default(),
                 AssistStatus::Failed,
                 Some(model.to_owned()),
+                SummaryVetting::None,
             )
+        }
+    }
+}
+
+/// Ask the model whether its own summary reveals what its own advisory
+/// just flagged, and withhold the summary if it says yes.
+///
+/// Observed live: a model wrote the advisory "do not disclose the
+/// deployment credentials" and the summary "Successfully deployed
+/// Northwind using a prod API key from my laptop" — a semantic leak in the
+/// one field meant to be safe to publish. The deterministic scanners
+/// cannot catch that (no credential-shaped string), so nothing but a
+/// second look can.
+///
+/// Only runs when there is something to contradict: a summary AND at least
+/// one advisory note. Fail-closed in the sense that matters — an
+/// unreadable verdict downgrades the summary to *unverified* rather than
+/// presenting it as checked.
+async fn self_check_summary(
+    gateway: &sm_gateway::Gateway,
+    base: &sm_gateway::InferenceRequest,
+    findings: &mut sm_gateway::assist::ReviewFindings,
+) -> sm_gateway::assist::SummaryVetting {
+    use sm_gateway::assist::SummaryVetting;
+
+    let Some(summary) = findings.suggested_summary.clone() else {
+        return SummaryVetting::None;
+    };
+    if findings.advisory.is_empty() {
+        return SummaryVetting::Scanners;
+    }
+    let mut req = base.clone();
+    req.prompt = sm_gateway::assist::build_self_check_prompt(&summary, &findings.advisory);
+    match gateway.route_and_record(&req).await {
+        Ok(resp) => match sm_gateway::assist::parse_self_check(&resp.text) {
+            Some(found) if !found.is_empty() => {
+                warn!(
+                    items = ?found,
+                    "gate assist: withholding a suggested summary that names sensitive items"
+                );
+                findings.suggested_summary = None;
+                SummaryVetting::WithheldSelfCheck
+            }
+            Some(_) => SummaryVetting::ScannersAndSelfCheck,
+            None => SummaryVetting::SelfCheckUnverified,
+        },
+        Err(e) => {
+            warn!("gate assist self-check: {e}");
+            SummaryVetting::SelfCheckUnverified
         }
     }
 }
@@ -2626,6 +2685,7 @@ struct GateReviewOutcome {
     findings: sm_gateway::assist::ReviewFindings,
     status: sm_gateway::assist::AssistStatus,
     model: Option<String>,
+    summary_vetting: sm_gateway::assist::SummaryVetting,
     thread_status: WorkThreadStatus,
 }
 
@@ -2667,6 +2727,7 @@ async fn emit_gate_review_notice(
         "advisory": outcome.findings.advisory,
         "suggestedSummary": outcome.findings.suggested_summary,
         "assist": outcome.status.as_str(),
+        "summaryVetting": outcome.summary_vetting.as_str(),
         "model": outcome.model,
         "threadStatus": outcome.thread_status.to_string(),
     })
