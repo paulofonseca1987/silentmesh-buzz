@@ -41,9 +41,10 @@ targets:
         # client reports an NSURLError that looks like the network is
         # down. A Silent Mesh relay is reached over `ws://` on a tailnet,
         # where WireGuard already provides the transport encryption ATS
-        # is asking for, so the exception is accurate rather than lazy.
-        # A relay published beyond a tailnet must use `wss://`, and this
-        # exception should be removed when that is the norm.
+        # is asking for, so the exception describes the deployment rather
+        # than working around it. Settled 2026-07-31 (D11, architecture
+        # §10.1): relays are never published beyond the tailnet, so this
+        # is permanent — not a step on the way to `wss://`.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
     settings:
