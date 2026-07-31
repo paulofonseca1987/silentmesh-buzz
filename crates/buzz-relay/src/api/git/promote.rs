@@ -860,7 +860,6 @@ mod s3_probe_tests {
                     personal_id,
                     "my-space",
                     buzz_core::channel::ChannelType::Stream,
-                    buzz_core::channel::ChannelTier::Private,
                     None,
                     &member.public_key().to_bytes(),
                     None,

@@ -268,6 +268,48 @@ pub fn classify_model(model: &str) -> Backend {
     }
 }
 
+/// Qualify a configured model id with its **declared** provider, producing
+/// the `"provider:model-id"` form [`classify_model`] can route on.
+///
+/// A launcher (the desktop app, a persona projection) knows two separate
+/// facts: which model the agent should use, and which provider serves it.
+/// Passing only the model id downstream throws the second fact away, and
+/// since an unqualified id fails closed to [`Backend::Vendor`], a perfectly
+/// local agent then gets refused in an owned channel. This joins them back
+/// together at the boundary.
+///
+/// Rules, in order:
+/// - A model already carrying a known provider prefix is returned unchanged —
+///   never double-prefixed, and a caller's explicit qualification wins.
+/// - Otherwise a non-empty `provider` is prepended.
+/// - Otherwise the bare id passes through, and downstream classification
+///   fails closed as before.
+///
+/// **This does not weaken the self-declaration rule.** A launcher claiming
+/// `ollama` only *proposes* a Local classification; the harness still
+/// confirms the agent's own advertised catalog id before a turn runs, and
+/// the prefixed-desired-vs-bare-advertised path is vendor-only, so a vendor
+/// agent mislabeled `ollama:` fails the switch confirm rather than
+/// smuggling a Local classification.
+pub fn qualify_model(provider: Option<&str>, model: &str) -> String {
+    let model = model.trim();
+    // An empty model id must never be qualified: `"ollama:"` would classify
+    // as Local off a known prefix with no model behind it, manufacturing a
+    // zero-egress claim out of a missing configuration value.
+    if model.is_empty() {
+        return String::new();
+    }
+    if let Some((prefix, _)) = model.split_once(':') {
+        if is_known_provider_prefix(prefix) {
+            return model.to_owned();
+        }
+    }
+    match provider.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(provider) => format!("{provider}:{model}"),
+        None => model.to_owned(),
+    }
+}
+
 /// Classify an agent's configured model **provider** — the `provider` half of
 /// a persona's `"provider:model-id"` string (see
 /// `buzz_persona::persona::split_model`) — into the [`Backend`] that serves
@@ -465,6 +507,61 @@ mod tests {
         for tier in TIERS {
             assert!(route(tier, local, AgentTurn).is_allowed(), "{tier}");
         }
+    }
+
+    #[test]
+    fn qualify_model_joins_the_launcher_s_two_facts() {
+        // The gap this closes: a desktop-launched local agent used to send a
+        // bare id, which fails closed to Vendor and is refused in an owned
+        // channel even though it never egresses.
+        assert_eq!(
+            qualify_model(Some("ollama"), "qwen3:14b"),
+            "ollama:qwen3:14b"
+        );
+        assert_eq!(
+            classify_model(&qualify_model(Some("ollama"), "qwen3:14b")),
+            Backend::Local
+        );
+
+        // Already qualified: never double-prefixed, and the caller's own
+        // qualification wins over the declared provider.
+        assert_eq!(
+            qualify_model(Some("ollama"), "ollama:qwen3:14b"),
+            "ollama:qwen3:14b"
+        );
+        assert_eq!(
+            qualify_model(Some("ollama"), "anthropic:claude-x"),
+            "anthropic:claude-x",
+            "an explicitly qualified model must not be re-labelled by the launcher"
+        );
+
+        // A colon-bearing tag is not a provider prefix — it gets qualified.
+        assert_eq!(qualify_model(Some("openai"), "gpt-4o"), "openai:gpt-4o");
+
+        // No provider declared → unchanged, so classification still fails
+        // closed to Vendor exactly as before.
+        for absent in [None, Some(""), Some("   ")] {
+            assert_eq!(qualify_model(absent, "qwen3:14b"), "qwen3:14b");
+            assert_eq!(
+                classify_model(&qualify_model(absent, "qwen3:14b")),
+                Backend::Vendor
+            );
+        }
+
+        // An empty model id is never qualified — otherwise "ollama:" would
+        // classify Local off the prefix alone, with no model behind it.
+        assert_eq!(qualify_model(Some("ollama"), ""), "");
+        assert_eq!(qualify_model(Some("ollama"), "   "), "");
+        assert_eq!(
+            classify_model(&qualify_model(Some("ollama"), "")),
+            Backend::Vendor
+        );
+
+        // Whitespace around the pieces never produces a broken id.
+        assert_eq!(
+            qualify_model(Some(" ollama "), "  qwen3:14b "),
+            "ollama:qwen3:14b"
+        );
     }
 
     #[test]

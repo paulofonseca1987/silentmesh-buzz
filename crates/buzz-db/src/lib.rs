@@ -2934,8 +2934,9 @@ impl Db {
     }
 
     /// Create a member's personal channel (D29): channel row (visibility
-    /// forced private), owner membership, and registry row, atomically —
-    /// one personal channel per member per community.
+    /// forced private, tier forced `owned` — D24), owner membership, and
+    /// registry row, atomically — one personal channel per member per
+    /// community.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_personal_channel(
         &self,
@@ -2943,7 +2944,6 @@ impl Db {
         channel_id: Uuid,
         name: &str,
         channel_type: channel::ChannelType,
-        tier: channel::ChannelTier,
         description: Option<&str>,
         owner_pubkey: &[u8],
         ttl_seconds: Option<i32>,
@@ -2954,7 +2954,6 @@ impl Db {
             channel_id,
             name,
             channel_type,
-            tier,
             description,
             owner_pubkey,
             ttl_seconds,

@@ -37,7 +37,6 @@ pub async fn create_personal_channel(
     channel_id: Uuid,
     name: &str,
     channel_type: ChannelType,
-    tier: ChannelTier,
     description: Option<&str>,
     owner_pubkey: &[u8],
     ttl_seconds: Option<i32>,
@@ -57,6 +56,13 @@ pub async fn create_personal_channel(
     if name.trim().is_empty() {
         return Err(DbError::InvalidData("channel name is required".into()));
     }
+    // silent-mesh (D24/D29): a personal channel is always the `owned` tier —
+    // not a caller's choice, for the same reason its visibility is not. It
+    // holds pre-gate content, so its model-routing floor must forbid egress;
+    // taking it as a parameter would let some future call site declare the
+    // member's private space `open` again. Tier is immutable once written
+    // (D26), so there is no repair afterwards, only a migration.
+    let tier = ChannelTier::Owned;
 
     let mut tx = pool.begin().await?;
 
@@ -267,7 +273,6 @@ mod pg_tests {
             ch1,
             "my-space",
             ChannelType::Stream,
-            ChannelTier::Private,
             Some("personal"),
             &owner,
             None,
@@ -279,7 +284,11 @@ mod pg_tests {
             other => panic!("expected Created, got {other:?}"),
         };
         assert_eq!(record.visibility, "private", "visibility is forced");
-        assert_eq!(record.tier, "private");
+        assert_eq!(
+            record.tier, "owned",
+            "tier is forced too — a personal channel holds pre-gate content, \
+             so its model-routing floor must forbid egress"
+        );
 
         // The creator is the channel owner (implicit Channel Admin).
         let members = crate::channel::get_members(&pool, community, ch1)
@@ -310,7 +319,6 @@ mod pg_tests {
             ch1,
             "my-space",
             ChannelType::Stream,
-            ChannelTier::Private,
             None,
             &owner,
             None,
@@ -331,7 +339,6 @@ mod pg_tests {
             ch2,
             "my-other-space",
             ChannelType::Stream,
-            ChannelTier::Private,
             None,
             &owner,
             None,
@@ -354,7 +361,6 @@ mod pg_tests {
             ch3,
             "their-space",
             ChannelType::Stream,
-            ChannelTier::Open,
             None,
             &other,
             None,
@@ -412,7 +418,6 @@ mod pg_tests {
             ch4,
             "my-new-space",
             ChannelType::Stream,
-            ChannelTier::Private,
             None,
             &owner,
             None,

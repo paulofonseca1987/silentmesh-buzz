@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 33);
+        assert_eq!(migrations.len(), 34);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1011,6 +1011,32 @@ mod tests {
         assert!(!migrations[0].sql.as_str().contains("44201"));
         assert!(!migrations[4].sql.as_str().contains("44201"));
 
+        // silent-mesh D24/D29: existing personal channels are tightened to
+        // the `owned` tier. The only migration that touches an immutable
+        // column, and only in the tightening direction — it drops and
+        // recreates the guard rather than disabling it (DISABLE TRIGGER on
+        // channels is what the tenant-fence lint refuses), and recreates it
+        // verbatim so the guard is no weaker afterwards.
+        assert_eq!(migrations[33].version, 34);
+        let personal_tier = migrations[33].sql.as_str();
+        assert!(personal_tier.contains("UPDATE channels"));
+        assert!(personal_tier.contains("personal_channels"));
+        assert!(
+            personal_tier.contains("CREATE TRIGGER trg_channels_tier_immutable"),
+            "the tier guard must be restored by the same migration that drops it",
+        );
+        assert!(
+            !normalize_sql(personal_tier).contains("disable trigger"),
+            "tightening must not disable a trigger on channels",
+        );
+        // Reuses the real tenant-fence lint rather than a substring check:
+        // the update joins on community_id, so "community_id =" appears in
+        // the predicate — what must never happen is an *assignment*.
+        assert!(
+            forbidden_channels_community_id_mutations(personal_tier).is_empty(),
+            "the tightening update must never re-tenant or rewrite channels",
+        );
+
         let desired_schema = include_str!("../../../schema/schema.sql");
         assert!(
             desired_schema.contains("CREATE TABLE join_policy_acceptances"),
@@ -1298,7 +1324,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(33));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(34));
     }
 
     #[tokio::test]

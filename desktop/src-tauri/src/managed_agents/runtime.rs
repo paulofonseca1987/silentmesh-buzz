@@ -764,8 +764,18 @@ pub fn spawn_agent_child(
     } else {
         command.env_remove("BUZZ_ACP_SYSTEM_PROMPT");
     }
+    // silent-mesh: the harness classifies a turn's egress class from this
+    // value (`buzz_core::model_route::classify_model`), and a bare model id
+    // fails closed to Vendor — so a locally-served agent launched from here
+    // was being refused in owned/private channels despite never egressing.
+    // Qualify it with the provider the desktop already resolved. The agent's
+    // own advertised catalog id is still what the harness confirms before a
+    // turn runs, so this proposes a classification, it does not assert one.
     if let Some(model) = effective_model.as_deref() {
-        command.env("BUZZ_ACP_MODEL", model);
+        command.env(
+            "BUZZ_ACP_MODEL",
+            buzz_core_pkg::model_route::qualify_model(effective_provider.as_deref(), model),
+        );
     } else {
         command.env_remove("BUZZ_ACP_MODEL");
     }

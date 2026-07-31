@@ -2737,7 +2737,7 @@ async fn ingest_event_inner(
                 }
             })
             .unwrap_or_else(|| "open".to_string());
-        let tier: buzz_db::channel::ChannelTier = tier_str
+        let mut tier: buzz_db::channel::ChannelTier = tier_str
             .parse()
             .map_err(|_| IngestError::Rejected(format!("invalid tier: {tier_str}")))?;
 
@@ -2759,6 +2759,27 @@ async fn ingest_event_inner(
                     "invalid: personal channels are always private".into(),
                 ));
             }
+        }
+        // silent-mesh: a personal channel is forced to the `owned` tier for
+        // the same reason it is forced private — visibility and tier are two
+        // doors on one room. It holds **pre-gate** content: work that has not
+        // been through the D30 review that promotion requires. Leaving it at
+        // the `open` default would let an agent turn there egress to a vendor
+        // exactly the material the gate exists to hold back, and would split
+        // the same bytes across two egress floors (gate/copilot/embedding
+        // reads of that channel are owned-pinned to Local regardless).
+        //
+        // Tier is immutable (D26), so this is decided once, at creation, and
+        // an explicit weaker `tier` tag is refused rather than silently
+        // upgraded — the member should learn their request was not honored.
+        if is_personal {
+            let explicit_tier = event.tags.iter().any(|t| t.kind().to_string() == "tier");
+            if explicit_tier && tier != buzz_db::channel::ChannelTier::Owned {
+                return Err(IngestError::Rejected(
+                    "invalid: personal channels are always the 'owned' tier".into(),
+                ));
+            }
+            tier = buzz_db::channel::ChannelTier::Owned;
         }
 
         // silent-mesh: team-channel creation is a workspace-authority action
@@ -2806,7 +2827,6 @@ async fn ingest_event_inner(
                         client_uuid,
                         name,
                         channel_type,
-                        tier,
                         description.as_deref(),
                         &actor_bytes,
                         ttl_seconds,
