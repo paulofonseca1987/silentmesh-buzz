@@ -18,6 +18,31 @@ new session cannot learn from those.
 
 ## Shipped so far
 
+**Phase 3 slice 7 — personal channels are the `owned` tier (2026-07-31).**
+Closes the D24/D29 gap slice 6's live run surfaced: personal channels were
+created at the `open` default, so an **agent turn** in a member's most
+private space passed the tier gate for a vendor backend — while gate /
+copilot / embedding reads of the same channel were owned-pinned to Local.
+Same bytes, two egress floors. Forced at the **DB choke point** by removing
+the `tier` parameter from `create_personal_channel` (the tier of a personal
+channel is not a caller's choice, and a parameter invites some future call
+site to declare it open again); the relay additionally refuses an explicit
+weaker `tier` tag instead of silently upgrading it. **Migration 0034**
+tightens existing rows — the only migration touching an immutable column,
+justified in-file: the trigger guards against *weakening*, and
+open/private → owned strictly reduces permitted egress. It **drops and
+recreates** the trigger rather than disabling it (`ALTER TABLE channels …
+DISABLE TRIGGER` is refused by the tenant-fence lint, correctly) and
+restores it verbatim; verified live that a pre-fix row flips and that a
+later tier change still raises. **Desktop** had to move with it: it wrote a
+*bare* model id into `BUZZ_ACP_MODEL`, which fail-closes to Vendor, so
+local desktop agents would have been refused in every personal channel —
+new `buzz_core::model_route::qualify_model` joins launcher-known
+model+provider into the `provider:model` form (never double-prefixes,
+never overrides an explicit qualification, never qualifies an empty id).
+The desktop call site is one line and **unverified locally** (the Tauri
+crate needs WebKitGTK dev libs this box cannot install) — CI compiles it.
+
 **Phase 3 slice 6 — Privacy Gate assist (D30), the gateway's first
 consumer (2026-07-31).** New kind:47022 asks, before promoting, what a
 promotion *would* expose; relay-only kind:47023 answers with deterministic
@@ -332,15 +357,6 @@ slice; its **harness wiring** is the one remaining Phase-2 follow-up.
    backend; live-turn attribution 44201 + owner usage read; the gateway's
    real `local` backend). The Phase 3 exit criterion is closed. What is
    left, roughly in dependency order:
-   - **Personal channels default to `tier=open`** (found while validating
-     slice 6). `visibility` is forced private and membership is locked to
-     the member, but no tier tag is set on the `create-personal` path, so
-     D24's creation default applies — meaning an **agent turn** in a
-     member's personal channel passes the slice-2 tier gate for a vendor
-     backend. The gate assist is unaffected (its purpose pin ignores
-     channel tier). Fixing it is a product decision: `owned` forbids
-     anything but local models there, `private` allows TEE. Smallest
-     high-value next slice.
    - **More gateway consumers.** Slice 6 wired the first (the gate
      assist). Copilot (D25) and embeddings (D37) remain; embeddings
      additionally need a trait seam — `RawInference { text, tokens }`
