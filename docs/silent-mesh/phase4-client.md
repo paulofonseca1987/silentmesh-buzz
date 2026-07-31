@@ -1,23 +1,20 @@
-# Phase 4 — Swift macOS client: foundation shipped, app blocked on tooling
+# Phase 4 — the Swift macOS client
 
 Phase 4 is the native macOS client (roadmap "Phase 4 — Swift macOS client
-MVP"). Its first piece — `MeshProtocol` — is shipped and validated against
-a live relay. The rest is bounded by what the machine can build, not by
-design questions.
+MVP"). It reads the workspace, writes to it, and updates live, all against
+the real relay over Tailscale. Nothing here is mocked: every claim below
+was made by running it from the MacBook against the WSL relay.
 
 ## What shipped
 
-`macos/MeshProtocol`, an SPM library with no UI and no entitlements. That
-scope is deliberate: it is the half that can be built, tested, and proven
-headlessly over SSH, and it is what every later surface (vault, UI, sync)
-sits on. 11 tests, 9 pure and 2 live.
+`macos/` holds four pieces. 33 tests — 27 pure, 6 gated on a live relay.
 
-| Type | Responsibility |
+| Piece | Responsibility |
 |---|---|
-| `MeshEvent` | Nostr event; canonical serialization, derived id, verification |
-| `MeshKeys` | secp256k1 identity; BIP-340 signing (the vault will replace it) |
-| `MeshKind` / `MeshChannelTier` | Registry mirror + the tier strictness rule |
-| `MeshRelayClient` | WebSocket actor: NIP-42 auth, publish-with-OK, query-to-EOSE |
+| `MeshProtocol` | Nostr events, keys, kind registry, WebSocket relay client |
+| `MeshVault` | Secure-Enclave-wrapped identity at rest |
+| `ThreadFold` | D41 work-thread state rebuilt from signed events |
+| `MeshApp` | SwiftUI shell — channels, threads, timeline, composer, refusals |
 
 Three decisions worth keeping:
 
@@ -30,16 +27,83 @@ signature covering a different id would otherwise let a relay swap content
 while keeping real cryptography. The suite grafts one event's signature
 onto another to prove that path is closed.
 
-**The relay is a distribution point, not a trust anchor.** Query results
-are verified before they are returned, and `publish` waits for the matching
-`OK` rather than assuming success — the relay enforces authority, the
-privacy tier, and the D30 gate at ingest, so "sent" and "accepted" are
-different outcomes a member needs told apart.
+**The relay is a distribution point, not a trust anchor.** Every event is
+verified before it reaches the UI — on queries, and on live pushes — and
+`publish` waits for the matching `OK` rather than assuming success. The
+relay enforces authority, the privacy tier, and the D30 gate at ingest, so
+"sent" and "accepted" are different outcomes a member needs told apart.
+When the relay refuses, the app shows the relay's own words rather than a
+generic failure.
 
 **The kind mirror is tested against its source.** `KindParityTests` reads
 `crates/buzz-core/src/kind.rs` and compares the integers. Drift there never
 fails loudly at runtime: the client simply stops matching those events,
 which looks like an empty channel rather than a bug.
+
+## The relay client: one reader, and no gap between register and send
+
+The client began with serialized exchanges — one request at a time, each
+owning the socket until its reply arrived. That cannot express a live
+subscription, which never completes: any query queued behind an open stream
+waits forever. So a single reader task now owns `receive()` and
+demultiplexes every frame to its waiter — by subscription id (`EVENT`,
+`EOSE`, `CLOSED`), by event id (`OK`), or to the singleton challenge waiter
+(`AUTH`).
+
+That design has one rule, and it is the whole lesson of the slice:
+
+> **Register the waiter in the same actor turn as the send.**
+
+Sending first and registering after leaves a window in which the reply is
+unclaimed, and the reader must discard it. The window looks impossibly
+small and a relay on a LAN wins it routinely. Because an actor cannot
+dispatch an incoming frame in the middle of a turn, doing both in one turn
+does not *shrink* the gap — it removes it:
+
+```swift
+return try await withCheckedThrowingContinuation { continuation in
+    pendingQueries[sub] = PendingQuery(continuation: continuation)
+    sendFireAndForget(["REQ", sub, filter.jsonObject()])
+}
+```
+
+**The bug this cost.** The relay sends its NIP-42 challenge the instant the
+socket opens — before `authenticate()` has registered anyone. The reader
+found no waiter, dropped the frame, and `authenticate()` then waited for a
+challenge that had already come and gone, until the relay's own timer
+closed the connection. It surfaced as "NIP-42 auth timeout", which points
+at the relay.
+
+The app lost that race every time; the tests never did. SwiftUI puts
+main-actor work between `connect()` and `authenticate()`, while the tests
+call them back to back and beat the network. **A green suite and an app
+that could not connect at all, from nothing but scheduling.** An unclaimed
+challenge is now buffered, so arriving early is not the same as being lost.
+
+**Two of my own fixes were wrong, and both are worth remembering:**
+
+- *Ping-before-read deadlocked.* Waiting for a pong before reading looked
+  tidier than retrying — but the relay does not answer client pings, so the
+  wait never ended. A race traded for a deadlock. The warm-up retry is back,
+  bounded to *before the first frame*: after that, an error means the
+  connection really died and every waiter must be told (`failAllPending`),
+  not left hoping.
+- *The live-subscription test could hang instead of fail.* Its deadline was
+  checked inside `for await`, so it could only fire when an event arrived —
+  meaning "nothing ever arrives", the exact failure the test exists to
+  catch, would block the suite rather than report it. The deadline is now a
+  racing task. **A wait whose escape hatch depends on the thing being waited
+  for is not a timeout.**
+
+**What actually found it was instrumentation, not reasoning.** Three rounds
+of theorising produced nothing; one log line — `reader stopped after 1
+frame(s)` — said the socket opened, took one frame, and died. That is now
+permanent behind `MESH_LOG=1`.
+
+A related trap is worth stating once: an earlier concurrency test written
+to prove the reentrancy fix **also passed without the fix**. A test whose
+outcome does not depend on the behaviour it names proves only that the code
+runs. Check that a new test fails against the old code before trusting it.
 
 ## Live interop (2026-07-31)
 
@@ -47,7 +111,11 @@ From the MacBook, over Tailscale, against the WSL relay:
 
 ```
 ✔ a Swift-signed event is accepted and read back by the relay
+✔ work-thread events come back and fold into threads
 ✔ the relay's own tier stamp is readable from the channel metadata
+✔ two overlapping queries each get their own results
+✔ a live subscription delivers an event published after it started
+✔ queries still work while a subscription is open
 ```
 
 A Swift-signed `kind:9` was accepted by the Rust verifier, survived
@@ -56,9 +124,15 @@ That is the strongest single statement that the two implementations agree,
 and it is the roadmap's stated Phase 4 dependency ("MeshProtocol validated
 against Buzz's conformance suite and interop E2E").
 
+The live-delivery test publishes from a **second connection**, so what it
+proves is relay fan-out rather than the client hearing its own echo on the
+socket it wrote to. End to end, two messages published from the WSL host
+appeared in an untouched Mac window.
+
 ```bash
 MESH_RELAY_URL=ws://<relay> MESH_PRIVATE_KEY=<64-hex> MESH_CHANNEL=<uuid> \
-  swift test            # gated; without MESH_RELAY_URL only the 9 pure tests run
+  swift test            # gated; without MESH_RELAY_URL only the pure tests run
+MESH_LOG=1 …            # transport diagnostics to stderr
 ```
 
 ## MeshVault — verified on hardware (2026-07-31)
@@ -107,36 +181,35 @@ returns instantly, and pass/fail alone could not tell the two apart.
 password. A member whose finger is not read should be inconvenienced, not
 locked out of their workspace.
 
-With `MESH_VAULT=1` the app now imports an environment key into the vault
-on first launch and never reads it again; later launches have no identity
+With `MESH_VAULT=1` the app imports an environment key into the vault on
+first launch and never reads it again; later launches have no identity
 until the member unlocks. That is the difference between an app handed a
 secret and an app that keeps one.
 
-## What is blocked, and on what
+## What still needs a human
 
-- **Signed builds still need a human.** A keychain-held signing key is
-  unreachable from an SSH session (`errSecInternalComponent`, and
-  `security` reports "User interaction is not allowed") — unlock state is
-  per-session, so unlocking in a console Terminal does not carry over.
-  Swift changes therefore need one `xcodebuild` run from a Terminal on the
-  Mac; everything after that (running, testing, screenshotting) works
-  headlessly.
-- **The SwiftUI app** needs an Xcode project. Recommend `xcodegen`
-  (`brew install xcodegen`) so the project is a YAML file that can be
-  edited and regenerated deterministically; hand-editing `project.pbxproj`
-  over SSH is a silent-corruption risk.
-- **Anything visual.** `screencapture` over SSH only works against an
-  attached console session. The UI half needs either a human looking or a
-  logged-in unlocked session.
+- **Signed builds.** A keychain-held signing key is unreachable from an SSH
+  session (`errSecInternalComponent`, and `security` reports "User
+  interaction is not allowed") — unlock state is per-session, so unlocking
+  in a console Terminal does not carry over. Each Swift change therefore
+  needs one `xcodebuild` run from a Terminal on the Mac. Everything after
+  that — running, testing, screenshotting, driving the UI — is headless,
+  because Screen Recording *and* Accessibility are granted to sshd.
+- **Nothing else.** `macos/scripts/ui-select.sh` selects rows and captures
+  the window without a person present. Two traps it encodes: `click at`
+  does not change a SwiftUI `List` selection (three byte-identical
+  screenshots is how that was found — set `selected` via the accessibility
+  API instead), and the window moves, so its position must be read on every
+  call rather than cached.
 
 ## Suggested next slices
 
-1. **`MeshVault`** — Secure Enclave key wrapping with a software fallback,
-   so the protocol layer stops holding raw secrets. Testable except for the
-   biometric prompt.
-2. **The event fold** — channel list, message timeline, and work-thread
-   state folded from signed events client-side, mirroring what
-   `buzz threads show` does. Pure, fully testable, and the real content of
-   "the client understands the workspace".
-3. **The app shell** — only after 1 and 2, since both are provable without
-   a window.
+1. **Agent interaction** — approvals and per-turn diffs, where the client
+   meets the ACP harness. The largest remaining gap between the Mac client
+   and the desktop app, and the first place the client does more than
+   observe.
+2. **The channel repo browser** — file tree and blob view over git smart
+   HTTP, so a work thread's checkpoints can be read where they happened.
+3. **Reconnect** — the reader tells every waiter when the socket dies, but
+   nothing yet re-establishes it. A dropped tailnet route currently means
+   restarting the app.

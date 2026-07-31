@@ -18,8 +18,9 @@ new session cannot learn from those.
 
 ## Shipped so far
 
-**Phase 4 — the macOS client works end to end (2026-07-31).** Four pieces,
-all in `macos/`, all validated against the live relay from the MacBook:
+**Phase 4 — the macOS client works end to end (2026-07-31).** Five pieces,
+all in `macos/`, all validated against the live relay from the MacBook.
+33 Swift tests, 6 of them gated on a live relay:
 
 - **`MeshProtocol`** (SPM library, no UI/entitlements — the half provable
   headlessly). Event id is **computed, never trusted**: canonical NIP-01
@@ -41,15 +42,37 @@ all in `macos/`, all validated against the live relay from the MacBook:
 - **The app** — channels with tier badges, work threads with status/fork/
   checkpoint/deadline, thread detail, gate-review cards, a composer, a
   new-thread field, and a **refusal banner** carrying the relay's own words.
+- **Live subscriptions** — one reader task owns `receive()` and
+  demultiplexes every frame to its waiter (by subscription id, by event id,
+  or to the challenge waiter). Serialized exchanges could not express a
+  stream that never completes: any query queued behind an open subscription
+  waited forever. Proven by fan-out from a *second* connection, not by the
+  client hearing its own echo.
 
-**Three defects only running it could find** (see phase4-client.md):
-reqwest-style *actor reentrancy* let two overlapping `query()` calls eat
-each other's WebSocket frames (relay served everything, client showed
-nothing); **ATS** refused cleartext `ws://` before opening a socket (the
-same code passed tests, because a SwiftPM test binary has no Info.plist);
-and a **gate review on a team channel was accepted then silently dropped**
-— the check lived in the side effect, which can decline to act but cannot
-say why, so it moved to ingest where a reason can travel back.
+**Defects only running it could find** (see phase4-client.md):
+*actor reentrancy* let two overlapping `query()` calls eat each other's
+WebSocket frames (relay served everything, client showed nothing); **ATS**
+refused cleartext `ws://` before opening a socket (the same code passed
+tests, because a SwiftPM test binary has no Info.plist); a **gate review on
+a team channel was accepted then silently dropped** — the check lived in
+the side effect, which can decline to act but cannot say why, so it moved
+to ingest where a reason can travel back; and the relay's **NIP-42
+challenge arrived before anyone was waiting for it**, so the reader
+discarded it and auth timed out. The app lost that race every time and the
+tests never did — SwiftUI interleaves main-actor work between `connect()`
+and `authenticate()` while the tests call them back to back. A green suite
+and an app that could not connect at all, from nothing but scheduling.
+
+**The rule that came out of it, now load-bearing across the client:**
+*register the waiter in the same actor turn as the send.* An actor cannot
+dispatch an incoming frame mid-turn, so doing both together removes the gap
+rather than shrinking it. Two related traps, both mine: a
+ping-before-read "fix" deadlocked (the relay does not answer client pings —
+a race traded for a deadlock), and a live test checked its deadline *inside*
+`for await`, so the failure it existed to catch would hang the suite instead
+of failing it. A wait whose escape hatch depends on the thing being waited
+for is not a timeout. Transport diagnostics now live behind `MESH_LOG=1`;
+one log line found what three rounds of theorising did not.
 
 **Mac working agreement.** SSH in with `ssh -i ~/.ssh/sm_e2e_mac
 paulofonseca@macbook.tail94f67c.ts.net`. Screen Recording **and**
@@ -61,17 +84,6 @@ keychain-held signing key is unreachable from SSH (`User interaction is
 not allowed`) and unlock state is per-session, so each Swift change needs
 one `xcodebuild` run from a Terminal on the Mac. Everything after that —
 running, testing, screenshotting, driving the UI — is headless.
-
-**Phase 4 foundation — MeshProtocol (2026-07-31).** `macos/MeshProtocol`,
-an SPM library (no UI, no entitlements — the half provable headlessly over
-SSH). Event id computed by hand from NIP-01's canonical array (an encoder
-that sorts keys produces unverifiable events); `isValid()` recomputes the
-id AND checks the signature over it. Relay client is an actor that waits
-for the matching OK and verifies query results. Kind mirror is tested
-**against `kind.rs` itself**. 11 tests pass on Swift 6.3.3, incl. 2 gated
-interop tests run live from the MacBook against the WSL relay. Blocked
-next: MeshVault needs entitlements (Xcode now installed) and the app needs
-an Xcode project — recommend `xcodegen`. See phase4-client.md.
 
 **Phase 3 slice 8 — the member owns their space's tier; promotion must
 satisfy the destination (2026-07-31).** Personal channels still start
@@ -434,11 +446,6 @@ slice; its **harness wiring** is the one remaining Phase-2 follow-up.
    backend; live-turn attribution 44201 + owner usage read; the gateway's
    real `local` backend). The Phase 3 exit criterion is closed. What is
    left, roughly in dependency order:
-   - **Live subscriptions in the Swift client** — today's client
-     serializes request/response exchanges, which is correct for queries
-     and cannot carry a streaming subscription. Needs a demultiplexing
-     reader: one task receiving frames and dispatching by subscription id.
-     A design change, not a patch.
    - **More gateway consumers.** Slice 6 wired the first (the gate
      assist). Copilot (D25) and embeddings (D37) remain; embeddings
      additionally need a trait seam — `RawInference { text, tokens }`
@@ -448,14 +455,25 @@ slice; its **harness wiring** is the one remaining Phase-2 follow-up.
      hard part is placement, not policy: the relay holds the spend data,
      the harness is the only component that can *prevent* a turn.
    - **Member-facing usage reads** (today `buzz-admin usage` is
-     operator-only), the **desktop bare-model-id gap** (desktop writes bare
-     ids into `BUZZ_ACP_MODEL`, so desktop-launched local agents classify
-     as vendor and are refused in owned/private), then **TEE**
-     (attestation-then-send) and **per-user vendor CLIs** (D23).
+     operator-only), then **TEE** (attestation-then-send) and **per-user
+     vendor CLIs** (D23). The desktop bare-model-id gap is closed (slice 7,
+     `5d1c2221`) — desktop now calls `qualify_model` before writing
+     `BUZZ_ACP_MODEL`.
+3. **Phase 4 continues** — the client reads, writes, and updates live. What
+   is left, roughly in value order:
+   - **Agent interaction** — approvals and per-turn diffs, where the client
+     meets the ACP harness. The largest remaining gap against the desktop
+     app, and the first place the Mac client does more than observe.
+   - **The channel repo browser** — file tree and blob view over git smart
+     HTTP, so a work thread's checkpoints can be read where they happened.
+   - **Reconnect.** The reader now tells every waiter when the socket dies
+     (`failAllPending`), but nothing re-establishes it — a dropped tailnet
+     route means restarting the app.
 
 ## Suggested kickoff prompt for a fresh session
 
-> Read docs/silent-mesh/HANDOFF.md, then docs/silent-mesh/roadmap.md and
-> phase2-work-threads.md, and skim `git log --oneline main..HEAD`. Continue
+> Read docs/silent-mesh/HANDOFF.md, then docs/silent-mesh/roadmap.md,
+> phase2-work-threads.md, and phase4-client.md (if the slice touches
+> `macos/`), and skim `git log --oneline main..HEAD`. Continue
 > the roadmap at the next unshipped slice, following the working
 > conventions in the handoff (slice → gates → signed commit → push).
