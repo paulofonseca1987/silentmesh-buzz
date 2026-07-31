@@ -299,6 +299,7 @@ struct ContentView: View {
                 model.selectedThread = nil
                 await model.loadMessages(channel: selected)
                 await model.loadThreads(channel: selected)
+                model.startLive(channel: selected)
             }
         }
     }

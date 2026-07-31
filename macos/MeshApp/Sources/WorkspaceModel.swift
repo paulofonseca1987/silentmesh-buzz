@@ -49,6 +49,10 @@ final class WorkspaceModel: ObservableObject {
     @Published private(set) var isSending = false
 
     private var client: MeshRelayClient?
+    /// The live subscription for the selected channel. One at a time: a
+    /// stream left running for a channel nobody is looking at keeps the
+    /// relay fanning out to a window that will never show it.
+    private var liveTask: Task<Void, Never>?
     private let relayURL: URL
     private let keys: MeshKeys
 
@@ -142,6 +146,7 @@ final class WorkspaceModel: ObservableObject {
             if let selected = selectedChannel {
                 await loadMessages(channel: selected)
                 await loadThreads(channel: selected)
+                startLive(channel: selected)
             }
         } catch {
             status = "channel load failed: \(describe(error))"
@@ -173,6 +178,62 @@ final class WorkspaceModel: ObservableObject {
         } catch {
             status = "message load failed: \(describe(error))"
         }
+    }
+
+    /// Watch the selected channel for new events.
+    ///
+    /// The relay pushes; the client folds. Before this, the timeline only
+    /// changed when something in the app happened to reload — so a message
+    /// from another member simply did not appear, which reads as "nobody
+    /// is talking" rather than "this client is not listening".
+    func startLive(channel: String) {
+        liveTask?.cancel()
+        liveTask = Task { [weak self] in
+            guard let self, let client = self.client else { return }
+            let kinds = [
+                MeshKind.chatMessage, MeshKind.channelMessage,
+                MeshKind.workThreadOpen, MeshKind.workThreadFork,
+                MeshKind.workThreadPromote, MeshKind.workThreadMetadata,
+                MeshKind.workThreadState, MeshKind.workThreadCheckpoint,
+                MeshKind.workThreadOverdue, MeshKind.workThreadCanon,
+                MeshKind.workThreadSiblingArchived, MeshKind.workThreadPromoted,
+                MeshKind.workThreadGateReviewed,
+            ]
+            do {
+                // `limit: 0` asks for no history: the load already fetched
+                // it, and replaying it here would duplicate every row.
+                let stream = try await client.subscribe(
+                    MeshFilter(kinds: kinds, limit: 0, tags: ["#h": [channel]]))
+                for await event in stream {
+                    if Task.isCancelled { break }
+                    await self.absorb(event, channel: channel)
+                }
+            } catch {
+                FileHandle.standardError.write(
+                    Data("mesh: live subscription failed: \(self.describe(error))\n".utf8))
+            }
+        }
+    }
+
+    /// Fold one pushed event into what is on screen.
+    private func absorb(_ event: MeshEvent, channel: String) async {
+        guard selectedChannel == channel else { return }
+        if MeshKind.isWorkThread(event.kind) {
+            // Thread state is a fold over many events, so re-fold rather
+            // than trying to patch it in place — a partial application is
+            // how a client ends up showing a state the relay never had.
+            await loadThreads(channel: channel)
+            return
+        }
+        guard !messages.contains(where: { $0.id == event.id }) else { return }
+        messages.append(
+            TimelineMessage(
+                id: event.id,
+                author: String(event.pubkey.prefix(8)),
+                content: event.content,
+                createdAt: Date(timeIntervalSince1970: TimeInterval(event.createdAt)),
+                kind: event.kind))
+        messages.sort { $0.createdAt < $1.createdAt }
     }
 
     /// Post a message to the selected channel.

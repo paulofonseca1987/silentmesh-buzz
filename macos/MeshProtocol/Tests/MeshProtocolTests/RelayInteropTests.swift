@@ -163,3 +163,87 @@ struct RelayConcurrencyTests {
         await client.disconnect()
     }
 }
+
+/// Live subscriptions — the reason the client needed a demultiplexing
+/// reader rather than serialized exchanges.
+@Suite("Interop live", .enabled(if: ProcessInfo.processInfo.environment["MESH_RELAY_URL"] != nil))
+struct RelayLiveTests {
+    private func env() throws -> (URL, String, String) {
+        let e = ProcessInfo.processInfo.environment
+        guard let urlString = e["MESH_RELAY_URL"], let url = URL(string: urlString),
+            let key = e["MESH_PRIVATE_KEY"], let channel = e["MESH_CHANNEL"]
+        else { throw MeshProtocolError.malformed("interop environment missing") }
+        return (url, key, channel)
+    }
+
+    @Test("a live subscription delivers an event published after it started")
+    func liveDelivery() async throws {
+        let (url, keyHex, channel) = try env()
+        let keys = try MeshKeys(privateKeyHex: keyHex)
+
+        let watcher = MeshRelayClient(url: url, keys: keys)
+        try await watcher.connect()
+        try await watcher.authenticate()
+        let stream = try await watcher.subscribe(
+            MeshFilter(kinds: [MeshKind.chatMessage], limit: 0, tags: ["#h": [channel]]))
+
+        // A second connection publishes, so the delivery path is genuinely
+        // relay fan-out rather than the client hearing its own echo on the
+        // socket it wrote to.
+        let publisher = MeshRelayClient(url: url, keys: keys)
+        try await publisher.connect()
+        try await publisher.authenticate()
+        let marker = "live subscription \(UUID().uuidString)"
+        var event = try MeshEvent.chatMessage(
+            channel: channel, content: marker, pubkey: keys.publicKeyHex)
+        try event.sign(with: keys)
+        try await publisher.publish(event)
+
+        // The deadline must be independent of arrivals: checking it inside
+        // the loop only fires when an event shows up, so "nothing ever
+        // arrives" — the failure this test exists to catch — would hang the
+        // suite instead of failing it.
+        let seen: MeshEvent? = await withTaskGroup(of: MeshEvent?.self) { group in
+            group.addTask {
+                for await incoming in stream where incoming.content == marker {
+                    return incoming
+                }
+                return nil
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(20))
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+        #expect(seen != nil, "the subscription never delivered the published event")
+        #expect(seen?.isValid() == true)
+
+        await watcher.disconnect()
+        await publisher.disconnect()
+    }
+
+    @Test("queries still work while a subscription is open")
+    func queryDuringSubscription() async throws {
+        let (url, keyHex, channel) = try env()
+        let client = MeshRelayClient(url: url, keys: try MeshKeys(privateKeyHex: keyHex))
+        try await client.connect()
+        try await client.authenticate()
+
+        // The case serialized exchanges could not express: a stream stays
+        // open indefinitely, so a query that waits its turn would wait
+        // forever.
+        let stream = try await client.subscribe(
+            MeshFilter(kinds: [MeshKind.chatMessage], limit: 0, tags: ["#h": [channel]]))
+        let messages = try await client.query(
+            MeshFilter(kinds: [MeshKind.chatMessage], limit: 20, tags: ["#h": [channel]]))
+        #expect(!messages.isEmpty, "a query alongside a live subscription came back empty")
+        #expect(messages.allSatisfy { $0.kind == MeshKind.chatMessage })
+
+        var iterator = stream.makeAsyncIterator()
+        _ = iterator  // the stream is closed by disconnect below
+        await client.disconnect()
+    }
+}
