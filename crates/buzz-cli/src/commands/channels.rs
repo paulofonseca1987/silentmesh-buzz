@@ -14,12 +14,39 @@ use crate::error::CliError;
 use crate::validate::{parse_uuid, read_or_stdin, validate_hex64, validate_uuid};
 
 fn extract_channel_metadata(e: &serde_json::Value) -> serde_json::Value {
+    // silent-mesh: `tier` is the channel's privacy floor (D24) — which
+    // model backends may serve work here. A member can choose it for their
+    // personal channel, so they need to be able to read it back; without
+    // this the only way to see your own privacy setting was the database.
+    // Visibility comes from NIP-29's `public`/`private` marker tag rather
+    // than a value tag.
+    let visibility = if has_marker_tag(e, "public") {
+        "open"
+    } else {
+        "private"
+    };
     serde_json::json!({
         "channel_id": extract_d_tag(e),
         "name": extract_tag_value(e, "name"),
         "description": extract_tag_value(e, "about"),
+        "tier": extract_tag_value(e, "tier"),
+        "visibility": visibility,
         "created_at": e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
     })
+}
+
+/// Is a single-element marker tag (e.g. `["public"]`) present?
+fn has_marker_tag(e: &serde_json::Value, marker: &str) -> bool {
+    e.get("tags")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tags| {
+            tags.iter().any(|t| {
+                t.as_array()
+                    .and_then(|p| p.first())
+                    .and_then(serde_json::Value::as_str)
+                    == Some(marker)
+            })
+        })
 }
 
 pub async fn cmd_list_channels(
