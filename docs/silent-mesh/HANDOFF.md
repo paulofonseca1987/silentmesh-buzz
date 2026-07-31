@@ -8,15 +8,72 @@ and [phase2-work-threads.md](./phase2-work-threads.md); repo conventions in
 [AGENTS.md](../../CLAUDE.md) / CONTRIBUTING.md. This file adds only what a
 new session cannot learn from those.
 
+> **Read [Audit](#audit-2026-07-31--status-corrections-and-untracked-debt)
+> before planning anything.** This file twice claimed the Phase 3 exit
+> criterion was closed when only its metering clause was, and it listed two
+> shipped items as remaining. Those are corrected in place, but the audit
+> also collects seven pieces of debt that no document tracked — including
+> that the roadmap's #1 standing risk (fork divergence) has no mechanism at
+> all. Status claims here are only as good as their last check against the
+> code; the audit records which ones were checked, and which were not.
+
 ## Where the work lives
 
 - **Branch: `claude/fork-sync-0vdsko`** on `paulofonseca1987/silentmesh-buzz`
   (fork of `block/buzz`, in sync with upstream main at fork time). All Silent
   Mesh work to date is on this branch; continue on it (or a branch cut from
   it) — the commit history is slice-per-commit and self-describing
-  (`git log --oneline` is the index).
+  (`git log --oneline` is the index). **There is no `upstream` remote and no
+  rebase has ever run** — `main` is still the fork point. See Audit #1.
 
 ## Shipped so far
+
+**Nine commits landed without a docs commit** (`faaccef7`..`57b3f906`) before
+this update caught up. The slice→docs pairing held for ~50 commits and then
+stopped; if it slips again, `git log --oneline <last-HANDOFF-commit>..HEAD`
+is how to find the gap. What they did:
+
+- **`faaccef7` — a repo announcement only counts if the relay signed it.**
+  `repo_binding_from_events` now takes the expected owner and *skips*
+  foreign signers rather than trusting any author with a matching `d` tag
+  (the 30617 redirection hole named in next-slices #1). Fails closed on an
+  empty owner. `c264093d` corrects the module doc: the worktree probe does
+  **not** exercise the auth path, and used to say it did.
+- **`e930aaa4`, `9ff5622d` — the Mac client can address someone and talk in
+  a thread.** `MeshMentions` mirrors `buzz_sdk::mentions`
+  (longest-known-name-first with a word-boundary check, `display_name` over
+  `name`, ambiguous names tag everyone) and the thread composer posts kind:9
+  with the `e` root and resolved `p` tags. Without the `p` tag an agent
+  never wakes, so this is what makes the client able to *start* a turn.
+- **`24548db3` — one session map with a structured key.** `SessionKey
+  { Channel | Thread { channel, scope } | Heartbeat }` + `SessionEntry
+  { id, turns }` replaces four parallel maps, and the turn counter moving
+  *inside* the entry makes "drop the session but keep its counter" —
+  the prototype's every-turn-rotation bug — unrepresentable. A pure
+  refactor: all 668 pre-existing tests pass unchanged, which is the
+  evidence. `58381faf` fixes two `unnecessary_get_then_check` clippy errors
+  in its tests that escaped because clippy ran without `--all-targets`.
+- **`4e8cda27` — the newline failure that looks like a typo.** A real
+  qwen3:14b turn stored `99nThe smallest payload…` with no newline anywhere
+  (`position(E'\n' in content)` = 0). The CLI is innocent — `--content
+  'x\ny'` stores `5c 6e`. Of the three bash forms only the *unquoted* one
+  yields the observed bytes, and it is the one `base_prompt.md` did not
+  warn about: quoted forms leave a visible `\n` that gets reported, while
+  quote removal deletes the backslash and the reader sees a typo. Both are
+  now spelled out. **This fix is prompt-only** — see Audit.
+- **`57b3f906` — `buzz usage show|turns`.** Members can read their own
+  metering, closing the next-slices item that said `buzz-admin usage` was
+  operator-only. Queries `{kinds:[44201], "#p":[self]}` — no new endpoint,
+  no new kind — and classifies backend with `classify_model`, the same
+  function the relay's ingest calls, so the column agrees by construction.
+  Tier is deliberately absent: the relay resolves it from its own channels
+  table and it is not in the event. Live totals match `buzz-admin usage`'s
+  `agent_turn` rows to the token.
+- **`0a5d9d9b` — a NIP-44 conformance fix in `mobile/`.** Real bug (decrypt
+  accepted non-canonical padding and a 97-byte floor that should be 99;
+  the upstream "invalid padding" vector returned plausible text instead of
+  erroring), fixed with the official vectors vendored. **But see Audit:
+  this is upstream Block code, outside declared Silent Mesh scope.**
 
 **A real agent turn ran end to end (2026-07-31).** Until now every claim
 about agent interaction rested on events *I synthesized*; the database had
@@ -285,7 +342,10 @@ owner-encryption and deferred to the real-backend slice. See
 phase3-tier-enforcement.md.
 
 **Phase 3 slice 4 — live-turn attribution + owner usage read (2026-07-30).**
-**The Phase 3 exit criterion is closed with live data.** New cleartext kind
+**The exit criterion's *metering clause* is closed with live data** — "usage
+query shows per-user totals by tier and backend", its last sentence. This
+paragraph used to claim the whole Phase 3 exit criterion was closed; it was
+not, and the correction is recorded in "Audit" below. New cleartext kind
 44201 (attribution sibling of the encrypted 44200): harness publishes per
 completed turn with reliable token counts; the relay is the classification
 authority (tier from its own channels table, backend via the shared
@@ -500,6 +560,72 @@ serialize so exactly one winner survives) and emits kind:47013 notices.
   `.so.3`, then run gates with `OPENSSL_DIR=<prefix>`. Beware masked
   pipeline exit codes (`cargo … | tail` reports tail's status).
 
+## Audit (2026-07-31) — status corrections and untracked debt
+
+Built by checking this file and `roadmap.md` against `git log`, the code,
+and the live testbed database rather than against memory. Two claims here
+were wrong and are corrected above; the rest is work that had no home in
+any document.
+
+**Corrected:** "the Phase 3 exit criterion is closed" (twice) — only the
+metering clause was. "Member-facing usage reads" and "approvals" were
+listed as remaining after they shipped.
+
+**Untracked, in the order I would act on it:**
+
+1. **The fork's top standing risk has no mechanism.** `roadmap.md` names
+   upstream velocity vs fork divergence as risk #1 and D35 prescribes
+   *scheduled* rebases gated by the conformance/E2E harness. Neither
+   exists: there is **no `upstream` remote** (only `origin`, the fork), and
+   `main` is still at the fork point `90e058eb` with 0 commits ahead — so
+   **no upstream rebase has ever run**, contrary to Phase 0's exit
+   criterion ("upstream rebase executed once end-to-end"). Every day this
+   waits, the rebase gets harder, which is precisely the risk.
+2. **`mobile/` is outside declared scope, and `0a5d9d9b` went there
+   anyway.** Phase 0 excludes desktop/mobile/web/admin-web from our CI
+   ("trees stay in-tree, unbuilt"), and `mobile/lib/shared/crypto/nip44.dart`
+   **predates the fork** — it is Block's code, first landed in the NIP-AB
+   pairing work. The fix is real and worth having, but it belongs upstream
+   to Block, and there is **no upstreaming process** — which is item 1
+   again. Decide deliberately whether out-of-scope trees are in or out;
+   right now the answer is "out, except when a bug is found by accident".
+3. **The agent reply path is quoting-fragile and the fix is prompt-only.**
+   Every agent reply is the model writing a shell command line through
+   buzz-dev-mcp's bash. `4e8cda27` strengthened the instruction, but
+   qwen3:14b had already ignored the *existing* stdin instruction, so there
+   is no reason to believe a stronger sentence holds. A structural fix — a
+   reply path that does not round-trip through shell quoting — would touch
+   buzz-agent's tool-calls-as-output design. Not scheduled.
+4. **`SessionKey::Thread` carries `#[allow(dead_code)]`.** Deliberate and
+   documented in-place ("the allow goes away with the first production
+   caller"), but next-slices #1 is that caller, so the two should be
+   closed together. Nothing outside `pool.rs` constructs it today.
+5. **The ledger and the events can disagree, and once did.** `model_usage`
+   is the durable record; kind:44201 is the transport. The testbed holds a
+   `purpose="gate"` row whose source event is **not in the events table**,
+   so `buzz usage` reports three turns where `buzz-admin usage` reports
+   four. `record_model_usage` has exactly one caller, driven by 44201, so
+   the row must have come from an event that later vanished. **Cause not
+   established** — do not assume a bug in either read before finding it.
+6. **Desktop changes cannot be gated on the WSL box** (Tauri needs
+   WebKitGTK, no sudo), and slice 7 shipped a desktop change explicitly
+   marked "unverified locally", relying on CI. That is a reasonable
+   trade but it is not written down as policy anywhere. The same gap makes
+   `git push` fail its pre-push hook, so pushes here need `--no-verify`
+   after running the workspace gates by hand — which once let **nine
+   commits sit unpushed while being reported as pushed**. Check
+   `git status -sb` for `[ahead N]`.
+7. **Streaming has never been exercised.** Zero kind:24200 rows have ever
+   existed in the testbed database. Next-slices correctly says the Mac
+   client needs an owner binding first, but the consequence is that the
+   whole observer-frame path — encrypt, publish, p-gate, decrypt — is
+   unproven end to end, on any client.
+
+**Not verified in this audit** (so do not treat as confirmed): Phase 1's
+four approval paths were taken from this file, not re-run; and Phase 0's
+"buzz-acp runs claude-code and codex; Grok via BYOH" is unconfirmed — the
+live turn used in-tree `buzz-agent` against Ollama, not claude-code.
+
 ## Next slices (Phase 3+)
 
 Phase 2's scope items (2a–2h) all shipped and the exit criterion runs
@@ -525,29 +651,58 @@ slice; its **harness wiring** is the one remaining Phase-2 follow-up.
    Must be validated against a **live** claude-code turn in a 47000-rooted
    thread pushing to a running relay's forge — the whole value is that
    round trip, unexercisable in the dev sandbox.
-2. **Phase 3 continues** — slices 1–5 shipped (tier-aware router +
+2. **Phase 3 continues** — slices 1–8 shipped (tier-aware router +
    attribution store; pre-turn tier enforcement; the local Ollama agent
    backend; live-turn attribution 44201 + owner usage read; the gateway's
-   real `local` backend). The Phase 3 exit criterion is closed. What is
-   left, roughly in dependency order:
+   real `local` backend; the Privacy Gate assist; personal channels forced
+   to `owned`; the member's own re-tiering with promotion checked against
+   `model_usage`).
+
+   **The Phase 3 exit criterion is NOT closed** — only its metering clause
+   is. The criterion also requires a *spoken* request refined by the
+   **copilot** and **queued**, **TEE** routing in a private channel, a
+   **sealed** value resolving/scrubbing/rendering as a placeholder with a
+   raw paste caught at ingestion, and an **agent retrieval query** scoped to
+   what its operator can read. None of that exists. What is left, in
+   dependency order — the first three are roadmap Phase 3 scope that this
+   file previously did not track at all:
+   - **Content Seals (D31)** — registry, workspace sweep, ingestion guards,
+     delivery redaction envelopes, gateway resolution/scrub, mandatory-
+     redaction integration with the gate. **Zero code**: no
+     `content_seal`/`ContentSeal` anywhere in `crates/`. The only "seal" in
+     this document is MeshVault's Secure Enclave, which is unrelated.
+   - **Retrieval foundation (D37)** — pgvector + a continuous owned-tier
+     embedding pipeline, ACL-scoped search over buzz-search FTS, retrieval
+     tools for copilot and harness agents. **Not started**: `pg_extension`
+     on the testbed holds only `pgcrypto` and the default `plpgsql` — no
+     pgvector — and no embedding model is pulled.
+   - **Prompt Copilot + inference queue (D25)** — exists solely as the
+     `InferencePurpose::Copilot` enum variant in `model_route.rs`. Policy
+     without an implementation. Server whisper (voice-to-text) likewise
+     absent.
    - **More gateway consumers.** Slice 6 wired the first (the gate
-     assist). Copilot (D25) and embeddings (D37) remain; embeddings
-     additionally need a trait seam — `RawInference { text, tokens }`
-     cannot express a vector.
+     assist). Copilot (D25) and embeddings (D37) are the two above;
+     embeddings additionally need a trait seam — `RawInference { text,
+     tokens }` cannot express a vector.
    - **Owner budgets.** `Gateway::with_budget` exists and is tested, but
      nothing sets a budget or enforces one on the live (harness) path. The
      hard part is placement, not policy: the relay holds the spend data,
      the harness is the only component that can *prevent* a turn.
-   - **Member-facing usage reads** (today `buzz-admin usage` is
-     operator-only), then **TEE** (attestation-then-send) and **per-user
-     vendor CLIs** (D23). The desktop bare-model-id gap is closed (slice 7,
+   - **TEE** (attestation-then-send) and **per-user vendor CLIs** (D23) —
+     both still stubs. The desktop bare-model-id gap is closed (slice 7,
      `5d1c2221`) — desktop now calls `qualify_model` before writing
-     `BUZZ_ACP_MODEL`.
+     `BUZZ_ACP_MODEL`. Member-facing usage reads shipped (`57b3f906`,
+     `buzz usage show|turns`).
+   - **The harness does not go through the gateway.** `buzz-agent` talks to
+     Ollama directly; `sm-gateway` serves the relay-side consumers (gate
+     assist). D17's "gateway-only model access" is therefore not yet true,
+     and every routing guarantee on the harness path rests on the pre-turn
+     tier gate instead. Worth settling deliberately rather than by drift.
 3. **Phase 4 continues** — the client reads, writes, and updates live. What
    is left, roughly in value order:
-   - **Agent interaction** — approvals and per-turn diffs, where the client
-     meets the ACP harness. The largest remaining gap against the desktop
-     app, and the first place the Mac client does more than observe.
+   - **Per-turn diffs** — approvals shipped (`43f83977`, with `46013`
+     withdrawal in `cef8bdb2`), so what remains of "agent interaction" is
+     the diff half, and it is blocked on item 1 below, not on the client.
    - **The channel repo browser** — file tree and blob view over git smart
      HTTP, so a work thread's checkpoints can be read where they happened.
    - **Per-turn diffs are blocked upstream, not on the client.**
@@ -563,7 +718,8 @@ slice; its **harness wiring** is the one remaining Phase-2 follow-up.
 
 ## Suggested kickoff prompt for a fresh session
 
-> Read docs/silent-mesh/HANDOFF.md, then docs/silent-mesh/roadmap.md,
+> Read docs/silent-mesh/HANDOFF.md **including its Audit section**, then
+> docs/silent-mesh/roadmap.md,
 > phase2-work-threads.md, and phase4-client.md (if the slice touches
 > `macos/`), and skim `git log --oneline main..HEAD`. Continue
 > the roadmap at the next unshipped slice, following the working
