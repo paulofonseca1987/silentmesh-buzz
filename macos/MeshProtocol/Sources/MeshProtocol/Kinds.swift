@@ -9,6 +9,7 @@ import Foundation
 /// loudly — it silently ignores events, which looks like an empty channel.
 public enum MeshKind {
     // Chat + channel surface
+    public static let profile = 0
     public static let textNote = 1
     public static let deletion = 5
     public static let reaction = 7

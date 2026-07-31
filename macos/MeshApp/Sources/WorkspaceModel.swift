@@ -63,6 +63,10 @@ final class WorkspaceModel: ObservableObject {
     /// already accepted it. The record replaces it as soon as it lands.
     private var decidedLocally: [String: MeshApprovalOutcome] = [:]
 
+    /// Profiles of the selected channel's members, for resolving
+    /// `@mentions` to the `p` tags that address them.
+    private var memberProfiles: [MeshEvent] = []
+
     /// Agent turns in flight in the selected channel.
     @Published private(set) var turns: [MeshTurn] = []
 
@@ -227,6 +231,7 @@ final class WorkspaceModel: ObservableObject {
                 await loadThreads(channel: selected)
                 await loadApprovals(channel: selected)
                 await loadTurns(channel: selected)
+                await loadMemberProfiles(channel: selected)
                 if startingLive { startLive(channel: selected) }
             }
         } catch {
@@ -385,6 +390,32 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
+    /// Load the channel's member profiles, so `@name` can be resolved.
+    ///
+    /// Two queries, mirroring the CLI: the kind:39002 membership list gives
+    /// the pubkeys (`p` tags), then kind:0 gives their display names.
+    /// Best-effort — a failure means mentions do not resolve, never that a
+    /// message cannot be sent.
+    func loadMemberProfiles(channel: String) async {
+        guard let client else { return }
+        do {
+            let roster = try await client.query(
+                MeshFilter(kinds: [MeshKind.channelMembers], limit: 1, tags: ["#d": [channel]]))
+            let members = roster.first?.tagValues("p") ?? []
+            guard !members.isEmpty else {
+                memberProfiles = []
+                return
+            }
+            memberProfiles = try await client.query(
+                MeshFilter(authors: members, kinds: [MeshKind.profile], limit: members.count))
+        } catch {
+            if !(error is CancellationError) {
+                FileHandle.standardError.write(
+                    Data("mesh: member profiles failed: \(describe(error))\n".utf8))
+            }
+        }
+    }
+
     /// Post a message to the selected channel.
     ///
     /// Reloads afterwards rather than appending optimistically: the relay
@@ -395,8 +426,13 @@ final class WorkspaceModel: ObservableObject {
         isSending = true
         defer { isSending = false }
         do {
+            // Resolve @mentions to `p` tags. Without these the message is
+            // readable by an agent but addressed to no one — an agent wakes
+            // on a `p` tag naming it and on nothing else.
+            let mentions = MeshMentions.resolve(content: content, profiles: memberProfiles)
             var event = try MeshEvent.chatMessage(
-                channel: channel, content: content, pubkey: keys.publicKeyHex)
+                channel: channel, content: content, mentions: mentions,
+                pubkey: keys.publicKeyHex)
             try event.sign(with: keys)
             try await client.publish(event)
             lastRefusal = nil

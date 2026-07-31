@@ -12,10 +12,14 @@ import Foundation
 /// and clearer than reading a rejection.
 extension MeshEvent {
     /// A channel message (kind 9), optionally threading under `replyTo`.
+    /// - Parameter mentions: pubkeys to address, as `p` tags. An agent is
+    ///   woken by a `p` tag naming it and by nothing else, so a message
+    ///   without these can be read by an agent but never addressed to one.
     public static func chatMessage(
         channel: String,
         content: String,
         replyTo: String? = nil,
+        mentions: [String] = [],
         pubkey: String,
         at: Date = Date()
     ) throws -> MeshEvent {
@@ -29,6 +33,9 @@ extension MeshEvent {
                 throw MeshProtocolError.malformed("replyTo must be a 64-hex event id")
             }
             tags.append(["e", replyTo])
+        }
+        for mention in mentions where mention.count == 64 && mention.allSatisfy(\.isHexDigit) {
+            tags.append(["p", mention])
         }
         return MeshEvent(
             pubkey: pubkey,

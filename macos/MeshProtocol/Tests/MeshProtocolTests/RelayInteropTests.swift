@@ -512,6 +512,54 @@ struct RelayApprovalTests {
         }
     }
 
+    /// `@mention` resolution against the live roster.
+    ///
+    /// The unit tests pin the matching rule; this proves the client reads
+    /// the *relay's* answer correctly — the kind:39002 roster shape, the
+    /// kind:0 profile JSON, and that the pubkey it produces is the one that
+    /// actually wakes the agent. Without a `p` tag the app can talk in a
+    /// channel but never address anyone in it, which is why every mention in
+    /// this session had to be sent from the CLI.
+    @Test("an @mention resolves to the agent's pubkey using the live roster")
+    func mentionResolvesAgainstTheLiveRoster() async throws {
+        let env = try environment()
+        let member = try await connected(env, as: env.member)
+
+        // Exactly what WorkspaceModel.loadMemberProfiles does.
+        let roster = try await member.query(
+            MeshFilter(kinds: [MeshKind.channelMembers], limit: 1, tags: ["#d": [env.channel]]))
+        let members = roster.first?.tagValues("p") ?? []
+        #expect(!members.isEmpty, "the relay returned no membership roster for this channel")
+        #expect(
+            members.contains(env.agent.publicKeyHex),
+            "the agent is not in the channel roster, so no mention could ever wake it")
+
+        let profiles = try await member.query(
+            MeshFilter(authors: members, kinds: [MeshKind.profile], limit: members.count))
+        #expect(!profiles.isEmpty, "no member profiles came back — mentions cannot resolve")
+
+        // The agent published its profile as "Mesh"; the display name is the
+        // only handle a member has for it.
+        let resolved = MeshMentions.resolve(
+            content: "@Mesh one sentence please", profiles: profiles)
+        #expect(
+            resolved.contains(env.agent.publicKeyHex),
+            "@Mesh did not resolve to the agent — got \(resolved)")
+
+        // And the composer turns that into the tag the harness looks for.
+        var event = try MeshEvent.chatMessage(
+            channel: env.channel, content: "@Mesh one sentence please",
+            mentions: resolved, pubkey: env.member.publicKeyHex)
+        try event.sign(with: env.member)
+        #expect(event.tags.contains(["p", env.agent.publicKeyHex]))
+
+        // A name nobody answers to must tag nobody, or every stray `@` would
+        // wake somebody.
+        #expect(MeshMentions.resolve(content: "@nobody hi", profiles: profiles).isEmpty)
+
+        await member.disconnect()
+    }
+
     /// The turn lifecycle, against the real relay.
     ///
     /// The fold is unit-tested against hand-built events; this proves the

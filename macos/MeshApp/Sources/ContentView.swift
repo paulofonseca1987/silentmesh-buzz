@@ -327,6 +327,7 @@ struct ContentView: View {
                 await model.loadThreads(channel: selected)
                 await model.loadApprovals(channel: selected)
                 await model.loadTurns(channel: selected)
+                await model.loadMemberProfiles(channel: selected)
                 model.startLive(channel: selected)
             }
         }
