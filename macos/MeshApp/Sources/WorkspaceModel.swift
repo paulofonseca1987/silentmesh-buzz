@@ -47,6 +47,21 @@ final class WorkspaceModel: ObservableObject {
     /// than logged.
     @Published var lastRefusal: String?
     @Published private(set) var isSending = false
+    /// Agent permission requests in the selected channel — the surface the
+    /// roadmap's Phase 4 exit criterion turns on ("including granting a
+    /// supervised approval").
+    @Published private(set) var approvals: [MeshApproval] = []
+
+    /// Decisions this client has published and the relay has accepted, but
+    /// whose public record has not arrived yet.
+    ///
+    /// The relay commits the decision *before* emitting the kind:46011/46012
+    /// that records it, so between the OK and that event the fold still says
+    /// pending. Re-showing an Approve button there invites a second click,
+    /// which the relay refuses as "already granted" — a confusing way to
+    /// learn the first click worked. This is not optimism: the relay has
+    /// already accepted it. The record replaces it as soon as it lands.
+    private var decidedLocally: [String: MeshApprovalOutcome] = [:]
 
     private var client: MeshRelayClient?
     /// The live subscription for the selected channel. One at a time: a
@@ -146,6 +161,7 @@ final class WorkspaceModel: ObservableObject {
             if let selected = selectedChannel {
                 await loadMessages(channel: selected)
                 await loadThreads(channel: selected)
+                await loadApprovals(channel: selected)
                 startLive(channel: selected)
             }
         } catch {
@@ -198,6 +214,11 @@ final class WorkspaceModel: ObservableObject {
                 MeshKind.workThreadOverdue, MeshKind.workThreadCanon,
                 MeshKind.workThreadSiblingArchived, MeshKind.workThreadPromoted,
                 MeshKind.workThreadGateReviewed,
+                // An agent asking permission is blocked until someone
+                // answers, so this is the one push that must not wait for a
+                // reload to be noticed.
+                MeshKind.approvalRequested, MeshKind.approvalGranted,
+                MeshKind.approvalDenied,
             ]
             do {
                 // `limit: 0` asks for no history: the load already fetched
@@ -218,6 +239,16 @@ final class WorkspaceModel: ObservableObject {
     /// Fold one pushed event into what is on screen.
     private func absorb(_ event: MeshEvent, channel: String) async {
         guard selectedChannel == channel else { return }
+        switch event.kind {
+        case MeshKind.approvalRequested, MeshKind.approvalGranted, MeshKind.approvalDenied:
+            // Same reason as threads: the queue is a fold over the whole
+            // trail, and patching one row in place is how a client ends up
+            // showing a state the relay never had.
+            await loadApprovals(channel: channel)
+            return
+        default:
+            break
+        }
         if MeshKind.isWorkThread(event.kind) {
             // Thread state is a fold over many events, so re-fold rather
             // than trying to patch it in place — a partial application is
@@ -301,6 +332,71 @@ final class WorkspaceModel: ObservableObject {
     func refreshThreads() async {
         guard let channel = selectedChannel else { return }
         await loadThreads(channel: channel)
+    }
+
+    /// Load the channel's approval trail and fold it into a decision queue.
+    ///
+    /// Only the relay-signed events are queried. The member's own
+    /// kind:46030/46031 carries no `h` tag — it is addressed to a request,
+    /// not to a channel — so a channel-scoped filter would never return it.
+    /// That is the right shape anyway: what resolves a card is the relay's
+    /// record of the outcome, not this client's memory of having clicked.
+    func loadApprovals(channel: String) async {
+        guard let client else { return }
+        do {
+            let events = try await client.query(
+                MeshFilter(
+                    kinds: [
+                        MeshKind.approvalRequested, MeshKind.approvalGranted,
+                        MeshKind.approvalDenied,
+                    ],
+                    limit: 200, tags: ["#h": [channel]]))
+            var folded = MeshApprovalFold.approvals(from: events)
+            for index in folded.indices {
+                guard let mine = decidedLocally[folded[index].tokenHash] else { continue }
+                if folded[index].outcome == .pending {
+                    folded[index].outcome = mine
+                } else {
+                    // The relay's own record has arrived and outranks ours.
+                    decidedLocally[folded[index].tokenHash] = nil
+                }
+            }
+            approvals = folded
+        } catch {
+            if !(error is CancellationError) {
+                status = "approval load failed: \(describe(error))"
+            }
+        }
+    }
+
+    /// Grant or deny a pending agent permission request.
+    ///
+    /// The relay is the authority on whether this is allowed at all: an
+    /// agent may not decide its own request, only a full member of the
+    /// request's channel may decide, and an expired or already-decided
+    /// request is refused. Each of those comes back as a sentence worth
+    /// reading, so a refusal goes to the banner rather than the log.
+    func decide(_ approval: MeshApproval, grant: Bool, note: String = "") async {
+        guard let client, let channel = selectedChannel else { return }
+        isSending = true
+        defer { isSending = false }
+        do {
+            var event = try MeshEvent.approvalDecision(
+                tokenHash: approval.tokenHash, grant: grant, note: note,
+                pubkey: keys.publicKeyHex)
+            try event.sign(with: keys)
+            try await client.publish(event)
+            lastRefusal = nil
+            decidedLocally[approval.tokenHash] =
+                grant ? .granted(by: keys.publicKeyHex) : .denied(by: keys.publicKeyHex)
+            await loadApprovals(channel: channel)
+        } catch {
+            lastRefusal = describe(error)
+            // Re-fold either way: "already granted" usually means someone
+            // else decided it, and the queue should show that rather than
+            // keep offering a button that will be refused again.
+            await loadApprovals(channel: channel)
+        }
     }
 
     /// Load every work-thread event in the channel and fold them.

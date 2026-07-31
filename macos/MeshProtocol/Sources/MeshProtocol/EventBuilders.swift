@@ -95,4 +95,41 @@ extension MeshEvent {
             tags: [["e", threadRoot], ["h", channel]],
             content: draftSummary)
     }
+
+    /// A member's decision on a pending approval — kind 46030 (grant) or
+    /// 46031 (deny).
+    ///
+    /// `tokenHash` is the request's `d` tag: a SHA-256 digest, so the member
+    /// references the request without ever holding the token that authorizes
+    /// it. The 64-hex check mirrors `build_workflow_approval` in `buzz-sdk`,
+    /// which refuses anything else — and a wrong-length hash would otherwise
+    /// come back as "approval not found", which reads like the request is
+    /// gone rather than like the client sent nonsense.
+    ///
+    /// No `h` tag: the relay resolves the channel from the stored request,
+    /// and the same command path serves both approval domains. `note` is the
+    /// content and may be empty.
+    ///
+    /// Whether the relay accepts this is a separate question the caller must
+    /// still ask — an agent may not decide its own request, only full
+    /// members of the request's channel may decide, and an expired or
+    /// already-decided request is refused with a reason worth showing.
+    public static func approvalDecision(
+        tokenHash: String,
+        grant: Bool,
+        note: String = "",
+        pubkey: String,
+        at: Date = Date()
+    ) throws -> MeshEvent {
+        guard tokenHash.count == 64, tokenHash.allSatisfy(\.isHexDigit) else {
+            throw MeshProtocolError.malformed(
+                "an approval decision needs the request's 64-hex token hash")
+        }
+        return MeshEvent(
+            pubkey: pubkey,
+            createdAt: Int64(at.timeIntervalSince1970),
+            kind: grant ? MeshKind.approvalGrant : MeshKind.approvalDeny,
+            tags: [["d", tokenHash]],
+            content: note)
+    }
 }

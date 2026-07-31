@@ -105,6 +105,89 @@ to prove the reentrancy fix **also passed without the fix**. A test whose
 outcome does not depend on the behaviour it names proves only that the code
 runs. Check that a new test fails against the old code before trusting it.
 
+## Supervised approvals (2026-07-31)
+
+The roadmap's Phase 4 exit criterion names this explicitly — "a two-person
+team + one agent runs a real session entirely from the macOS app, **including
+granting a supervised approval**" — so it is the one client surface the phase
+cannot exit without.
+
+The whole lifecycle is already on the wire, which is why the client needs no
+new HTTP:
+
+| Event | Author | Carries |
+|---|---|---|
+| kind:46010 request | relay | `d` = token hash, `h` = channel, `p` = agent; content is the summary |
+| kind:46030/46031 decision | the member | `d` = token hash, content = optional note |
+| kind:46011/46012 outcome | relay | `d` = token hash, `e` = the member's command, approver in content |
+
+So `MeshApprovalFold` rebuilds the decision queue from signed events exactly
+as `MeshFold` rebuilds work threads. Four things it has to get right, none of
+which are obvious from the kind numbers:
+
+**The `d` tag is a hash, not the token.** The member references a request
+without ever holding the secret that authorizes it; the relay resolves the
+hash and checks membership itself. (The older *workflow* approval path puts
+the raw token in event content. The agent path deliberately does not, and
+mixing them up would leak one.)
+
+**Kind 46010 is shared between two domains.** Workflow gates and agent
+permission requests use the same integer, discriminated only by a `domain`
+field inside the JSON content. Folding on the kind alone renders a workflow
+gate as an agent request with every field blank — and offers an Approve
+button that cannot execute. The fold reads `domain` and drops the rest.
+
+**Expiry is the client's job.** The relay emits nothing when a request
+lapses, and nothing when an agent withdraws one (`POST /api/approvals/resolve`
+updates the row silently — see below). A client folding outcome events alone
+shows dead requests as live decisions forever, so the fold expires them
+against the deadline the request carries.
+
+**Both RFC 3339 shapes must parse.** `chrono`'s `to_rfc3339()` emits
+sub-second digits whenever the value has any — `Utc::now()` always does — and
+omits them when it does not. `ISO8601DateFormatter` accepts one shape or the
+other, never both, so a single formatter drops a deadline it cannot read, and
+an unparsed deadline silently becomes *no* deadline. The mutation test for
+this failed two other tests as a side effect, which is what that class of bug
+looks like: the parse never complains, the *rule* downstream quietly stops
+applying.
+
+### Proven live, not just unit-tested
+
+Three gated tests run the real round trip: the Swift test signs NIP-98 and
+registers a request over `POST /api/approvals` exactly as the ACP harness
+does, then a second identity decides it over the WebSocket.
+
+```
+✔ a member reads the relay's request and grants it
+✔ a denial is recorded as a denial, not merely as 'not granted'
+✔ an agent cannot grant its own request
+```
+
+The last is the rule the word "supervised" rests on, so it asserts the
+refusal *and* that the relay's reason is a sentence a member can read
+("an agent cannot decide its own permission request"). Cross-checked against
+the relay's own rows: one `granted`, one `denied`, and the self-approval
+attempt still `pending`.
+
+Unit tests alone could not have caught the timestamp or the domain trap —
+both are properties of what the *relay* emits, not of what the client
+believes.
+
+### Known gap: withdrawal is invisible
+
+`POST /api/approvals/resolve` lets the requesting agent cancel its own
+request. It updates the row and emits **no event**, unlike the decision path,
+which carefully writes a kind:46011/46012 record into the channel. An
+event-driven client therefore keeps showing a withdrawn request as pending
+until it expires; a member who acts on it gets a refusal instead of an
+action.
+
+Left as-is deliberately: the fix belongs on the relay, which is the only
+party that knows, and it is a one-line symmetry with the path right next to
+it. The client fails safe in the meantime — the relay refuses, and the
+refusal is shown.
+
 ## Live interop (2026-07-31)
 
 From the MacBook, over Tailscale, against the WSL relay:
@@ -204,12 +287,13 @@ secret and an app that keeps one.
 
 ## Suggested next slices
 
-1. **Agent interaction** — approvals and per-turn diffs, where the client
-   meets the ACP harness. The largest remaining gap between the Mac client
-   and the desktop app, and the first place the client does more than
-   observe.
+1. **Per-turn agent output** — streaming turns and diffs. Approvals landed;
+   what the agent *did* between them is still only visible as work-thread
+   checkpoints.
 2. **The channel repo browser** — file tree and blob view over git smart
    HTTP, so a work thread's checkpoints can be read where they happened.
 3. **Reconnect** — the reader tells every waiter when the socket dies, but
    nothing yet re-establishes it. A dropped tailnet route currently means
    restarting the app.
+4. **Emit an event on approval withdrawal** (relay-side, small) — closes the
+   gap above.

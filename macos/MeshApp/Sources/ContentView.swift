@@ -256,6 +256,17 @@ struct ContentView: View {
                     .padding(12)
                     Divider()
                 }
+                // Above everything the channel contains, and outside the
+                // thread selection: an agent blocked on a decision is not a
+                // property of whichever thread happens to be open, and
+                // burying it one click deep means it waits until someone
+                // goes looking. Bounded height so a busy queue cannot take
+                // the whole pane.
+                if !model.approvals.isEmpty {
+                    ScrollView { ApprovalQueue(model: model) }
+                        .frame(maxHeight: 320)
+                    Divider()
+                }
                 if let selectedThread = model.selectedThread,
                     let thread = model.threads.first(where: { $0.id == selectedThread })
                 {
@@ -299,6 +310,7 @@ struct ContentView: View {
                 model.selectedThread = nil
                 await model.loadMessages(channel: selected)
                 await model.loadThreads(channel: selected)
+                await model.loadApprovals(channel: selected)
                 model.startLive(channel: selected)
             }
         }

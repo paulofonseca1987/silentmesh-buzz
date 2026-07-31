@@ -35,6 +35,16 @@ public enum MeshKind {
     public static let agentTurnMetric = 44200
     public static let agentTurnAttribution = 44201
 
+    // Approvals. 46010/46011/46012 are relay-signed records; 46030/46031
+    // are the member's own signed decision. The request kinds are shared
+    // with the workflow approval gate — see `MeshApproval`, which reads the
+    // `domain` field rather than trusting the kind alone.
+    public static let approvalRequested = 46010
+    public static let approvalGranted = 46011
+    public static let approvalDenied = 46012
+    public static let approvalGrant = 46030
+    public static let approvalDeny = 46031
+
     /// Kinds only the relay may author. A client that renders one of these
     /// as if a member wrote it is misattributing the relay's own actions.
     public static let relayOnly: Set<Int> = [
@@ -43,6 +53,9 @@ public enum MeshKind {
         workThreadSiblingArchived,
         workThreadPromoted,
         workThreadGateReviewed,
+        approvalRequested,
+        approvalGranted,
+        approvalDenied,
     ]
 
     /// Is this one of the work-thread kinds (47000–47023)?

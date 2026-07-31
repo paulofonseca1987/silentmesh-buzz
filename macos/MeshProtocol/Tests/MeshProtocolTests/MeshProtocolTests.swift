@@ -150,6 +150,11 @@ func kindParity() throws {
         ("KIND_WORK_THREAD_GATE_REVIEWED", MeshKind.workThreadGateReviewed),
         ("KIND_AGENT_TURN_METRIC", MeshKind.agentTurnMetric),
         ("KIND_AGENT_TURN_ATTRIBUTION", MeshKind.agentTurnAttribution),
+        ("KIND_WORKFLOW_APPROVAL_REQUESTED", MeshKind.approvalRequested),
+        ("KIND_WORKFLOW_APPROVAL_GRANTED", MeshKind.approvalGranted),
+        ("KIND_WORKFLOW_APPROVAL_DENIED", MeshKind.approvalDenied),
+        ("KIND_APPROVAL_GRANT", MeshKind.approvalGrant),
+        ("KIND_APPROVAL_DENY", MeshKind.approvalDeny),
     ]
     for (rustName, swiftValue) in expected {
         let rustValue = rustKind(rustName)
