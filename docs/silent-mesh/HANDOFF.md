@@ -18,6 +18,50 @@ new session cannot learn from those.
 
 ## Shipped so far
 
+**Phase 4 — the macOS client works end to end (2026-07-31).** Four pieces,
+all in `macos/`, all validated against the live relay from the MacBook:
+
+- **`MeshProtocol`** (SPM library, no UI/entitlements — the half provable
+  headlessly). Event id is **computed, never trusted**: canonical NIP-01
+  array written by hand (an encoder that sorts keys makes unverifiable
+  events), and `isValid()` recomputes the id AND checks the signature over
+  it. `MeshRelayClient` is an actor that waits for the matching OK and
+  verifies every queried event. Kind mirror is tested by **reading
+  `kind.rs`** — drift there fails silently at runtime (the client just
+  stops matching events, which looks like an empty channel).
+- **`MeshVault`** — identity sealed by a non-extractable P-256 key **in the
+  Secure Enclave**. The enclave never holds the identity (it does P-256
+  only; Nostr is secp256k1) — it *wraps* it. Cross-process Touch ID unlock
+  verified on hardware: seal in one process, unlock in a fresh one, 6.9 s
+  (a human at the sensor; a cached grant returns instantly, which is why
+  the self-test reports elapsed time).
+- **The fold** (`ThreadFold.swift`) — D41 state rebuilt client-side from
+  signed events. Same-second ties go to the relay notice, porting the CLI's
+  fix; `null` clears a metadata field while absent leaves it alone.
+- **The app** — channels with tier badges, work threads with status/fork/
+  checkpoint/deadline, thread detail, gate-review cards, a composer, a
+  new-thread field, and a **refusal banner** carrying the relay's own words.
+
+**Three defects only running it could find** (see phase4-client.md):
+reqwest-style *actor reentrancy* let two overlapping `query()` calls eat
+each other's WebSocket frames (relay served everything, client showed
+nothing); **ATS** refused cleartext `ws://` before opening a socket (the
+same code passed tests, because a SwiftPM test binary has no Info.plist);
+and a **gate review on a team channel was accepted then silently dropped**
+— the check lived in the side effect, which can decline to act but cannot
+say why, so it moved to ingest where a reason can travel back.
+
+**Mac working agreement.** SSH in with `ssh -i ~/.ssh/sm_e2e_mac
+paulofonseca@macbook.tail94f67c.ts.net`. Screen Recording **and**
+Accessibility are granted to sshd, so `macos/scripts/ui-select.sh` can
+select rows and capture the window headlessly (`click at` does NOT work on
+SwiftUI lists — set `selected` on the row; and the window moves, so read
+its position every call). **Signed builds still need a human**: a
+keychain-held signing key is unreachable from SSH (`User interaction is
+not allowed`) and unlock state is per-session, so each Swift change needs
+one `xcodebuild` run from a Terminal on the Mac. Everything after that —
+running, testing, screenshotting, driving the UI — is headless.
+
 **Phase 4 foundation — MeshProtocol (2026-07-31).** `macos/MeshProtocol`,
 an SPM library (no UI, no entitlements — the half provable headlessly over
 SSH). Event id computed by hand from NIP-01's canonical array (an encoder
@@ -390,6 +434,11 @@ slice; its **harness wiring** is the one remaining Phase-2 follow-up.
    backend; live-turn attribution 44201 + owner usage read; the gateway's
    real `local` backend). The Phase 3 exit criterion is closed. What is
    left, roughly in dependency order:
+   - **Live subscriptions in the Swift client** — today's client
+     serializes request/response exchanges, which is correct for queries
+     and cannot carry a streaming subscription. Needs a demultiplexing
+     reader: one task receiving frames and dispatching by subscription id.
+     A design change, not a patch.
    - **More gateway consumers.** Slice 6 wired the first (the gate
      assist). Copilot (D25) and embeddings (D37) remain; embeddings
      additionally need a trait seam — `RawInference { text, tokens }`
