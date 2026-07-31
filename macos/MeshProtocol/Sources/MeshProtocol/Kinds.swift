@@ -42,6 +42,7 @@ public enum MeshKind {
     public static let approvalRequested = 46010
     public static let approvalGranted = 46011
     public static let approvalDenied = 46012
+    public static let approvalWithdrawn = 46013
     public static let approvalGrant = 46030
     public static let approvalDeny = 46031
 
@@ -56,6 +57,7 @@ public enum MeshKind {
         approvalRequested,
         approvalGranted,
         approvalDenied,
+        approvalWithdrawn,
     ]
 
     /// Is this one of the work-thread kinds (47000–47023)?

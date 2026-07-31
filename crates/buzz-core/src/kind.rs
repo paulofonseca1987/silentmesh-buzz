@@ -540,6 +540,19 @@ pub const KIND_WORKFLOW_APPROVAL_REQUESTED: u32 = 46010;
 pub const KIND_WORKFLOW_APPROVAL_GRANTED: u32 = 46011;
 /// A pending workflow approval was denied.
 pub const KIND_WORKFLOW_APPROVAL_DENIED: u32 = 46012;
+/// A pending approval was withdrawn by whoever requested it, or lapsed.
+///
+/// Relay-signed, like the 46010 request and the 46011/46012 outcomes it
+/// completes. Emitted today only for the **agent** domain (`domain:
+/// "agent"` in content), when an agent calls `POST /api/approvals/resolve`
+/// to cancel its own request.
+///
+/// It exists because the row was being updated with nothing said: a client
+/// folding approvals from events had no way to learn a request was dead, so
+/// it kept offering a decision that could only be refused. The `WORKFLOW_`
+/// prefix on this block is historical — 46010–46013 serve both the workflow
+/// gate and agent permissions, told apart by `domain` in the content.
+pub const KIND_WORKFLOW_APPROVAL_WITHDRAWN: u32 = 46013;
 
 // Work threads (47000–47499 — Silent Mesh; 47500+ left free for upstream)
 /// Work-thread root: launches a thread **as a task** (Silent Mesh D40).
@@ -793,6 +806,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_WORKFLOW_APPROVAL_REQUESTED,
     KIND_WORKFLOW_APPROVAL_GRANTED,
     KIND_WORKFLOW_APPROVAL_DENIED,
+    KIND_WORKFLOW_APPROVAL_WITHDRAWN,
     KIND_AUDIT_ENTRY,
     KIND_HUDDLE_STARTED,
     KIND_HUDDLE_PARTICIPANT_JOINED,
@@ -831,10 +845,14 @@ pub const fn is_parameterized_replaceable(kind: u32) -> bool {
     kind >= PARAM_REPLACEABLE_KIND_MIN && kind <= PARAM_REPLACEABLE_KIND_MAX
 }
 
-/// Returns `true` if `kind` is a workflow execution event (46001–46012).
+/// Returns `true` if `kind` is a workflow execution event (46001–46013).
 /// These must not trigger workflows (prevents infinite loops).
+///
+/// The upper bound is a *range*, so a new kind added to this block must
+/// extend it — otherwise the newcomer is the one execution event that can
+/// trigger a workflow, which is the loop this guard exists to prevent.
 pub const fn is_workflow_execution_kind(kind: u32) -> bool {
-    kind >= KIND_WORKFLOW_TRIGGERED && kind <= KIND_WORKFLOW_APPROVAL_DENIED
+    kind >= KIND_WORKFLOW_TRIGGERED && kind <= KIND_WORKFLOW_APPROVAL_WITHDRAWN
 }
 
 /// Returns `true` if `kind` is a NIP-43 relay membership admin command (9030–9032)

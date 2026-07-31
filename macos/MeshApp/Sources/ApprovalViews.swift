@@ -95,6 +95,12 @@ struct ApprovalCard: View {
                 ResolvedLabel(
                     systemImage: "hand.raised.fill", tint: .red,
                     text: by.isEmpty ? "Denied" : "Denied by \(String(by.prefix(8)))")
+            case .withdrawn(let status):
+                ResolvedLabel(
+                    systemImage: "arrow.uturn.backward", tint: .secondary,
+                    text: status == "expired"
+                        ? "Withdrawn — the agent's request timed out"
+                        : "Withdrawn by the agent")
             case .expired:
                 ResolvedLabel(
                     systemImage: "clock.badge.xmark", tint: .secondary,

@@ -10,6 +10,10 @@ public enum MeshApprovalOutcome: Sendable, Equatable {
     case pending
     case granted(by: String)
     case denied(by: String)
+    /// The agent took its own request back, or the relay retired it.
+    /// Distinct from `.expired`: the relay said so, rather than the client
+    /// inferring it from a deadline.
+    case withdrawn(status: String)
     case expired
 }
 
@@ -97,15 +101,26 @@ public enum MeshApprovalFold {
         }
 
         for event in events {
-            let granted = event.kind == MeshKind.approvalGranted
-            let denied = event.kind == MeshKind.approvalDenied
-            guard granted || denied,
+            let resolves =
+                event.kind == MeshKind.approvalGranted || event.kind == MeshKind.approvalDenied
+                || event.kind == MeshKind.approvalWithdrawn
+            guard resolves,
                 isAgentDomain(event),
                 let token = event.tagValue("d"),
                 var approval = byToken[token]
             else { continue }
-            let approver = body(of: event)?["approver"] as? String ?? ""
-            approval.outcome = granted ? .granted(by: approver) : .denied(by: approver)
+            let payload = body(of: event)
+            switch event.kind {
+            case MeshKind.approvalGranted:
+                approval.outcome = .granted(by: payload?["approver"] as? String ?? "")
+            case MeshKind.approvalDenied:
+                approval.outcome = .denied(by: payload?["approver"] as? String ?? "")
+            default:
+                // The relay names the reason ("cancelled" / "expired"); the
+                // client repeats it rather than inventing one, because a
+                // withdrawal and a lapse read differently to a member.
+                approval.outcome = .withdrawn(status: payload?["status"] as? String ?? "withdrawn")
+            }
             byToken[token] = approval
         }
 

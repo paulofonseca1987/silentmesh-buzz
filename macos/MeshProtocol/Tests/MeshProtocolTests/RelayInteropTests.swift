@@ -484,9 +484,66 @@ struct RelayApprovalTests {
             MeshFilter(
                 kinds: [
                     MeshKind.approvalRequested, MeshKind.approvalGranted, MeshKind.approvalDenied,
+                    MeshKind.approvalWithdrawn,
                 ],
                 limit: 200, tags: ["#h": [channel]]))
         return MeshApprovalFold.approvals(from: events)
+    }
+
+    /// Withdraw a request the way the harness does when its turn ends
+    /// before anyone answered.
+    private func withdraw(_ env: Environment, requestID: String) async throws {
+        let url = env.http.appendingPathComponent("api/approvals/resolve")
+        let body = try JSONSerialization.data(withJSONObject: [
+            "request_id": requestID, "outcome": "cancelled",
+        ])
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(
+            try nip98(keys: env.agent, method: "POST", url: url.absoluteString, body: body),
+            forHTTPHeaderField: "Authorization")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else {
+            throw MeshProtocolError.relay(
+                "POST /api/approvals/resolve -> \(status): \(String(decoding: data, as: UTF8.self))")
+        }
+    }
+
+    /// A request the agent takes back must stop being actionable.
+    ///
+    /// Before kind:46013 the relay updated the row and emitted nothing, so a
+    /// client folding from events kept offering a decision that could only be
+    /// refused. This asserts the announcement exists and that the fold uses
+    /// it — the gap, and its closing, in one test.
+    @Test("a withdrawn request is announced and retires the card")
+    func withdrawalIsVisible() async throws {
+        let env = try environment()
+        let (requestID, tokenHash) = try await requestPermission(
+            env, detail: "withdrawn before anyone looked — \(UUID().uuidString)")
+
+        let member = try await connected(env, as: env.member)
+        let pending = try await approvals(member, channel: env.channel)
+            .first { $0.tokenHash == tokenHash }
+        #expect(pending?.isActionable == true, "the request was not actionable to begin with")
+
+        try await withdraw(env, requestID: requestID)
+
+        var retired: MeshApproval?
+        for _ in 0..<20 {
+            retired = try await approvals(member, channel: env.channel)
+                .first { $0.tokenHash == tokenHash }
+            if retired?.outcome != .pending { break }
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        #expect(
+            retired?.outcome == .withdrawn(status: "cancelled"),
+            "the relay announced no withdrawal — got \(String(describing: retired?.outcome))")
+        #expect(retired?.isActionable == false)
+
+        await member.disconnect()
     }
 
     @Test("a member reads the relay's request and grants it")

@@ -269,7 +269,7 @@ final class WorkspaceModel: ObservableObject {
                 // answers, so this is the one push that must not wait for a
                 // reload to be noticed.
                 MeshKind.approvalRequested, MeshKind.approvalGranted,
-                MeshKind.approvalDenied,
+                MeshKind.approvalDenied, MeshKind.approvalWithdrawn,
             ]
             do {
                 // `limit: 0` asks for no history: the load already fetched
@@ -291,7 +291,8 @@ final class WorkspaceModel: ObservableObject {
     private func absorb(_ event: MeshEvent, channel: String) async {
         guard selectedChannel == channel else { return }
         switch event.kind {
-        case MeshKind.approvalRequested, MeshKind.approvalGranted, MeshKind.approvalDenied:
+        case MeshKind.approvalRequested, MeshKind.approvalGranted, MeshKind.approvalDenied,
+            MeshKind.approvalWithdrawn:
             // Same reason as threads: the queue is a fold over the whole
             // trail, and patching one row in place is how a client ends up
             // showing a state the relay never had.
@@ -399,7 +400,7 @@ final class WorkspaceModel: ObservableObject {
                 MeshFilter(
                     kinds: [
                         MeshKind.approvalRequested, MeshKind.approvalGranted,
-                        MeshKind.approvalDenied,
+                        MeshKind.approvalDenied, MeshKind.approvalWithdrawn,
                     ],
                     limit: 200, tags: ["#h": [channel]]))
             var folded = MeshApprovalFold.approvals(from: events)

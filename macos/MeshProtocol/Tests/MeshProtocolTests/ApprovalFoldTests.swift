@@ -99,6 +99,33 @@ struct ApprovalFoldTests {
         #expect(denied[0].isActionable == false)
     }
 
+    /// The gap that used to exist: an agent withdrew its request, the relay
+    /// updated the row and said nothing, and the card stayed clickable until
+    /// it expired. Now the relay emits kind:46013 and the queue retires it.
+    @Test("a withdrawn request stops being actionable")
+    func withdrawalRetiresTheRequest() {
+        let withdrawal = event(
+            id: "wd", kind: MeshKind.approvalWithdrawn, at: 200,
+            tags: [["d", token], ["h", "chan"], ["p", agent]],
+            content: #"{"domain":"agent","request_id":"1","status":"cancelled"}"#)
+        let approvals = MeshApprovalFold.approvals(from: [requestEvent(), withdrawal])
+        #expect(approvals[0].outcome == .withdrawn(status: "cancelled"))
+        #expect(approvals[0].isActionable == false)
+    }
+
+    /// The relay distinguishes "the agent took it back" from "it lapsed", and
+    /// a member reads those differently — so the client repeats the relay's
+    /// word instead of collapsing both into one label.
+    @Test("the relay's reason for withdrawal is carried, not flattened")
+    func withdrawalCarriesItsReason() {
+        let lapsed = event(
+            id: "wd", kind: MeshKind.approvalWithdrawn, at: 200,
+            tags: [["d", token], ["h", "chan"]],
+            content: #"{"domain":"agent","request_id":"1","status":"expired"}"#)
+        let approvals = MeshApprovalFold.approvals(from: [requestEvent(), lapsed])
+        #expect(approvals[0].outcome == .withdrawn(status: "expired"))
+    }
+
     /// An outcome whose request is not on this page describes something the
     /// member cannot see. Inventing a row from it would show an approval
     /// nobody asked for, with no detail to judge it by.

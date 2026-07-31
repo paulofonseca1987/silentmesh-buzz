@@ -153,6 +153,7 @@ func kindParity() throws {
         ("KIND_WORKFLOW_APPROVAL_REQUESTED", MeshKind.approvalRequested),
         ("KIND_WORKFLOW_APPROVAL_GRANTED", MeshKind.approvalGranted),
         ("KIND_WORKFLOW_APPROVAL_DENIED", MeshKind.approvalDenied),
+        ("KIND_WORKFLOW_APPROVAL_WITHDRAWN", MeshKind.approvalWithdrawn),
         ("KIND_APPROVAL_GRANT", MeshKind.approvalGrant),
         ("KIND_APPROVAL_DENY", MeshKind.approvalDeny),
     ]

@@ -22,7 +22,7 @@ use nostr::{EventBuilder, Kind, Tag};
 use serde_json::Value;
 use uuid::Uuid;
 
-use buzz_core::kind::KIND_WORKFLOW_APPROVAL_REQUESTED;
+use buzz_core::kind::{KIND_WORKFLOW_APPROVAL_REQUESTED, KIND_WORKFLOW_APPROVAL_WITHDRAWN};
 use buzz_core::TenantContext;
 use buzz_db::agent_permission::{
     hash_permission_token, AgentPermissionRequestKind, AgentPermissionRequestRecord,
@@ -340,10 +340,98 @@ pub async fn resolve_approval(
         return Err(api_error(StatusCode::CONFLICT, "request already resolved"));
     }
 
+    // Say so in the channel. Updating the row and emitting nothing left an
+    // event-driven client with no way to learn the request was dead: it kept
+    // rendering as pending, and a member acting on it got a refusal instead
+    // of an action. The decision path right beside this one has always
+    // written its outcome; this completes the symmetry.
+    //
+    // Best-effort, like the other two: the row is the source of truth, and a
+    // failure to announce must not undo a resolution that already committed.
+    emit_agent_approval_withdrawn(
+        &state,
+        &tenant,
+        &request,
+        status,
+        hex::encode(&request.token_hash),
+    )
+    .await;
+
     Ok(Json(serde_json::json!({
         "request_id": body.request_id,
         "status": status.to_string(),
     })))
+}
+
+/// Emit the relay-signed kind:46013 for a withdrawn or lapsed request.
+///
+/// Same correlation handle as the rest of the series — the `d` token hash —
+/// so a client folds it onto the request it retires without needing to know
+/// anything new.
+async fn emit_agent_approval_withdrawn(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    request: &AgentPermissionRequestRecord,
+    status: AgentPermissionStatus,
+    token_hash_hex: String,
+) {
+    let channel_str = request.channel_id.to_string();
+    let agent_hex = hex::encode(&request.agent_pubkey);
+    let tags: Result<Vec<Tag>, _> = [
+        ["d", token_hash_hex.as_str()],
+        ["h", channel_str.as_str()],
+        ["p", agent_hex.as_str()],
+    ]
+    .into_iter()
+    .map(Tag::parse)
+    .collect();
+    let tags = match tags {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("agent approval withdrawal: tag build failed: {e}");
+            return;
+        }
+    };
+
+    let content = serde_json::json!({
+        "domain": "agent",
+        "request_id": request.request_id,
+        "status": status.to_string(),
+    });
+
+    let event = match EventBuilder::new(
+        Kind::Custom(KIND_WORKFLOW_APPROVAL_WITHDRAWN as u16),
+        content.to_string(),
+    )
+    .tags(tags)
+    .sign_with_keys(&state.relay_keypair)
+    {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("agent approval withdrawal: signing failed: {e}");
+            return;
+        }
+    };
+
+    match state
+        .db
+        .insert_event(tenant.community(), &event, Some(request.channel_id))
+        .await
+    {
+        Ok((stored, true)) => {
+            let _ = dispatch_persistent_event(
+                tenant,
+                state,
+                &stored,
+                KIND_WORKFLOW_APPROVAL_WITHDRAWN,
+                &state.relay_keypair.public_key().to_hex(),
+                None,
+            )
+            .await;
+        }
+        Ok((_, false)) => {}
+        Err(e) => tracing::warn!("agent approval withdrawal: persist failed: {e}"),
+    }
 }
 
 /// JSON shape for one request row. The payload is included — the read is

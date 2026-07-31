@@ -7,14 +7,17 @@ was made by running it from the MacBook against the WSL relay.
 
 ## What shipped
 
-`macos/` holds four pieces. 33 tests — 27 pure, 6 gated on a live relay.
+`macos/` holds five pieces. **57 tests — 45 run anywhere, 12 more only
+against a live relay.** (Swift Testing's "Test run with N tests" line counts
+skipped ones, so a green run without a relay is not 57 executed.)
 
 | Piece | Responsibility |
 |---|---|
-| `MeshProtocol` | Nostr events, keys, kind registry, WebSocket relay client |
+| `MeshProtocol` | Nostr events, keys, kind registry, reconnecting WebSocket client |
 | `MeshVault` | Secure-Enclave-wrapped identity at rest |
 | `ThreadFold` | D41 work-thread state rebuilt from signed events |
-| `MeshApp` | SwiftUI shell — channels, threads, timeline, composer, refusals |
+| `MeshApprovalFold` | The supervised-approval decision queue |
+| `MeshApp` | SwiftUI shell — channels, threads, timeline, approvals, composer, refusals |
 
 Three decisions worth keeping:
 
@@ -138,10 +141,10 @@ gate as an agent request with every field blank — and offers an Approve
 button that cannot execute. The fold reads `domain` and drops the rest.
 
 **Expiry is the client's job.** The relay emits nothing when a request
-lapses, and nothing when an agent withdraws one (`POST /api/approvals/resolve`
-updates the row silently — see below). A client folding outcome events alone
-shows dead requests as live decisions forever, so the fold expires them
-against the deadline the request carries.
+lapses on its own, so a client folding outcome events alone would show dead
+requests as live decisions forever; the fold expires them against the
+deadline the request carries. (Agent *withdrawal* used to be silent too —
+that one is now announced as kind:46013, below.)
 
 **Both RFC 3339 shapes must parse.** `chrono`'s `to_rfc3339()` emits
 sub-second digits whenever the value has any — `Utc::now()` always does — and
@@ -210,19 +213,32 @@ both buttons; it did not make a name readable through System Events, so
 whether it reaches VoiceOver is **unverified** and worth checking with
 Accessibility Inspector on the Mac.
 
-### Known gap: withdrawal is invisible
+### Withdrawal, now announced (kind:46013)
 
-`POST /api/approvals/resolve` lets the requesting agent cancel its own
-request. It updates the row and emits **no event**, unlike the decision path,
-which carefully writes a kind:46011/46012 record into the channel. An
-event-driven client therefore keeps showing a withdrawn request as pending
-until it expires; a member who acts on it gets a refusal instead of an
-action.
+`POST /api/approvals/resolve` lets the requesting agent take its own request
+back. It used to update the row and emit **nothing**, unlike the decision
+path beside it which carefully writes a kind:46011/46012 record — so a
+client folding from events kept showing a dead request as actionable, and a
+member who clicked got a refusal instead of an action.
 
-Left as-is deliberately: the fix belongs on the relay, which is the only
-party that knows, and it is a one-line symmetry with the path right next to
-it. The client fails safe in the meantime — the relay refuses, and the
-refusal is shown.
+The relay now emits a relay-signed **kind:46013** carrying the same `d`
+token-hash handle as the rest of the series, so the fold retires the card
+without needing to know anything new. Its content names the relay's own
+reason (`cancelled` / `expired`) and the client repeats it rather than
+inventing one, because "the agent took it back" and "it lapsed" read
+differently to whoever was about to approve it.
+
+Adding to that numeric block has one non-obvious obligation:
+`is_workflow_execution_kind` is a **range** ending at the last approval
+kind, and its job is stopping execution events from triggering workflows.
+Extend the range with the kind, or the newcomer becomes the one execution
+event that *can* trigger a workflow — the exact loop the guard exists to
+prevent.
+
+Proven by the order of operations rather than by assertion alone: the new
+live test was run first against the **old** relay still in memory, where the
+withdrawn request stayed `pending` and actionable — the gap, reproduced —
+and then against the rebuilt relay, where it retires.
 
 ## Reconnect (2026-07-31)
 
@@ -413,5 +429,6 @@ secret and an app that keeps one.
    checkpoints.
 2. **The channel repo browser** — file tree and blob view over git smart
    HTTP, so a work thread's checkpoints can be read where they happened.
-3. **Emit an event on approval withdrawal** (relay-side, small) — closes the
-   gap above.
+3. **Agent turn liveness** — the harness already publishes 👀/💬 reactions
+   and deletes them when a turn ends; adding kinds 7/5 to the live filter is
+   a small change with a visible payoff.

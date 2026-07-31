@@ -20,7 +20,8 @@ new session cannot learn from those.
 
 **Phase 4 — the macOS client works end to end (2026-07-31).** Five pieces,
 all in `macos/`, all validated against the live relay from the MacBook.
-33 Swift tests, 6 of them gated on a live relay:
+57 Swift tests — 45 run anywhere, 12 only against a relay (the "Test run
+with N" line counts skipped ones, so it overstates what executed):
 
 - **`MeshProtocol`** (SPM library, no UI/entitlements — the half provable
   headlessly). Event id is **computed, never trusted**: canonical NIP-01
@@ -501,10 +502,11 @@ slice; its **harness wiring** is the one remaining Phase-2 follow-up.
      app, and the first place the Mac client does more than observe.
    - **The channel repo browser** — file tree and blob view over git smart
      HTTP, so a work thread's checkpoints can be read where they happened.
-   - **Emit an event when an agent withdraws an approval request** (relay
-     side, small): `POST /api/approvals/resolve` updates the row and emits
-     nothing, unlike the decision path beside it, so a withdrawn request
-     renders as pending until it expires.
+   - **Agent turn rendering** — see the verified event map in
+     phase4-client.md. Turn liveness is cleartext (kind:7 👀/💬 plus the
+     kind:5 that removes them); real streaming is kind:24200 only, which is
+     ephemeral, NIP-44-encrypted to the owner, and **must not** carry an
+     `#h` tag.
 
 ## Suggested kickoff prompt for a fresh session
 
