@@ -20,6 +20,9 @@ dependencies:
   web_socket_channel: ^3.0.1
   connectivity_plus: ^7.0.0
   nostr: ^2.0.0
+  # Declared directly so `shared/crypto/` can use @visibleForTesting without
+  # importing the Flutter SDK — those files are plain Dart on purpose.
+  meta: ^1.17.0
   pointycastle: ^4.0.0
   url_launcher: ^6.3.2
   gpt_markdown: ^1.1.6

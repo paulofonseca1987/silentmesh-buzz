@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:meta/meta.dart';
 import 'package:pointycastle/api.dart';
 import 'package:pointycastle/digests/sha256.dart';
 import 'package:pointycastle/macs/hmac.dart';
@@ -21,15 +22,34 @@ Uint8List getConversationKey(String senderPrivHex, String receiverPubHex) {
 /// NIP-44 v2 encrypt.
 ///
 /// Returns base64-encoded payload: version(1) || nonce(32) || ciphertext || mac(32)
-String nip44Encrypt(Uint8List conversationKey, String plaintext) {
+String nip44Encrypt(Uint8List conversationKey, String plaintext) =>
+    nip44EncryptWithNonce(conversationKey, plaintext, secureRandomBytes(32));
+
+/// [nip44Encrypt] with the nonce supplied rather than generated.
+///
+/// Exists so the official NIP-44 vectors — which pin an exact ciphertext for
+/// an exact nonce — can be asserted byte-for-byte. A round-trip test cannot
+/// do that: padding or assembly that is wrong but self-consistent round-trips
+/// happily and still fails to interoperate with the relay and desktop.
+///
+/// Production code must never call this. Reusing a nonce under one
+/// conversation key is catastrophic for a stream cipher — the keystream
+/// repeats and XORing two ciphertexts cancels it out entirely.
+@visibleForTesting
+String nip44EncryptWithNonce(
+  Uint8List conversationKey,
+  String plaintext,
+  Uint8List nonce,
+) {
   final plaintextBytes = utf8.encode(plaintext);
   if (plaintextBytes.isEmpty || plaintextBytes.length > 65535) {
     throw ArgumentError('Plaintext must be 1-65535 bytes');
   }
+  if (nonce.length != 32) {
+    throw ArgumentError('Nonce must be 32 bytes, got ${nonce.length}');
+  }
 
   final padded = _pad(Uint8List.fromList(plaintextBytes));
-
-  final nonce = secureRandomBytes(32);
 
   // Derive message keys: chacha_key(32) + chacha_nonce(12) + hmac_key(32) = 76
   final messageKeys = hkdfExpand(conversationKey, nonce, 76);
@@ -59,8 +79,14 @@ String nip44Encrypt(Uint8List conversationKey, String plaintext) {
 String nip44Decrypt(Uint8List conversationKey, String payloadBase64) {
   final payload = base64.decode(payloadBase64);
 
-  // Minimum: version(1) + nonce(32) + min_ciphertext(32) + mac(32) = 97
-  if (payload.length < 97) {
+  // Minimum: version(1) + nonce(32) + min_ciphertext(34) + mac(32) = 99.
+  //
+  // The ciphertext floor is 34, not 32: ChaCha20 is a stream cipher, so the
+  // ciphertext is exactly as long as the padded plaintext, and the smallest
+  // padded plaintext is a 2-byte big-endian length prefix followed by the
+  // 32-byte minimum pad. Forgetting the prefix gives 97, which accepts two
+  // payload lengths the relay and every other client reject.
+  if (payload.length < 99) {
     throw FormatException('NIP-44 payload too short: ${payload.length}');
   }
 
@@ -122,6 +148,18 @@ String _unpad(Uint8List padded) {
   final len = (padded[0] << 8) | padded[1];
   if (len == 0 || 2 + len > padded.length) {
     throw FormatException('Invalid padding length: $len');
+  }
+  // The declared length must account for the whole buffer under the padding
+  // rule — not merely fit inside it. Without this, a sender can pad to any
+  // length it likes and stash arbitrary bytes after the plaintext, and the
+  // frame still decrypts here while the relay and desktop refuse it. That is
+  // a silent divergence: the same event reads as text on mobile and as an
+  // error everywhere else.
+  if (padded.length != 2 + _calcPaddedLen(len)) {
+    throw FormatException(
+      'Non-canonical NIP-44 padding: ${padded.length} bytes for a '
+      '$len-byte plaintext',
+    );
   }
   return utf8.decode(padded.sublist(2, 2 + len));
 }
