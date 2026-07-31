@@ -3633,8 +3633,19 @@ mod agent_draft_prompt_tests {
     fn shared_base_prompt_teaches_real_newlines_for_multiline_messages() {
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.contains("pass real newline bytes through stdin"));
-        assert!(prompt.contains("single-quoted shell strings preserve `\\n` literally"));
         assert!(prompt.contains("buzz messages send ... --content -"));
+
+        // Both failure modes, because they are not the same failure.
+        //
+        // A quoted `\n` survives as a visible backslash — ugly, reported,
+        // fixed. An UNQUOTED one is eaten by bash's quote removal and the
+        // reader sees `firstnsecond`, which looks like a typo rather than a
+        // bug. That is the one that goes unreported, and it is the one a
+        // real qwen3:14b turn actually produced ("99nThe smallest payload
+        // …"). Warning only about the visible case is what let it through.
+        assert!(prompt.contains("preserves the backslash literally"));
+        assert!(prompt.contains("deletes the backslash"));
+        assert!(prompt.contains("firstnsecond"));
     }
 }
 
