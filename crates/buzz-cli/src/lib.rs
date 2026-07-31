@@ -209,6 +209,9 @@ enum Cmd {
     /// Read the activity feed
     #[command(subcommand)]
     Feed(FeedCmd),
+    /// Read your own agent model usage — token totals and where they ran
+    #[command(subcommand)]
+    Usage(UsageCmd),
     /// Publish notes and manage the social graph (NIP-01/02)
     #[command(subcommand)]
     Social(SocialCmd),
@@ -1237,6 +1240,32 @@ pub enum FeedCmd {
     },
 }
 
+/// Your own model usage, read from the kind:44201 turn attributions the
+/// relay already scopes to you. `tier` is deliberately absent: the relay
+/// resolves it from its own channels table on ingest and it is not carried
+/// in the event, so only `buzz-admin usage` can report it authoritatively.
+#[derive(Subcommand)]
+pub enum UsageCmd {
+    /// Aggregate token totals across your turns
+    Show {
+        /// Only include turns from the last N hours. Omit for all time
+        #[arg(long)]
+        since_hours: Option<u32>,
+        /// Bucket by: model (default), channel, or agent
+        #[arg(long)]
+        by: Option<String>,
+    },
+    /// List your individual turns, newest first
+    Turns {
+        /// Only include turns from the last N hours. Omit for all time
+        #[arg(long)]
+        since_hours: Option<u32>,
+        /// Maximum number of turns to return
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+}
+
 #[derive(Subcommand)]
 pub enum SocialCmd {
     /// Publish a text note (NIP-01 kind:1)
@@ -2082,6 +2111,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Threads(sub) => commands::threads::dispatch(sub, &client).await,
         Cmd::Workflows(sub) => commands::workflows::dispatch(sub, &client).await,
         Cmd::Feed(sub) => commands::feed::dispatch(sub, &client, &cli.format).await,
+        Cmd::Usage(sub) => commands::usage::dispatch(sub, &client, &cli.format).await,
         Cmd::Social(sub) => commands::social::dispatch(sub, &client).await,
         Cmd::Notes(sub) => commands::notes::dispatch(sub, &client).await,
         Cmd::Repos(sub) => commands::repos::dispatch(sub, &client).await,
@@ -2155,6 +2185,7 @@ mod tests {
             "social",
             "threads",
             "upload",
+            "usage",
             "users",
             "workflows",
         ];
