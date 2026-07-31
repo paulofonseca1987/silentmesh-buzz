@@ -124,6 +124,33 @@ impl ChannelTier {
             ChannelTier::Open => "open",
         }
     }
+
+    /// How strict this tier is, ascending: `open` (0) → `private` (1) →
+    /// `owned` (2). Only meaningful relative to another tier; see
+    /// [`ChannelTier::is_at_least_as_strict_as`].
+    pub fn strictness(&self) -> u8 {
+        match self {
+            ChannelTier::Open => 0,
+            ChannelTier::Private => 1,
+            ChannelTier::Owned => 2,
+        }
+    }
+
+    /// Does this tier permit **no more** egress than `other`?
+    ///
+    /// The comparison content movement has to satisfy (D29/D30): material
+    /// may move into a channel only from a space at least as strict, because
+    /// a stricter channel's promise is about what has *already* been allowed
+    /// to leave. Promoting an `open` thread into an `owned` channel would
+    /// import content that may have been sent to a vendor into a space whose
+    /// whole guarantee is that nothing in it ever was.
+    ///
+    /// The reverse — strict into loose — is the ordinary promotion direction,
+    /// a deliberate privacy weakening, which is exactly what the D30 gate
+    /// review exists to make the member look at first.
+    pub fn is_at_least_as_strict_as(&self, other: ChannelTier) -> bool {
+        self.strictness() >= other.strictness()
+    }
 }
 
 impl std::fmt::Display for ChannelTier {
@@ -225,6 +252,27 @@ impl FromStr for MemberRole {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tier_strictness_orders_by_permitted_egress() {
+        use super::ChannelTier::*;
+        assert!(Owned.strictness() > Private.strictness());
+        assert!(Private.strictness() > Open.strictness());
+
+        // Equal tiers satisfy each other (promotion within a tier is fine).
+        for t in [Owned, Private, Open] {
+            assert!(t.is_at_least_as_strict_as(t), "{t} vs itself");
+        }
+        // Strict → loose is the ordinary promotion direction.
+        assert!(Owned.is_at_least_as_strict_as(Open));
+        assert!(Owned.is_at_least_as_strict_as(Private));
+        assert!(Private.is_at_least_as_strict_as(Open));
+        // Loose → strict imports already-egressable content into a space
+        // whose guarantee is that nothing in it ever egressed.
+        assert!(!Open.is_at_least_as_strict_as(Owned));
+        assert!(!Open.is_at_least_as_strict_as(Private));
+        assert!(!Private.is_at_least_as_strict_as(Owned));
+    }
+
     use super::canonical_channel_name;
 
     #[test]

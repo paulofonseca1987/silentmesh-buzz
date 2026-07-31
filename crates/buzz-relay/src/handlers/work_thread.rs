@@ -795,6 +795,72 @@ pub(crate) async fn handle_thread_promote(
         ));
     }
 
+    // silent-mesh (D24/D29/D30): promoted content must comply with the
+    // DESTINATION's privacy setting. A tier is a statement about what has
+    // been allowed to leave a space, so material may only move into a
+    // channel that is no stricter than the one it came from: promoting an
+    // `open` personal thread into an `owned` team channel would import
+    // content a vendor may already have seen into a space whose entire
+    // guarantee is that nothing in it ever egressed.
+    //
+    // The ordinary direction — strict source into looser target — stays
+    // open, because that is a deliberate weakening the member performs
+    // knowingly, and it is exactly what the D30 gate makes them look at
+    // first (`buzz threads gate-review`).
+    //
+    // Unresolvable tiers fail closed to `owned` on the source (assume the
+    // most sensitive origin) and to the parsed value on the target.
+    let source_channel_row = state
+        .db
+        .get_channel(tenant.community(), from_channel)
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: source channel lookup: {e}")))?;
+    let source_tier = source_channel_row
+        .tier
+        .parse::<buzz_core::channel::ChannelTier>()
+        .unwrap_or(buzz_core::channel::ChannelTier::Owned);
+    let target_tier = target
+        .tier
+        .parse::<buzz_core::channel::ChannelTier>()
+        .unwrap_or(buzz_core::channel::ChannelTier::Owned);
+    if !source_tier.is_at_least_as_strict_as(target_tier) {
+        return Err(IngestError::Rejected(format!(
+            "forbidden: privacy tier mismatch — the source channel is '{source_tier}', looser \
+             than the target's '{target_tier}'. Content may only move into a channel no stricter \
+             than the space it came from. Promote into a channel at '{source_tier}' or looser."
+        )));
+    }
+
+    // Declared tiers state a permission; `model_usage` records what the
+    // space actually did. Consult both, because re-tiering a personal
+    // channel from `open` to `owned` changes what is allowed next — it does
+    // not un-send the prompts a vendor already saw, and without this check
+    // the tier comparison above would be bypassable by flipping the source
+    // tier immediately before promoting.
+    //
+    // Evidence, not proof: this sees metered inference, not text pasted in
+    // from elsewhere. It can refuse movement that looks clean, never
+    // certify a channel that isn't.
+    let permitted = buzz_core::model_route::allowed_backends(
+        target_tier,
+        buzz_core::model_route::InferencePurpose::AgentTurn,
+    );
+    let used = state
+        .db
+        .channel_backends_used(tenant.community(), from_channel)
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: usage lookup: {e}")))?;
+    if let Some(offending) = used.iter().find(|b| {
+        // An unparseable backend string is not one we can vouch for.
+        buzz_core::model_route::Backend::from_str_opt(b).is_none_or(|b| !permitted.contains(&b))
+    }) {
+        return Err(IngestError::Rejected(format!(
+            "forbidden: the source channel has already run inference on the '{offending}' \
+             backend, which the target's '{target_tier}' tier does not permit. Re-tiering the \
+             source changes what happens next; it does not withdraw what already left."
+        )));
+    }
+
     // A named checkpoint must be one the source thread actually recorded.
     if let Some(commit) = &req_commit {
         let recorded =

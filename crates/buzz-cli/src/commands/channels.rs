@@ -348,6 +348,26 @@ pub async fn cmd_create_channel(
 }
 
 /// Create the caller's personal channel (kind 9007 + `personal` tag, D29):
+/// Change a personal channel's privacy tier (kind 9002 + `tier` tag).
+///
+/// The relay refuses this for a team channel (tier is immutable there,
+/// D26) and for anyone but the personal channel's owner.
+pub async fn cmd_set_channel_tier(
+    client: &BuzzClient,
+    channel: &str,
+    tier: &str,
+) -> Result<(), CliError> {
+    crate::validate::validate_uuid(channel)?;
+    let channel_id = uuid::Uuid::parse_str(channel)
+        .map_err(|_| CliError::Usage("--channel must be a UUID".into()))?;
+    let builder =
+        buzz_sdk::build_set_channel_tier(channel_id, tier).map_err(crate::validate::sdk_err)?;
+    let event = client.sign_event(builder)?;
+    let resp = client.submit_event(event).await?;
+    println!("{}", crate::client::normalize_write_response(&resp));
+    Ok(())
+}
+
 /// always private, one per member, implicit Channel Admin.
 pub async fn cmd_create_personal_channel(
     client: &BuzzClient,
@@ -1175,6 +1195,9 @@ pub async fn dispatch(
         }
         ChannelsCmd::CreatePersonal { name, description } => {
             cmd_create_personal_channel(client, &name, description.as_deref()).await
+        }
+        ChannelsCmd::SetTier { channel, tier } => {
+            cmd_set_channel_tier(client, &channel, &tier).await
         }
         ChannelsCmd::Update {
             channel,

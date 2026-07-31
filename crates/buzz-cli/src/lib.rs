@@ -593,6 +593,23 @@ pub enum ChannelsCmd {
         #[arg(long)]
         description: Option<String>,
     },
+    /// Change your personal channel's privacy tier (signs a kind:9002)
+    ///
+    /// A personal channel starts at `owned` — zero egress, local models
+    /// only — and is yours to re-tier. Team channels are immutable (D26).
+    /// Loosening applies to future work only, and a thread may still only
+    /// be promoted into a channel no stricter than the space it came from.
+    #[command(
+        after_help = "Tiers:\n  owned    local models only (zero egress) — the default\n  private  local or TEE-attested providers\n  open     your own vendor subscriptions allowed\n\nExample:\n  buzz channels set-tier --channel <UUID> --tier private"
+    )]
+    SetTier {
+        /// Personal channel UUID
+        #[arg(long)]
+        channel: String,
+        /// New tier
+        #[arg(long, value_parser = ["owned", "private", "open"])]
+        tier: String,
+    },
     /// Update channel name, description, or ephemeral TTL
     Update {
         /// Channel UUID
@@ -2240,6 +2257,7 @@ mod tests {
                 "remove-member",
                 "search",
                 "set-add-policy",
+                "set-tier",
                 "topic",
                 "unarchive",
                 "update"
@@ -2336,7 +2354,7 @@ mod tests {
         let expected: Vec<(&str, usize)> = vec![
             ("agents", 5),
             ("canvas", 2),
-            ("channels", 17),
+            ("channels", 18),
             ("dms", 4),
             ("emoji", 5),
             ("feed", 1),

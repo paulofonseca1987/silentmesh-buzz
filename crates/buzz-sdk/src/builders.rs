@@ -651,6 +651,25 @@ pub fn build_update_channel(
     Ok(EventBuilder::new(Kind::Custom(9002), "").tags(tags))
 }
 
+/// Build a personal-channel tier change (kind 9002 with a `tier` tag,
+/// Silent Mesh D24/D29).
+///
+/// A member's personal channel starts at `owned` (zero egress) and is
+/// theirs to re-tier later; a **team** channel's tier stays immutable
+/// (D26) and the relay refuses this event for one. Loosening applies to
+/// future work only — it cannot un-send what already stayed local — and a
+/// thread may still only be promoted into a channel no stricter than the
+/// space it came from.
+pub fn build_set_channel_tier(channel_id: Uuid, tier: &str) -> Result<EventBuilder, SdkError> {
+    if !matches!(tier, "owned" | "private" | "open") {
+        return Err(SdkError::InvalidTag(
+            "tier must be \"owned\", \"private\", or \"open\"".into(),
+        ));
+    }
+    let tags = vec![tag(&["h", &channel_id.to_string()])?, tag(&["tier", tier])?];
+    Ok(EventBuilder::new(Kind::Custom(9002), "").tags(tags))
+}
+
 /// Build a NIP-29 edit-metadata event for topic (kind 9002).
 pub fn build_set_topic(channel_id: Uuid, topic: &str) -> Result<EventBuilder, SdkError> {
     let tags = vec![

@@ -132,6 +132,36 @@ pub async fn user_usage_totals(
         .collect()
 }
 
+/// Which backends have actually served inference **in this channel**
+/// (Silent Mesh D24/D30).
+///
+/// Declared tiers say what a space is *allowed* to do; these rows say what
+/// it *did*. Promotion consults both, because a member who re-tiers their
+/// personal channel from `open` to `owned` has changed a permission, not
+/// un-sent the prompts a vendor already saw.
+///
+/// Evidence, not proof: it covers inference the harness or gateway
+/// metered, not text pasted in from elsewhere. It can therefore refuse
+/// wrongly-optimistic movement, never certify a channel as clean.
+pub async fn channel_backends_used(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+) -> Result<Vec<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT DISTINCT backend
+        FROM model_usage
+        WHERE community_id = $1 AND channel_id = $2
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(channel_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// A single user's total token spend (prompt + completion) since a cutoff —
 /// the number a per-user budget check compares against.
 pub async fn user_token_spend(

@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 34);
+        assert_eq!(migrations.len(), 35);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1037,6 +1037,19 @@ mod tests {
             "the tightening update must never re-tenant or rewrite channels",
         );
 
+        // silent-mesh D29: a personal channel's tier becomes the member's
+        // own choice — the guard is NARROWED (team channels keep the
+        // absolute rule), never dropped, and the exemption is data-driven
+        // off `personal_channels` rather than a caller-supplied flag.
+        assert_eq!(migrations[34].version, 35);
+        let personal_mutable = migrations[34].sql.as_str();
+        assert!(personal_mutable.contains("CREATE OR REPLACE FUNCTION channels_tier_immutable"));
+        assert!(personal_mutable.contains("personal_channels"));
+        assert!(
+            personal_mutable.contains("RAISE EXCEPTION"),
+            "team channels must still be refused a tier change",
+        );
+
         let desired_schema = include_str!("../../../schema/schema.sql");
         assert!(
             desired_schema.contains("CREATE TABLE join_policy_acceptances"),
@@ -1324,7 +1337,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(34));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(35));
     }
 
     #[tokio::test]

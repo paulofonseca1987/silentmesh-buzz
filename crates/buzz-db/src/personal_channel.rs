@@ -229,6 +229,53 @@ pub async fn get_personal_channel_for(
     Ok(row.map(|(ch,)| ch))
 }
 
+/// Set a personal channel's privacy tier (D24/D29) — the member's own
+/// choice for their own space.
+///
+/// The registry join **is** the authorization: the statement can only ever
+/// touch a row that is a personal channel owned by `owner_pubkey`, so this
+/// function cannot be used to re-tier a team channel or someone else's
+/// space, whatever the caller believes. A DB trigger backstops it
+/// (migration 0035 permits tier changes only for personal channels).
+///
+/// Returns `false` when nothing matched — not this member's personal
+/// channel, or no such channel — so the caller can answer precisely rather
+/// than reporting a success that did not happen.
+pub async fn set_personal_channel_tier(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    owner_pubkey: &[u8],
+    tier: ChannelTier,
+) -> Result<bool> {
+    if owner_pubkey.len() != 32 {
+        return Err(DbError::InvalidData(format!(
+            "pubkey must be 32 bytes, got {}",
+            owner_pubkey.len()
+        )));
+    }
+    let affected = sqlx::query(
+        r#"
+        UPDATE channels c
+        SET tier = $4::channel_tier
+        FROM personal_channels p
+        WHERE c.id = $2
+          AND c.community_id = $1
+          AND p.channel_id = c.id
+          AND p.community_id = c.community_id
+          AND p.owner_pubkey = $3
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(channel_id)
+    .bind(owner_pubkey)
+    .bind(tier.as_str())
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected > 0)
+}
+
 #[cfg(test)]
 mod pg_tests {
     //! Postgres-gated tests: atomic creation, forced privacy, owner
@@ -257,6 +304,108 @@ mod pg_tests {
             .await
             .expect("insert community");
         CommunityId::from_uuid(id)
+    }
+
+    /// D24/D29: the member re-tiers their own space; nobody else can, and
+    /// the function cannot reach a team channel at all — the registry join
+    /// IS the authorization, so a caller who gets the arguments wrong gets
+    /// `false`, never someone else's channel.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn only_the_owner_re_tiers_their_own_personal_channel() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let owner = vec![0x11u8; 32];
+        let stranger = vec![0x22u8; 32];
+        let channel = Uuid::new_v4();
+
+        let created = create_personal_channel(
+            &pool,
+            community,
+            channel,
+            "my-space",
+            ChannelType::Stream,
+            None,
+            &owner,
+            None,
+        )
+        .await
+        .expect("create personal channel");
+        let record = match created {
+            CreatePersonalChannelResult::Created(r) => r,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        assert_eq!(record.tier, "owned", "personal channels start owned");
+
+        let tier_of = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT tier::text FROM channels WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read tier")
+            }
+        };
+
+        // The owner may loosen it — their space, their default.
+        assert!(
+            set_personal_channel_tier(&pool, community, channel, &owner, ChannelTier::Private)
+                .await
+                .expect("owner re-tier"),
+        );
+        assert_eq!(tier_of(channel).await, "private");
+
+        // ...and tighten it again. Direction is not constrained here; what
+        // content movement must satisfy is enforced at promotion.
+        assert!(
+            set_personal_channel_tier(&pool, community, channel, &owner, ChannelTier::Owned)
+                .await
+                .expect("owner re-tier back"),
+        );
+        assert_eq!(tier_of(channel).await, "owned");
+
+        // A stranger cannot, and the row is untouched.
+        assert!(!set_personal_channel_tier(
+            &pool,
+            community,
+            channel,
+            &stranger,
+            ChannelTier::Open
+        )
+        .await
+        .expect("stranger re-tier"),);
+        assert_eq!(tier_of(channel).await, "owned");
+
+        // A team channel is unreachable through this path — and the 0035
+        // trigger still refuses it outright, so even a direct UPDATE fails.
+        let team = Uuid::new_v4();
+        crate::channel::create_channel_with_id(
+            &pool,
+            community,
+            team,
+            "team",
+            ChannelType::Stream,
+            crate::channel::ChannelVisibility::Open,
+            None,
+            &owner,
+            None,
+        )
+        .await
+        .expect("team channel");
+        assert!(
+            !set_personal_channel_tier(&pool, community, team, &owner, ChannelTier::Owned)
+                .await
+                .expect("team re-tier is a no-op"),
+        );
+        let direct = sqlx::query("UPDATE channels SET tier = 'owned' WHERE id = $1")
+            .bind(team)
+            .execute(&pool)
+            .await;
+        assert!(
+            direct.is_err(),
+            "the 0035 trigger must still refuse a team-channel tier change"
+        );
     }
 
     #[tokio::test]

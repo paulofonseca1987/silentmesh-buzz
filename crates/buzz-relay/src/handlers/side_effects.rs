@@ -582,13 +582,44 @@ pub async fn validate_admin_event(
             }
         }
         9002 => {
-            // silent-mesh: the privacy tier is immutable (D26) — the only
-            // re-tiering path is an owner-only channel clone. Reject any
-            // attempt pre-storage (a DB trigger backstops this in depth).
-            if event.tags.iter().any(|t| t.kind().to_string() == "tier") {
-                return Err(anyhow::anyhow!(
-                    "the channel tier is immutable (declared at creation)"
-                ));
+            // silent-mesh: a TEAM channel's privacy tier is immutable (D26)
+            // — members post into it on the strength of a declared floor,
+            // and re-tiering underneath them breaks a promise they already
+            // acted on; the only re-tiering path is an owner-only clone.
+            //
+            // A PERSONAL channel (D29) has exactly one member, who is also
+            // its owner: their space, their default, changeable later. The
+            // owner is the only one who may change it — a bot in the
+            // member's personal channel must not be able to loosen it.
+            // Rejected pre-storage; the DB trigger (0035) and the
+            // registry-joined update backstop it in depth.
+            if let Some(tier_tag) = event.tags.iter().find(|t| t.kind().to_string() == "tier") {
+                let owner = state
+                    .db
+                    .get_personal_channel_owner(tenant.community(), channel_id)
+                    .await?;
+                match owner {
+                    Some(owner) if owner == event.pubkey.to_bytes().to_vec() => {}
+                    Some(_) => {
+                        return Err(anyhow::anyhow!(
+                            "only the personal channel's owner may change its tier"
+                        ));
+                    }
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "the channel tier is immutable (declared at creation)"
+                        ));
+                    }
+                }
+                match tier_tag.content() {
+                    Some(v) if v.parse::<buzz_core::channel::ChannelTier>().is_ok() => {}
+                    Some(v) => {
+                        return Err(anyhow::anyhow!(
+                            "invalid tier value: {v} (must be \"owned\", \"private\", or \"open\")"
+                        ));
+                    }
+                    None => return Err(anyhow::anyhow!("tier tag must have a value")),
+                }
             }
             // silent-mesh: personal channels (D29) stay private forever — a
             // visibility flip would silently open a member's personal space
@@ -614,6 +645,8 @@ pub async fn validate_admin_event(
                 "purpose",
                 "visibility",
                 "ttl",
+                // silent-mesh: personal-channel tier (D29).
+                "tier",
             ];
             let has_recognized = event
                 .tags
@@ -621,7 +654,7 @@ pub async fn validate_admin_event(
                 .any(|t| RECOGNIZED_TAGS.contains(&t.kind().to_string().as_str()));
             if !has_recognized {
                 return Err(anyhow::anyhow!(
-                    "kind:9002 must include at least one metadata tag (name, about, archived, topic, purpose, visibility, ttl)"
+                    "kind:9002 must include at least one metadata tag (name, about, archived, topic, purpose, visibility, ttl, tier)"
                 ));
             }
 
@@ -1835,6 +1868,35 @@ async fn handle_edit_metadata(
                             },
                         )
                         .await?;
+                }
+                // silent-mesh: the member re-tiers their own personal
+                // space (D29). The DB function's registry join is the real
+                // authorization — it can only touch a personal channel owned
+                // by this actor — so a validation gap upstream cannot become
+                // a re-tiered team channel.
+                "tier" => {
+                    if let Ok(tier) = val.parse::<buzz_core::channel::ChannelTier>() {
+                        let changed = state
+                            .db
+                            .set_personal_channel_tier(
+                                tenant.community(),
+                                channel_id,
+                                &actor_bytes,
+                                tier,
+                            )
+                            .await?;
+                        if changed {
+                            emit_system_message(
+                                tenant,
+                                state,
+                                channel_id,
+                                serde_json::json!({
+                                    "type": "tier_changed", "actor": actor_hex, "tier": val
+                                }),
+                            )
+                            .await?;
+                        }
+                    }
                 }
                 "about" => {
                     state

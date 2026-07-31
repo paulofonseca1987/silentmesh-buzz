@@ -2961,6 +2961,37 @@ impl Db {
         .await
     }
 
+    /// Which backends have actually served inference in `channel_id`
+    /// (D24/D30) — what the space *did*, as opposed to what its declared
+    /// tier says it may do.
+    pub async fn channel_backends_used(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+    ) -> Result<Vec<String>> {
+        model_usage::channel_backends_used(&self.pool, community_id, channel_id).await
+    }
+
+    /// Set a personal channel's privacy tier (D24/D29) — the member's own
+    /// choice for their own space. Returns `false` when `channel_id` is not
+    /// `owner_pubkey`'s personal channel.
+    pub async fn set_personal_channel_tier(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        owner_pubkey: &[u8],
+        tier: channel::ChannelTier,
+    ) -> Result<bool> {
+        personal_channel::set_personal_channel_tier(
+            &self.pool,
+            community_id,
+            channel_id,
+            owner_pubkey,
+            tier,
+        )
+        .await
+    }
+
     /// Whose personal channel is `channel_id`, if anyone's (D29)?
     pub async fn get_personal_channel_owner(
         &self,
