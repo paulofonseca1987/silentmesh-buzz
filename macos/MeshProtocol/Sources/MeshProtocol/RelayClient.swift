@@ -202,7 +202,7 @@ public actor MeshRelayClient {
     private func receiveArray(timeout: TimeInterval) async throws -> [Any] {
         guard let task else { throw MeshProtocolError.transport("not connected") }
         guard timeout > 0 else { throw MeshProtocolError.timeout("receive deadline passed") }
-        let message = try await task.receive()
+        let message = try await withTimeout(seconds: timeout) { try await task.receive() }
         let text: String
         switch message {
         case .string(let s): text = s
@@ -224,6 +224,31 @@ public actor MeshRelayClient {
             throw MeshProtocolError.malformed("AUTH without a challenge")
         }
         return challenge
+    }
+
+    /// Bound an await that has no timeout of its own.
+    ///
+    /// `URLSessionWebSocketTask.receive()` waits forever if the relay sends
+    /// nothing. Checking a deadline *between* frames — which is all a loop
+    /// can do — is not a timeout: one silent subscription hangs the caller
+    /// permanently, with no error to log and nothing on screen to explain
+    /// it. Racing the receive against a sleep makes the deadline real.
+    private func withTimeout<T: Sendable>(
+        seconds: TimeInterval,
+        _ work: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await work() }
+            group.addTask {
+                try await Task.sleep(for: .seconds(seconds))
+                throw MeshProtocolError.timeout("relay sent nothing for \(Int(seconds))s")
+            }
+            guard let first = try await group.next() else {
+                throw MeshProtocolError.transport("receive produced no result")
+            }
+            group.cancelAll()
+            return first
+        }
     }
 
     /// Receive frames until `match` returns one, or the deadline passes.

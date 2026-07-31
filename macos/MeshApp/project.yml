@@ -1,0 +1,43 @@
+# XcodeGen spec — the project file is generated, never hand-edited.
+#
+# project.pbxproj is a machine-written format where a bad edit corrupts
+# silently; keeping the spec in YAML means the project is reviewable in a
+# diff and reproducible with `xcodegen generate`.
+name: MeshApp
+options:
+  bundleIdPrefix: net.silentmesh
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+packages:
+  MeshProtocol:
+    path: ../MeshProtocol
+
+targets:
+  MeshApp:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+    dependencies:
+      - package: MeshProtocol
+        product: MeshProtocol
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleName: Silent Mesh
+        CFBundleDisplayName: Silent Mesh
+        LSMinimumSystemVersion: "14.0"
+        NSHighResolutionCapable: true
+        # No sandbox yet: the vault slice adds the entitlements this app
+        # will need, and turning the sandbox on before then would only
+        # produce failures unrelated to what is being built.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: net.silentmesh.MeshApp
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "6.0"
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: YES
