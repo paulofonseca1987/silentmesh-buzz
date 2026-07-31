@@ -199,7 +199,7 @@ struct ContentView: View {
             // blank white in a `cacheDisplay` bitmap — the screenshot
             // would show an empty sidebar the app does not actually have.
             .background(Color(nsColor: .controlBackgroundColor))
-            .navigationSplitViewColumnWidth(min: 240, ideal: 280)
+            .navigationSplitViewColumnWidth(min: 200, ideal: 230)
             .safeAreaInset(edge: .bottom) {
                 HStack(spacing: 6) {
                     Circle()
@@ -209,6 +209,35 @@ struct ContentView: View {
                 }
                 .padding(8)
             }
+        } content: {
+            // Work threads are the unit of work in a Silent Mesh channel,
+            // so they get a column rather than being buried in the stream.
+            // The channel's timeline is the first row, because a channel is
+            // still a place people talk.
+            List(selection: $model.selectedThread) {
+                Section {
+                    HStack(spacing: 6) {
+                        Image(systemName: "bubble.left.and.bubble.right")
+                            .foregroundStyle(.secondary)
+                        Text("Channel timeline")
+                        Spacer()
+                        Text("\(model.messages.count)")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                    .tag(Optional<String>.none)
+                }
+                Section("Work threads") {
+                    if model.threads.isEmpty {
+                        Text("No threads yet").font(.caption).foregroundStyle(.secondary)
+                    }
+                    ForEach(model.threads) { thread in
+                        ThreadRow(thread: thread).tag(Optional(thread.id))
+                    }
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .navigationSplitViewColumnWidth(min: 260, ideal: 320)
         } detail: {
             VStack(alignment: .leading, spacing: 0) {
                 if let selected = model.selectedChannel,
@@ -222,7 +251,11 @@ struct ContentView: View {
                     .padding(12)
                     Divider()
                 }
-                if model.messages.isEmpty {
+                if let selectedThread = model.selectedThread,
+                    let thread = model.threads.first(where: { $0.id == selectedThread })
+                {
+                    ThreadDetailView(thread: thread)
+                } else if model.messages.isEmpty {
                     ContentUnavailableView(
                         "No messages", systemImage: "text.bubble",
                         description: Text("Nothing in this channel yet."))
@@ -236,10 +269,12 @@ struct ContentView: View {
                 }
             }
         }
-        .frame(minWidth: 1120, minHeight: 700)
+        .frame(minWidth: 1180, minHeight: 720)
         .task(id: model.selectedChannel) {
             if let selected = model.selectedChannel {
+                model.selectedThread = nil
                 await model.loadMessages(channel: selected)
+                await model.loadThreads(channel: selected)
             }
         }
     }

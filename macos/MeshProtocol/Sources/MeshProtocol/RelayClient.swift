@@ -59,6 +59,37 @@ public actor MeshRelayClient {
     private let session: URLSession
     private var subscriptionCounter = 0
 
+    /// One exchange at a time.
+    ///
+    /// An actor protects its state, not a *sequence* of awaits: actors are
+    /// reentrant, so a second `query()` can begin while the first is
+    /// suspended waiting for a frame. Both then await `receive()` on one
+    /// WebSocket, and whichever await happens to be pending consumes the
+    /// next frame no matter whose subscription it belongs to — each loop
+    /// then discards what it does not recognise. The symptom is brutal to
+    /// diagnose: the relay serves everything correctly and the client
+    /// silently shows nothing.
+    ///
+    /// A demultiplexing reader (one task receiving, dispatching by
+    /// subscription id) is the real answer and is what live subscriptions
+    /// will need. Until then this makes request/response exchanges
+    /// strictly sequential, which is honest about what the client
+    /// currently supports.
+    private var exchangeInFlight = false
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+
+    private func beginExchange() async {
+        while exchangeInFlight {
+            await withCheckedContinuation { waiting.append($0) }
+        }
+        exchangeInFlight = true
+    }
+
+    private func endExchange() {
+        exchangeInFlight = false
+        if !waiting.isEmpty { waiting.removeFirst().resume() }
+    }
+
     /// Was this connection authenticated (NIP-42) since it opened?
     public private(set) var isAuthenticated = false
 
@@ -88,6 +119,8 @@ public actor MeshRelayClient {
     /// invisible — which is indistinguishable from an empty channel, so a
     /// client that skips this looks broken rather than unauthorized.
     public func authenticate(timeout: TimeInterval = 10) async throws {
+        await beginExchange()
+        defer { endExchange() }
         let challenge = try await waitForAuthChallenge(timeout: timeout)
         var event = MeshEvent(
             pubkey: keys.publicKeyHex,
@@ -123,6 +156,8 @@ public actor MeshRelayClient {
         guard event.isValid() else {
             throw MeshProtocolError.malformed("refusing to publish an event that fails its own verification")
         }
+        await beginExchange()
+        defer { endExchange() }
         try await send(["EVENT", eventObject(event)])
         let ok = try await waitFor(timeout: timeout) { message in
             guard message.count >= 3, message[0] as? String == "OK",
@@ -138,6 +173,8 @@ public actor MeshRelayClient {
 
     /// Run a one-shot query: REQ, collect until EOSE, CLOSE.
     public func query(_ filter: MeshFilter, timeout: TimeInterval = 30) async throws -> [MeshEvent] {
+        await beginExchange()
+        defer { endExchange() }
         subscriptionCounter += 1
         let sub = "mp-\(subscriptionCounter)"
         try await send(["REQ", sub, filter.jsonObject()])

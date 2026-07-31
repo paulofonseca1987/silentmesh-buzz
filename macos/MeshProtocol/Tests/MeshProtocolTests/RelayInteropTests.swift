@@ -72,6 +72,39 @@ struct RelayInteropTests {
         await client.disconnect()
     }
 
+    /// Diagnostic: what does the work-thread query actually return, and
+    /// does each event survive verification? A client that silently drops
+    /// unverifiable events (correctly) looks identical to a relay that
+    /// returned nothing — this separates the two.
+    @Test("work-thread events come back and fold into threads")
+    func workThreadFold() async throws {
+        let (client, _, channel) = try makeClient()
+        try await client.connect()
+        try await client.authenticate()
+
+        let kinds = [
+            MeshKind.workThreadOpen, MeshKind.workThreadMetadata, MeshKind.workThreadState,
+            MeshKind.workThreadCheckpoint, MeshKind.workThreadOverdue, MeshKind.workThreadCanon,
+            MeshKind.workThreadSiblingArchived, MeshKind.workThreadPromoted,
+            MeshKind.workThreadFork, MeshKind.workThreadPromote,
+            MeshKind.workThreadGateReviewed,
+        ]
+        let events = try await client.query(
+            MeshFilter(kinds: kinds, limit: 500, tags: ["#h": [channel]]))
+        let byKind = Dictionary(grouping: events, by: \.kind).mapValues(\.count)
+        print("INTEROP: verified events by kind: \(byKind.sorted { $0.key < $1.key })")
+
+        let threads = MeshFold.threads(from: events)
+        print("INTEROP: folded \(threads.count) thread(s)")
+        for thread in threads {
+            print("INTEROP:   \(thread.status.rawValue) — \(thread.goal) — \(thread.notices.count) notice(s)")
+        }
+        #expect(!events.isEmpty, "the relay returned no work-thread events at all")
+        #expect(!threads.isEmpty, "events came back but folded into no threads")
+
+        await client.disconnect()
+    }
+
     @Test("the relay's own tier stamp is readable from the channel metadata")
     func channelTierIsVisible() async throws {
         let (client, _, channel) = try makeClient()
@@ -86,6 +119,47 @@ struct RelayInteropTests {
         let tier = MeshChannelTier(rawValue: tierTag ?? "")
         #expect(tier != nil, "tier '\(tierTag ?? "")' is not one the client knows")
 
+        await client.disconnect()
+    }
+}
+
+/// Concurrency, against a live relay.
+///
+/// The app issues overlapping queries as a matter of course (a view's
+/// `.task` and the connect path both load), and that is exactly what a
+/// single-query test cannot see.
+@Suite("Interop concurrency", .enabled(if: ProcessInfo.processInfo.environment["MESH_RELAY_URL"] != nil))
+struct RelayConcurrencyTests {
+    @Test("two overlapping queries each get their own results")
+    func concurrentQueriesDoNotStealFrames() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let urlString = env["MESH_RELAY_URL"], let url = URL(string: urlString),
+            let keyHex = env["MESH_PRIVATE_KEY"], let channel = env["MESH_CHANNEL"]
+        else { throw MeshProtocolError.malformed("interop environment missing") }
+        let client = MeshRelayClient(url: url, keys: try MeshKeys(privateKeyHex: keyHex))
+        try await client.connect()
+        try await client.authenticate()
+
+        // Before serialization these raced on one socket: whichever await
+        // was pending consumed the next frame regardless of subscription,
+        // and the loser returned empty while the relay had served both.
+        async let messages = client.query(
+            MeshFilter(kinds: [MeshKind.chatMessage], limit: 100, tags: ["#h": [channel]]))
+        async let threads = client.query(
+            MeshFilter(
+                kinds: [MeshKind.workThreadOpen, MeshKind.workThreadGateReviewed],
+                limit: 100, tags: ["#h": [channel]]))
+        let (gotMessages, gotThreads) = try await (messages, threads)
+
+        #expect(!gotMessages.isEmpty, "the message query came back empty")
+        #expect(!gotThreads.isEmpty, "the work-thread query came back empty")
+        // Each result must contain only its own kinds — a stolen frame
+        // would show up as a message in the thread result or vice versa.
+        #expect(gotMessages.allSatisfy { $0.kind == MeshKind.chatMessage })
+        #expect(
+            gotThreads.allSatisfy {
+                $0.kind == MeshKind.workThreadOpen || $0.kind == MeshKind.workThreadGateReviewed
+            })
         await client.disconnect()
     }
 }

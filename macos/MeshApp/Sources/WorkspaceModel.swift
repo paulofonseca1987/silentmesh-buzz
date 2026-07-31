@@ -39,6 +39,8 @@ final class WorkspaceModel: ObservableObject {
     @Published private(set) var status: String = "starting"
     @Published private(set) var identity: String = ""
     @Published var selectedChannel: String?
+    @Published private(set) var threads: [MeshThread] = []
+    @Published var selectedThread: String?
 
     private var client: MeshRelayClient?
     private let relayURL: URL
@@ -102,7 +104,12 @@ final class WorkspaceModel: ObservableObject {
             status = "connected as \(identity)…"
             await loadChannels()
         } catch {
-            status = "connection failed: \(describe(error))"
+            // Also to stderr: the status line truncates, and a connection
+            // failure is exactly the case where the detail matters and the
+            // window may not be where anyone is looking.
+            let detail = describe(error)
+            FileHandle.standardError.write(Data("mesh: connect failed: \(detail)\n".utf8))
+            status = "connection failed: \(detail)"
         }
     }
 
@@ -126,7 +133,10 @@ final class WorkspaceModel: ObservableObject {
             channels = summaries.sorted { $0.name.localizedCompare($1.name) == .orderedAscending }
             status = "\(channels.count) channels"
             if selectedChannel == nil { selectedChannel = channels.first?.id }
-            if let selected = selectedChannel { await loadMessages(channel: selected) }
+            if let selected = selectedChannel {
+                await loadMessages(channel: selected)
+                await loadThreads(channel: selected)
+            }
         } catch {
             status = "channel load failed: \(describe(error))"
         }
@@ -141,6 +151,8 @@ final class WorkspaceModel: ObservableObject {
             ]
             let events = try await client.query(
                 MeshFilter(kinds: kinds, limit: 100, tags: ["#h": [channel]]))
+            FileHandle.standardError.write(
+                Data("mesh: messages query -> \(events.count) events\n".utf8))
             messages =
                 events
                 .map {
@@ -154,6 +166,40 @@ final class WorkspaceModel: ObservableObject {
                 .sorted { $0.createdAt < $1.createdAt }
         } catch {
             status = "message load failed: \(describe(error))"
+        }
+    }
+
+    /// Load every work-thread event in the channel and fold them.
+    ///
+    /// One query for the whole family, then `MeshFold` rebuilds the D41
+    /// projection locally. The relay is not asked what state a thread is
+    /// in — the signed events say, and the client can therefore show a
+    /// thread it has cached, and notice if a relay ever contradicts them.
+    func loadThreads(channel: String) async {
+        guard let client else { return }
+        let kinds = [
+            MeshKind.workThreadOpen, MeshKind.workThreadMetadata, MeshKind.workThreadState,
+            MeshKind.workThreadCheckpoint, MeshKind.workThreadOverdue, MeshKind.workThreadCanon,
+            MeshKind.workThreadSiblingArchived, MeshKind.workThreadPromoted,
+            MeshKind.workThreadFork, MeshKind.workThreadPromote,
+            MeshKind.workThreadGateReviewed,
+        ]
+        do {
+            let events = try await client.query(
+                MeshFilter(kinds: kinds, limit: 500, tags: ["#h": [channel]]))
+            threads = MeshFold.threads(from: events).sorted { $0.createdAt > $1.createdAt }
+            FileHandle.standardError.write(
+                Data("mesh: threads query -> \(events.count) events, \(threads.count) threads\n".utf8))
+            if let selected = selectedThread, !threads.contains(where: { $0.id == selected }) {
+                selectedThread = nil
+            }
+        } catch {
+            // Cancellation is not a failure worth shouting about: SwiftUI
+            // cancels a `.task` whenever its id changes, which happens on
+            // every channel switch.
+            let detail = describe(error)
+            FileHandle.standardError.write(Data("mesh: threads query failed: \(detail)\n".utf8))
+            if !(error is CancellationError) { status = "thread load failed: \(detail)" }
         }
     }
 

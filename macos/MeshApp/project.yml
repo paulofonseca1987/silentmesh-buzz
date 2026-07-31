@@ -35,6 +35,17 @@ targets:
         # No sandbox yet: the vault slice adds the entitlements this app
         # will need, and turning the sandbox on before then would only
         # produce failures unrelated to what is being built.
+        #
+        # App Transport Security refuses cleartext connections before a
+        # socket is ever opened — the relay sees nothing at all, and the
+        # client reports an NSURLError that looks like the network is
+        # down. A Silent Mesh relay is reached over `ws://` on a tailnet,
+        # where WireGuard already provides the transport encryption ATS
+        # is asking for, so the exception is accurate rather than lazy.
+        # A relay published beyond a tailnet must use `wss://`, and this
+        # exception should be removed when that is the norm.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: net.silentmesh.MeshApp
