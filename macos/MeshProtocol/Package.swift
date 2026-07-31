@@ -11,7 +11,8 @@ let package = Package(
     name: "MeshProtocol",
     platforms: [.macOS(.v14)],
     products: [
-        .library(name: "MeshProtocol", targets: ["MeshProtocol"])
+        .library(name: "MeshProtocol", targets: ["MeshProtocol"]),
+        .library(name: "MeshVault", targets: ["MeshVault"]),
     ],
     dependencies: [
         // Nostr events are BIP-340 Schnorr over secp256k1. CryptoKit has no
@@ -23,6 +24,11 @@ let package = Package(
             name: "MeshProtocol",
             dependencies: [.product(name: "P256K", package: "swift-secp256k1")]
         ),
+        // Split from MeshProtocol because it pulls in Security and
+        // LocalAuthentication and only works in a signed process — the
+        // protocol layer must stay usable in plain `swift test`.
+        .target(name: "MeshVault", dependencies: ["MeshProtocol"]),
         .testTarget(name: "MeshProtocolTests", dependencies: ["MeshProtocol"]),
+        .testTarget(name: "MeshVaultTests", dependencies: ["MeshVault", "MeshProtocol"]),
     ]
 )

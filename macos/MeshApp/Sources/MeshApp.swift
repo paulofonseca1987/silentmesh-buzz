@@ -5,11 +5,22 @@ import SwiftUI
 struct MeshApp: App {
     @StateObject private var model = WorkspaceModel() ?? WorkspaceModel.unconfigured
 
+    init() {
+        // The enclave self-test runs before any window exists: it is a
+        // hardware check, not a feature of the UI, and mixing it into the
+        // app's normal startup would make its result depend on whether a
+        // view happened to appear.
+        if let mode = VaultSelfTest.mode() {
+            exit(VaultSelfTest.run(mode: mode))
+        }
+    }
+
     var body: some Scene {
         WindowGroup("Silent Mesh") {
             Group {
                 if model.isConfigured {
                     ContentView(model: model)
+                        .background(WindowIDReporter())
                         .task {
                             // The snapshot races the load rather than
                             // following it: a capture that only happens on
@@ -112,4 +123,28 @@ struct SnapshotRequest {
         }
         NSApplication.shared.terminate(nil)
     }
+}
+
+
+/// Reports the app's window id on stderr so a screenshot can be scoped to
+/// this window alone (`screencapture -l<id>`).
+///
+/// Capturing the whole display would put whatever else is on screen —
+/// other apps, personal tabs, notifications — into an image that travels
+/// off the machine. For a workspace whose entire premise is controlling
+/// where content goes, a screenshot tool that hoovers up the desktop is
+/// the wrong default; window-scoped capture is both safer and clearer.
+struct WindowIDReporter: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        DispatchQueue.main.async {
+            guard let number = view.window?.windowNumber else { return }
+            view.window?.makeKeyAndOrderFront(nil)
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            FileHandle.standardError.write(Data("window: \(number)\n".utf8))
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }

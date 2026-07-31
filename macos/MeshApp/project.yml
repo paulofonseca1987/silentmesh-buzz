@@ -23,6 +23,8 @@ targets:
     dependencies:
       - package: MeshProtocol
         product: MeshProtocol
+      - package: MeshProtocol
+        product: MeshVault
     info:
       path: Sources/Info.plist
       properties:
