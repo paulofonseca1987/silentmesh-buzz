@@ -29,7 +29,7 @@ codebases, D33 re-decided the foundation. **All D1–D32 product semantics survi
 | D8 | Agent execution | Server-side only *(inherited — buzz-acp spawns agents as server-side child processes)* |
 | D9 | File sync | Git-native: clients sync channel repos through ACL-enforcing git endpoints; offline edits are local commits *(transport inherited; client sync new)* |
 | D10 | Clients | Native Swift/SwiftUI macOS app first, native iOS later; server is headless for us — inherited Buzz clients are **not shipped** (D36) |
-| D11 | Remote access | VPN only (LAN / Tailscale / WireGuard / SSH); no third-party relay services. *The public wiki (D43) lives on a separate internet-facing host holding only already-published content — the workspace server stays dark* |
+| D11 | Remote access | VPN only (LAN / Tailscale / WireGuard / SSH); no third-party relay services. *The public wiki (D43) lives on a separate internet-facing host holding only already-published content — the workspace server stays dark.* **Settled 2026-07-31: relays are never exposed beyond the tailnet — see §10.1** |
 | D12 | Server platform | Linux |
 | D13 | Client security | Files encrypted at rest on the client, accessible only inside the app; app lock via Face ID / Touch ID / PIN |
 | D14 | Offline | Synced files remain editable offline; local on-device models handle summarize, translate, and voice-to-text |
@@ -346,6 +346,42 @@ Privacy Gate (D30), Content Seals + deep seal (D31/D32), the encrypted
 biometric-gated client vault (D13), and VPN-only reachability (D11). The two
 controlled egresses (member vendor subscriptions; the attested TEE provider) and
 the `owned-only` zero-egress guarantee are exactly as decided.
+
+### 10.1 The tailnet is the perimeter (D11, settled 2026-07-31)
+
+Relays will not be published beyond the Tailscale network — not behind a
+reverse proxy, not on a public hostname, not "temporarily". Several
+things that would otherwise be provisional follow from that, and it is
+worth writing them down so they are not re-litigated as workarounds:
+
+- **`ws://` is the relay protocol, not a placeholder.** WireGuard already
+  provides the transport encryption and peer authentication TLS would add,
+  so the client's App Transport Security exception
+  (`NSAllowsArbitraryLoads`, `macos/MeshApp/project.yml`) is a correct
+  description of the deployment rather than a shortcut to remove later.
+  The same holds for the git smart-HTTP forge and the HTTP bridge.
+- **No public DNS, no ACME, no edge terminator.** The relay binds its
+  tailnet address (`BUZZ_BIND_ADDR=100.x.y.z:port`), which is the
+  deployment invariant, not a testbed convenience. Binding `0.0.0.0`
+  should be treated as a misconfiguration.
+- **`Backend::Local`'s host rule is exactly the perimeter.** The gateway
+  admits loopback and the tailnet and refuses everything else — so a
+  local model served from another owner-enrolled machine is in scope,
+  and a "local" endpoint anywhere else is a bug caught at startup.
+
+What this does **not** remove:
+
+- **Device authentication is not identity authentication.** Tailscale
+  proves a *device* is enrolled; NIP-42 proves *who* is speaking. A
+  compromised or shared tailnet device is inside the network perimeter,
+  so relay-side authority (roles, channel membership, the D41 machine)
+  stays load-bearing.
+- **The privacy tiers still matter.** The perimeter governs who can reach
+  the relay; the tiers govern where content may go once it is inside.
+  An `open`-tier channel still egresses to a vendor from within the
+  tailnet.
+- **The public wiki (D43) remains the one deliberate exception**, on a
+  separate host, carrying only already-published content.
 
 ## 11. Model plane: tiers, gateway, copilot, native harness
 
