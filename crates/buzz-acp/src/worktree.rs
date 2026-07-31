@@ -564,16 +564,50 @@ pub fn is_work_thread_root_kind(kind: u64) -> bool {
 /// `["buzz-channel", "<uuid>"]` tag binding it to the channel — the same
 /// shape the pre-receive policy reads. Pure over the parsed JSON so it is
 /// testable without a relay.
+///
+/// # Why the author must be checked
+///
+/// `expected_owner_hex` is the **known relay owner** pubkey, and an
+/// announcement signed by anyone else is ignored. Without that check this
+/// resolves to the first announcement carrying a matching `buzz-channel`
+/// tag *whoever signed it*, and returns that author as the repo owner — so
+/// the caller clones from, and pushes to, `<forge>/<author>/<d>`.
+///
+/// Publishing a kind:30617 only needs `Scope::ReposWrite`, which the relay
+/// grants to ordinary members; it does not restrict this kind to itself.
+/// So any member could publish an announcement naming someone else's
+/// channel and silently redirect that channel's agent worktrees into a repo
+/// they own — turning private-channel agent work into a push to an
+/// attacker-controlled remote. Every legitimate announcement on a live
+/// relay is relay-signed, so requiring it costs nothing and closes that.
+///
+/// Fail-closed: an empty or malformed `expected_owner_hex` matches nothing.
 pub fn repo_binding_from_events(
     events: &[serde_json::Value],
     channel_id: Uuid,
+    expected_owner_hex: &str,
 ) -> Option<(String, String)> {
+    if expected_owner_hex.is_empty() {
+        return None;
+    }
     let want = channel_id.to_string();
     for ev in events {
         if ev.get("kind").and_then(|v| v.as_u64()) != Some(30617) {
             continue;
         }
-        let tags = ev.get("tags").and_then(|v| v.as_array())?;
+        // Author first: a mismatched signer is skipped rather than
+        // returning `None`, so one forged announcement cannot hide the
+        // genuine one behind it.
+        if !ev
+            .get("pubkey")
+            .and_then(|v| v.as_str())
+            .is_some_and(|a| a.eq_ignore_ascii_case(expected_owner_hex))
+        {
+            continue;
+        }
+        let Some(tags) = ev.get("tags").and_then(|v| v.as_array()) else {
+            continue;
+        };
         let tag_val = |name: &str| -> Option<String> {
             tags.iter().find_map(|t| {
                 let t = t.as_array()?;
@@ -583,9 +617,11 @@ pub fn repo_binding_from_events(
         if tag_val("buzz-channel").as_deref() != Some(want.as_str()) {
             continue;
         }
-        let owner = ev.get("pubkey").and_then(|v| v.as_str())?.to_owned();
-        let name = tag_val("d")?;
-        return Some((owner, name));
+        // `continue`, not `?`: bailing out of the whole scan on one
+        // announcement that lacks a `d` tag would let a malformed event
+        // suppress a valid one later in the set.
+        let Some(name) = tag_val("d") else { continue };
+        return Some((expected_owner_hex.to_owned(), name));
     }
     None
 }
@@ -678,14 +714,88 @@ mod tests {
         ]);
         let evs = events.as_array().unwrap();
         assert_eq!(
-            repo_binding_from_events(evs, channel),
+            repo_binding_from_events(evs, channel, "relayowner"),
             Some(("relayowner".into(), "chan-repo".into()))
         );
-        assert_eq!(repo_binding_from_events(evs, Uuid::from_u128(123)), None);
+        assert_eq!(
+            repo_binding_from_events(evs, Uuid::from_u128(123), "relayowner"),
+            None
+        );
         assert_eq!(event_kind_by_id(evs, "aa"), Some(47000));
         assert_eq!(event_kind_by_id(evs, "zz"), None);
         assert!(is_work_thread_root_kind(47000) && is_work_thread_root_kind(47020));
         assert!(!is_work_thread_root_kind(9) && !is_work_thread_root_kind(47001));
+    }
+
+    /// The redirection this resolver exists to refuse.
+    ///
+    /// Publishing a kind:30617 needs only `Scope::ReposWrite`, which the
+    /// relay grants to ordinary members — it does not reserve this kind for
+    /// itself. So a member can announce a repo they own, tagged with someone
+    /// else's channel. Resolving that would clone from and push to
+    /// `<forge>/<attacker>/<their-repo>`, sending a private channel's agent
+    /// work to a remote they control.
+    #[test]
+    fn a_forged_announcement_cannot_redirect_a_channels_repo() {
+        let channel = Uuid::from_u128(7);
+        let relay_owner = "6e32e3a8".repeat(8);
+        let attacker = "deadbeef".repeat(8);
+        let events = serde_json::json!([
+            // The attacker's announcement is FIRST, so a resolver that took
+            // the first match would take this one.
+            { "id": "evil", "kind": 30617, "pubkey": attacker, "tags": [
+                ["d", "exfil"], ["buzz-channel", channel.to_string()]
+            ]},
+            { "id": "good", "kind": 30617, "pubkey": relay_owner, "tags": [
+                ["d", "chan-repo"], ["buzz-channel", channel.to_string()]
+            ]},
+        ]);
+        let evs = events.as_array().unwrap();
+
+        // The genuine announcement is still found — the forged one is
+        // skipped, not treated as a reason to give up.
+        assert_eq!(
+            repo_binding_from_events(evs, channel, &relay_owner),
+            Some((relay_owner.clone(), "chan-repo".into()))
+        );
+
+        // And with only the forged announcement present, there is no binding
+        // at all rather than a poisoned one.
+        let evil_only = serde_json::json!([
+            { "id": "evil", "kind": 30617, "pubkey": attacker, "tags": [
+                ["d", "exfil"], ["buzz-channel", channel.to_string()]
+            ]},
+        ]);
+        assert_eq!(
+            repo_binding_from_events(evil_only.as_array().unwrap(), channel, &relay_owner),
+            None
+        );
+
+        // Fail closed when the caller has no relay owner to compare against:
+        // an unknown owner must not mean "trust anybody".
+        assert_eq!(repo_binding_from_events(evs, channel, ""), None);
+    }
+
+    /// A malformed announcement must not hide a valid one behind it.
+    #[test]
+    fn a_malformed_announcement_does_not_suppress_a_later_valid_one() {
+        let channel = Uuid::from_u128(7);
+        let relay_owner = "ab".repeat(32);
+        let events = serde_json::json!([
+            // Right author, right channel, but no `d` tag — and tags absent
+            // entirely on the one before it.
+            { "id": "no-tags", "kind": 30617, "pubkey": relay_owner },
+            { "id": "no-d", "kind": 30617, "pubkey": relay_owner, "tags": [
+                ["buzz-channel", channel.to_string()]
+            ]},
+            { "id": "good", "kind": 30617, "pubkey": relay_owner, "tags": [
+                ["d", "chan-repo"], ["buzz-channel", channel.to_string()]
+            ]},
+        ]);
+        assert_eq!(
+            repo_binding_from_events(events.as_array().unwrap(), channel, &relay_owner),
+            Some((relay_owner, "chan-repo".into()))
+        );
     }
 
     #[test]
