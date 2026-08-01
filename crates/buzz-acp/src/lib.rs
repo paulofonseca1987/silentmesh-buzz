@@ -1388,6 +1388,23 @@ async fn tokio_main() -> Result<()> {
         ),
     }
 
+    // The other precondition, reported next to it: worktree provisioning
+    // clones over NIP-98, which needs git 2.46+. Stated at boot because the
+    // failure is otherwise invisible — worktree ops are best-effort, so an
+    // old git yields no worktrees, no checkpoints, and no error anyone sees.
+    match worktree::probe_git_forge_auth().await {
+        Some(true) => {}
+        Some(false) => tracing::warn!(
+            "git on PATH is older than 2.46 — it cannot authenticate to the \
+             relay forge (the credential helper needs the `authtype` \
+             capability), so work-thread worktrees will not provision"
+        ),
+        None => tracing::warn!(
+            "could not determine the git version on PATH — work-thread \
+             worktree provisioning may fail"
+        ),
+    }
+
     let presence_publisher = relay.event_publisher();
     let presence_keys = config.keys.clone();
 

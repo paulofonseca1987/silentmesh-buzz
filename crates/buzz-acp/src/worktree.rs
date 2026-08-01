@@ -559,6 +559,57 @@ pub fn log_soft_failure(context: &str, err: &str) {
     warn!(target: "worktree", "{context}: {err} (turn unaffected)");
 }
 
+/// The minimum git that can authenticate to the relay forge.
+///
+/// `git-credential-nostr` answers only when git advertises
+/// `capability[]=authtype` in the credential protocol, which git added in
+/// **2.46**. Older git never advertises it, the helper prints an empty
+/// response and exits 0, and git falls through to prompting for a username —
+/// which, with `GIT_TERMINAL_PROMPT=0`, is the terminal error
+/// "could not read Username". See `crates/git-credential-nostr/README.md`.
+const GIT_MIN_AUTHTYPE: (u32, u32) = (2, 46);
+
+/// Whether `git --version` output describes a git that can do NIP-98 auth.
+///
+/// `None` means the version could not be parsed — reported as unknown rather
+/// than guessed either way, since both a false "supported" (a doomed clone)
+/// and a false "unsupported" (refusing a working setup) are worse than
+/// saying so.
+///
+/// This exists because the failure it detects is **invisible**. Every
+/// worktree operation is best-effort by design: a clone that cannot
+/// authenticate is logged and skipped, the turn proceeds normally, and the
+/// only symptom is that checkpoints never appear. On a host with old git
+/// that looks exactly like "the feature isn't wired yet" — which is the
+/// wrong conclusion, and an expensive one to reach twice.
+pub fn git_supports_forge_auth(version_output: &str) -> Option<bool> {
+    // "git version 2.43.0" / "git version 2.46.1.windows.1"
+    let rest = version_output.split_whitespace().nth(2)?;
+    let mut parts = rest.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor) >= GIT_MIN_AUTHTYPE)
+}
+
+/// Ask the `git` on PATH whether it can authenticate to the relay forge.
+///
+/// Returns `None` when git is absent or its version is unparseable.
+pub async fn probe_git_forge_auth() -> Option<bool> {
+    let out = Command::new("git")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    git_supports_forge_auth(&String::from_utf8_lossy(&out.stdout))
+}
+
 /// Is `kind` a work-thread root (kind:47000 open or kind:47020 fork)? Only
 /// these anchor a worktree; an ordinary NIP-10 root (a kind:9 message) does
 /// not.
@@ -784,6 +835,33 @@ mod tests {
         assert_eq!(event_kind_by_id(evs, "zz"), None);
         assert!(is_work_thread_root_kind(47000) && is_work_thread_root_kind(47020));
         assert!(!is_work_thread_root_kind(9) && !is_work_thread_root_kind(47001));
+    }
+
+    /// The boundary is exact and load-bearing: 2.45 cannot authenticate to
+    /// the forge and 2.46 can, so an off-by-one here silently disables (or
+    /// silently promises) the whole feature.
+    #[test]
+    fn git_forge_auth_support_is_detected_at_the_2_46_boundary() {
+        for (v, want) in [
+            ("git version 2.39.5", false),
+            ("git version 2.43.0", false),
+            ("git version 2.45.9", false),
+            ("git version 2.46.0", true),
+            ("git version 2.47.1", true),
+            ("git version 3.0.0", true),
+            ("git version 2.46.1.windows.1", true),
+        ] {
+            assert_eq!(git_supports_forge_auth(v), Some(want), "{v}");
+        }
+    }
+
+    /// Unknown must stay unknown. Guessing "supported" schedules a doomed
+    /// clone; guessing "unsupported" refuses a host that would have worked.
+    #[test]
+    fn an_unparseable_git_version_is_unknown_not_assumed() {
+        for v in ["", "git", "git version", "git version x.y", "nonsense"] {
+            assert_eq!(git_supports_forge_auth(v), None, "{v:?}");
+        }
     }
 
     // ── worktree_target_for_turn: the admission rule ────────────────────
