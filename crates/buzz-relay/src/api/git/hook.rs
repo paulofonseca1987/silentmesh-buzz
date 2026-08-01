@@ -45,6 +45,22 @@ set -eo pipefail
 # Rust uses byte-order comparison and byte lengths — locale-aware sort/strlen would mismatch.
 export LC_ALL=C
 
+# Put the system utilities first. This hook shells out to wc, sort, sed,
+# openssl, curl and mktemp, and it inherits the relay's PATH — so whatever
+# was on the operator's PATH when the relay started decides which of those
+# it gets. That is not hypothetical: a globally-installed npm package named
+# `wc-cli` shadows /usr/bin/wc on this project's own dev host, and its `wc`
+# rejects `-l`, so the hook exits non-zero and **every push is refused**
+# with `remote: error: unknown option '-l'` — a message that points at the
+# option rather than at the PATH, which is what makes it expensive.
+#
+# Fail-closed is right for policy, but not for this: a shadowed coreutil is
+# an environment accident, not a policy decision. The hook already
+# neutralizes locale and git config for the same reason; PATH is the same
+# class of ambient input. The inherited PATH is kept as a suffix so an
+# operator can still supply something genuinely missing.
+export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+
 ZERO="0000000000000000000000000000000000000000"
 
 # Fail-closed: required env vars must be set by the relay.
