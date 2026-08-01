@@ -1050,8 +1050,16 @@ pub async fn receive_pack(
         state.config.bind_addr.port()
     );
     let hooks_dir = repo.path().join("hooks").display().to_string();
+    // Hand the hook the Unix socket when the relay has one. Without it, a
+    // relay bound to a specific non-loopback address (the VPN-bound posture
+    // D11 mandates) is not listening on `BUZZ_HOOK_URL`'s loopback at all,
+    // so the callback is connection-refused and every push is rejected with
+    // "network error reaching policy service" — a message that reads like a
+    // transient outage rather than a permanent misconfiguration.
+    let hook_uds = state.config.uds_path.clone().unwrap_or_default();
     let hook_env = vec![
         ("BUZZ_HOOK_URL", hook_url),
+        ("BUZZ_HOOK_UDS", hook_uds),
         (
             "BUZZ_HOOK_SECRET",
             state.config.git_hook_hmac_secret.clone(),

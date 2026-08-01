@@ -36,18 +36,42 @@ pub mod transport;
 
 pub use transport::git_router;
 
-/// Middleware that rejects requests from non-loopback addresses.
+/// Marker inserted by the UDS server so [`require_localhost`] can recognize a
+/// request that arrived over the Unix socket.
 ///
-/// Defense-in-depth: the internal policy endpoint should only be reachable
-/// from localhost (the pre-receive hook runs on the same host as the relay).
+/// It must be a *positive* signal rather than inferred from a missing
+/// `ConnectInfo`: absence is also what a misconfigured TCP listener looks
+/// like, and treating "I don't know where this came from" as "local" is the
+/// one interpretation that fails open.
+#[derive(Clone, Copy, Debug)]
+pub struct LocalTransport;
+
+/// Middleware that rejects requests that did not come from this host.
+///
+/// Defense-in-depth on top of the body HMAC: the internal policy endpoint is
+/// only ever called by the pre-receive hook, which the relay spawns on its
+/// own machine.
+///
+/// Two things count as this host:
+///
+/// - a **loopback peer** over TCP, and
+/// - a request carrying [`LocalTransport`], which only the **Unix socket**
+///   server attaches.
+///
+/// The socket case is not a relaxation — a Unix socket cannot be connected to
+/// from another machine at all, so it is a stronger locality proof than a
+/// loopback IP. It is required because a relay bound to one specific
+/// non-loopback address is not listening on loopback, so the hook has no
+/// loopback endpoint to call and every push would be refused here.
 async fn require_localhost(req: Request<Body>, next: Next) -> Response {
+    let over_uds = req.extensions().get::<LocalTransport>().is_some();
     let is_loopback = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip().is_loopback())
         .unwrap_or(false);
 
-    if !is_loopback {
+    if !over_uds && !is_loopback {
         return (StatusCode::FORBIDDEN, "internal endpoint: localhost only").into_response();
     }
 

@@ -21,6 +21,13 @@ use tracing::{error, info};
 ///
 /// Environment variables set by the relay before spawning git receive-pack:
 /// - `BUZZ_HOOK_URL` — internal policy endpoint (http://127.0.0.1:{port}/internal/git/policy)
+/// - `BUZZ_HOOK_UDS` — optional Unix socket to reach that endpoint over
+///   instead of TCP. Set whenever the relay has one, and **required** in
+///   practice when the relay binds a specific non-loopback address: it is
+///   then not listening on loopback at all, so `BUZZ_HOOK_URL` is refused
+///   and every push fails. A Unix socket is same-host by construction, so
+///   it needs no address reasoning and satisfies the internal endpoint's
+///   locality requirement directly.
 /// - `BUZZ_HOOK_SECRET` — per-push HMAC secret
 /// - `BUZZ_REPO_ID` — repo identifier (d-tag)
 /// - `BUZZ_COMMUNITY_ID` — server-resolved community UUID for the git HTTP request
@@ -185,13 +192,24 @@ fi
 SAFE_REPO_ID=$(printf '%s' "$BUZZ_REPO_ID" | sed 's/\\/\\\\/g; s/"/\\"/g')
 BODY="{\"repo_id\":\"${SAFE_REPO_ID}\",\"repo_owner\":\"${BUZZ_REPO_OWNER}\",\"community_id\":\"${BUZZ_COMMUNITY_ID}\",\"pusher_pubkey\":\"${BUZZ_PUSHER_PUBKEY}\",\"ref_updates\":[${REFS}],\"changed_paths\":[${PATHS_JSON}],\"timestamp\":${TIMESTAMP},\"signature\":\"${SIGNATURE}\"}"
 
+# Prefer the Unix socket when the relay provides one. A relay bound to a
+# specific address (Silent Mesh's VPN-bound posture) is NOT listening on
+# loopback, so the TCP URL is connection-refused and every push fails; the
+# socket is same-host by construction and always reachable from the hook,
+# which the relay spawned on its own machine.
+if [ -n "${BUZZ_HOOK_UDS:-}" ]; then
+    set -- --unix-socket "$BUZZ_HOOK_UDS" "http://localhost/internal/git/policy"
+else
+    set -- "$BUZZ_HOOK_URL"
+fi
+
 HTTP_CODE=$(curl --silent --max-time 10 \
     -o "$RESP_FILE" \
     -w "%{http_code}" \
     -X POST \
     -H "Content-Type: application/json" \
     -d "$BODY" \
-    "$BUZZ_HOOK_URL" 2>/dev/null) || {
+    "$@" 2>/dev/null) || {
     echo "error: push authorization failed (network error reaching policy service)" >&2
     exit 1
 }

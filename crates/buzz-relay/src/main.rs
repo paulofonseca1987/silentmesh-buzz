@@ -1213,6 +1213,25 @@ async fn serve(
         std::process::exit(1);
     });
 
+    // A relay bound to one specific non-loopback address is not listening on
+    // loopback, so the pre-receive hook's TCP callback to
+    // `http://127.0.0.1:<port>/internal/git/policy` is connection-refused and
+    // **every git push is rejected**. The Unix socket is the supported way
+    // out (the hook prefers it whenever `BUZZ_UDS_PATH` is set). Warn rather
+    // than refuse to start: pushes are one feature among many, and a relay
+    // that serves everything else is better than one that will not boot.
+    if !config.bind_addr.ip().is_loopback()
+        && !config.bind_addr.ip().is_unspecified()
+        && config.uds_path.is_none()
+    {
+        warn!(
+            bind_addr = %config.bind_addr,
+            "relay is bound to a specific non-loopback address with no BUZZ_UDS_PATH — \
+             the git pre-receive hook cannot reach the internal policy endpoint, so \
+             every push will be rejected; set BUZZ_UDS_PATH to enable pushes"
+        );
+    }
+
     let tcp_listener = tokio::net::TcpListener::bind(&config.bind_addr)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to bind {}: {e}", config.bind_addr))?;
@@ -1236,7 +1255,14 @@ async fn serve(
             .map_err(|e| anyhow::anyhow!("Failed to bind UDS {uds_path}: {e}"))?;
         info!(path = %uds_path, "buzz-relay UDS listening");
 
-        let router_uds = router.clone();
+        // Mark every UDS request as same-host. A Unix socket cannot be
+        // connected to from another machine, so this is a stronger locality
+        // proof than a loopback IP — and it is what lets the pre-receive
+        // hook reach the internal policy endpoint on a relay bound to a
+        // specific non-loopback address, which is not listening on loopback.
+        let router_uds = router
+            .clone()
+            .layer(axum::Extension(buzz_relay::api::git::LocalTransport));
         let mut uds_rx = shutdown_tx.subscribe();
         let uds_handle = tokio::spawn(async move {
             axum::serve(uds_listener, router_uds.into_make_service())
