@@ -989,6 +989,81 @@ async fn resolve_new_session_channel_context(
     (is_dm, title_channel)
 }
 
+/// Commit what the agent changed this turn, push it, and record it as a
+/// kind:47010 checkpoint — the per-turn trail `buzz threads checkpoint`
+/// otherwise produces by hand.
+///
+/// Every failure is silent to the turn, which has already finished and
+/// already answered. The ordering that matters is that the event is
+/// published **only after** the push succeeds: a checkpoint names a commit
+/// that others are expected to fetch, so publishing one for a commit that
+/// exists solely in the harness's worktree would advertise an object nobody
+/// else can resolve. `ThreadWorktrees::checkpoint` returns `Err` on a failed
+/// push precisely so this stays a caller-side impossibility rather than a
+/// caller-side responsibility.
+///
+/// A clean worktree emits nothing. Most turns answer a question without
+/// touching a file, and a checkpoint per turn regardless would bury the
+/// commits that mean something under ones that mean nothing.
+async fn checkpoint_turn_worktree(
+    ctx: &PromptContext,
+    channel_id: Uuid,
+    thread_root_hex: &str,
+    binding: &crate::worktree::WorktreeBinding,
+) {
+    use crate::worktree::CheckpointOutcome;
+
+    let Some(worktrees) = ctx.thread_worktrees.as_ref() else {
+        return;
+    };
+    let (commit, branch) = match worktrees.checkpoint(binding).await {
+        Ok(CheckpointOutcome::Committed { commit, branch }) => (commit, branch),
+        Ok(CheckpointOutcome::NothingToCommit) => {
+            tracing::debug!(
+                target: "worktree",
+                branch = %binding.branch,
+                "turn changed nothing — no checkpoint"
+            );
+            return;
+        }
+        Err(e) => {
+            crate::worktree::log_soft_failure("worktree: checkpoint", &e);
+            return;
+        }
+    };
+
+    let builder = match buzz_sdk::build_thread_checkpoint(
+        channel_id,
+        thread_root_hex,
+        &commit,
+        Some(&branch),
+        None,
+        "",
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            crate::worktree::log_soft_failure("worktree: build 47010", &e.to_string());
+            return;
+        }
+    };
+    let event = match builder.sign_with_keys(&ctx.agent_keys) {
+        Ok(e) => e,
+        Err(e) => {
+            crate::worktree::log_soft_failure("worktree: sign 47010", &e.to_string());
+            return;
+        }
+    };
+    match ctx.rest_client.submit_event(&event).await {
+        Ok(_) => tracing::info!(
+            target: "worktree",
+            commit = %commit,
+            branch = %branch,
+            "checkpoint recorded"
+        ),
+        Err(e) => crate::worktree::log_soft_failure("worktree: publish 47010", &e.to_string()),
+    }
+}
+
 /// The session key a turn runs on.
 ///
 /// A turn bound to a work-thread worktree needs its **own** ACP session,
@@ -2605,6 +2680,22 @@ pub async fn run_prompt_task(
                 turn_attribution.as_ref(),
             )
             .await;
+
+            // Commit and push what the agent changed, and record it as a
+            // kind:47010 checkpoint. Only on the completion path: a turn that
+            // was cancelled or failed leaves its edits in the worktree, which
+            // persists, so the next turn's checkpoint picks them up. Nothing
+            // is lost by not committing here, and a checkpoint naming a
+            // half-finished turn would be worse than none.
+            if let (Some(binding), Some(cid), Some(root)) = (
+                turn_worktree.as_ref(),
+                observer_channel_id,
+                turn_attribution
+                    .as_ref()
+                    .and_then(|a| a.thread_root_id.as_deref()),
+            ) {
+                checkpoint_turn_worktree(&ctx, cid, root, binding).await;
+            }
 
             // Text-fallback: a channel turn that ended cleanly (EndTurn only
             // — MaxTokens/MaxTurnRequests/Refusal buffers hold truncated or
