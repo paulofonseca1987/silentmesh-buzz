@@ -1755,9 +1755,21 @@ pub async fn run_prompt_task(
         PromptSource::Heartbeat => None,
     };
 
+    // The one session identity for this turn.
+    //
+    // Hoisted to a single value because three separate places need it — the
+    // lookup below, the post-turn turn counter, and rotation — and they must
+    // agree. Deriving it independently at each site is how the reviewed
+    // prototype desynced: it would look a session up under one key and then
+    // increment or invalidate another, so a counter never advanced and
+    // rotation dropped the wrong session. Today every derivation yields the
+    // same key, so this is a pure hoist; it exists so the work-thread case
+    // is a change in one place rather than three.
+    let turn_key = SessionKey::from(&source);
+
     let (session_id, is_new_session) = match &source {
         PromptSource::Channel(cid) => {
-            if let Some(entry) = agent.state.sessions.get(&SessionKey::Channel(*cid)) {
+            if let Some(entry) = agent.state.sessions.get(&turn_key) {
                 (entry.id.clone(), false)
             } else {
                 // The title is channel-qualified (`Agent · #channel`) so one
@@ -2377,8 +2389,11 @@ pub async fn run_prompt_task(
                     // a counter belonging to a session that is already gone.
                     // A missing entry means the session was invalidated
                     // mid-turn — there is nothing left to rotate.
-                    let key = SessionKey::from(&source);
-                    match agent.state.sessions.get_mut(&key) {
+                    //
+                    // `turn_key`, not a fresh derivation: this must be the
+                    // same session the turn actually ran on, or the counter
+                    // advances on one session while another does the work.
+                    match agent.state.sessions.get_mut(&turn_key) {
                         Some(entry) => {
                             entry.turns += 1;
                             entry.turns >= limit
