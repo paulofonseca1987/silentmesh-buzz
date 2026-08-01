@@ -645,6 +645,15 @@ pub struct PromptContext {
     /// (`include_str!`) is inherently `'static`.
     pub base_prompt: Option<&'static str>,
     pub cwd: String,
+    /// Work-thread worktree engine, when configured and the relay identity
+    /// is known. `None` disables worktree binding entirely.
+    pub thread_worktrees: Option<std::sync::Arc<crate::worktree::ThreadWorktrees>>,
+    /// Per-channel repo bindings, resolved once. Behind a mutex because the
+    /// context is `Arc`-shared across concurrent turns on different channels.
+    pub repo_bindings: std::sync::Arc<tokio::sync::Mutex<crate::worktree::RepoBindingCache>>,
+    /// The relay's own signing pubkey — the only author whose kind:30617
+    /// repo binding may be trusted.
+    pub relay_self_pubkey: Option<String>,
     /// REST client for pre-prompt context fetches (thread/DM history).
     pub rest_client: RestClient,
     /// Shared channel metadata for startup-known and dynamically joined channels.
@@ -983,6 +992,127 @@ async fn resolve_new_session_channel_context(
     (is_dm, title_channel)
 }
 
+/// The session key a turn runs on.
+///
+/// A turn bound to a work-thread worktree needs its **own** ACP session,
+/// because a session's cwd is fixed at `session/new` and a different cwd is
+/// the entire point. Everything else keeps the key it has always had.
+///
+/// `bound` is deliberately the deciding input rather than "is there a thread
+/// root": a thread turn whose worktree could not be provisioned runs in the
+/// harness cwd, and must therefore share the channel session rather than
+/// claim a private one whose cwd would be wrong. Key and cwd are then always
+/// decided by the same fact.
+fn turn_session_key(
+    source: &PromptSource,
+    thread_root_hex: Option<&str>,
+    bound: bool,
+) -> SessionKey {
+    match (source, thread_root_hex, bound) {
+        (PromptSource::Channel(cid), Some(root), true) => SessionKey::Thread {
+            channel: *cid,
+            scope: crate::worktree::thread_scope_id(*cid, root),
+        },
+        _ => SessionKey::from(source),
+    }
+}
+
+/// Resolve the worktree a turn should run in, or `None` to run where the
+/// harness runs.
+///
+/// Everything here is best-effort in the strong sense: **no failure may
+/// affect the turn**. A relay hiccup, a missing binding, an unprovisionable
+/// clone — each returns `None`, the turn proceeds in the harness cwd, and
+/// the only cost is that this turn produces no per-turn commit. That
+/// asymmetry is deliberate. A turn that should have had a worktree and did
+/// not merely loses a checkpoint; a turn given the *wrong* worktree pushes a
+/// private channel's work somewhere it does not belong.
+///
+/// Ordering matters for cost as much as for correctness: the cheap local
+/// checks (is there a thread root at all, is the engine even enabled) come
+/// before any relay query, so an ordinary chat turn — the overwhelming
+/// majority — pays nothing.
+async fn resolve_turn_worktree(
+    worktrees: Option<&std::sync::Arc<crate::worktree::ThreadWorktrees>>,
+    cache: &tokio::sync::Mutex<crate::worktree::RepoBindingCache>,
+    rest: &RestClient,
+    relay_self_hex: Option<&str>,
+    channel_id: Uuid,
+    thread_root_hex: Option<&str>,
+) -> Option<crate::worktree::WorktreeBinding> {
+    let worktrees = worktrees?;
+    let root = thread_root_hex?;
+    if root.len() != 64 || !root.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    // Is the root a work-thread root? Asked first because it is the cheaper
+    // question and the one that disqualifies most threads: an ordinary
+    // NIP-10 reply chain on a chat message is a conversation, not a task.
+    let root_events = match rest
+        .query(std::slice::from_ref(
+            &nostr::Filter::new().id(nostr::EventId::from_hex(root).ok()?),
+        ))
+        .await
+    {
+        Ok(json) => json.as_array().cloned().unwrap_or_default(),
+        Err(e) => {
+            crate::worktree::log_soft_failure("worktree: thread-root lookup", &e.to_string());
+            return None;
+        }
+    };
+    let kind = crate::worktree::event_kind_by_id(&root_events, root)?;
+    if !crate::worktree::is_work_thread_root_kind(kind) {
+        return None;
+    }
+
+    // The channel's repo binding, cached — including the negative answer.
+    let mut guard = cache.lock().await;
+    let binding = match guard.get(&channel_id) {
+        Some(cached) => cached.clone(),
+        None => {
+            use nostr::{Alphabet, SingleLetterTag};
+            let d_tag = SingleLetterTag::lowercase(Alphabet::D);
+            let filter = nostr::Filter::new()
+                .kind(nostr::Kind::Custom(30617))
+                .custom_tags(d_tag, [channel_id.to_string().replace('-', "")]);
+            let repo_events = match rest.query(std::slice::from_ref(&filter)).await {
+                Ok(json) => json.as_array().cloned().unwrap_or_default(),
+                Err(e) => {
+                    // Not cached: a transient relay error must not be
+                    // remembered as "this channel has no repo" for the
+                    // lifetime of the process.
+                    crate::worktree::log_soft_failure(
+                        "worktree: repo-binding lookup",
+                        &e.to_string(),
+                    );
+                    return None;
+                }
+            };
+            let resolved = crate::worktree::repo_binding_from_events(
+                &repo_events,
+                channel_id,
+                relay_self_hex?,
+            );
+            guard.insert(channel_id, resolved.clone());
+            resolved
+        }
+    };
+    drop(guard);
+    let (repo_owner, repo_name) = binding?;
+
+    match worktrees
+        .ensure_worktree(channel_id, &repo_owner, &repo_name, root, None)
+        .await
+    {
+        Ok(binding) => Some(binding),
+        Err(e) => {
+            crate::worktree::log_soft_failure("worktree: provision", &e);
+            None
+        }
+    }
+}
+
 /// Create a new ACP session via `session_new_full()`, populate model capabilities
 /// on the agent (first session only), and apply `desired_model` if set.
 ///
@@ -1005,7 +1135,13 @@ async fn create_session_and_apply_model(
     agent_core: Option<&str>,
     agent_canvas: Option<&str>,
     channel_name: Option<&str>,
+    cwd_override: Option<&str>,
 ) -> Result<(String, bool), AcpError> {
+    // A work-thread turn runs in its thread's worktree. This is per-call
+    // rather than a field on `ctx` because the context is `Arc`-shared by
+    // every concurrent turn — mutating a shared cwd would hand one channel's
+    // worktree to another channel's session.
+    let cwd = cwd_override.unwrap_or(&ctx.cwd);
     // Build base_prompt + system_prompt + agent core + canvas metadata into a
     // single prompt. Standard protocol-v2 agents receive it in `session/new`;
     // Goose receives it through the custom request below. Legacy agents receive
@@ -1016,7 +1152,7 @@ async fn create_session_and_apply_model(
     let combined_system_prompt = with_canvas(
         with_core(
             with_team(
-                framed_system_prompt(&ctx.cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
+                framed_system_prompt(cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
                 ctx.team_instructions.as_deref(),
             ),
             agent_core,
@@ -1032,7 +1168,7 @@ async fn create_session_and_apply_model(
     let resp = agent
         .acp
         .session_new_full(
-            &ctx.cwd,
+            cwd,
             ctx.mcp_servers.clone(),
             session_new_system_prompt(
                 is_goose,
@@ -1755,6 +1891,28 @@ pub async fn run_prompt_task(
         PromptSource::Heartbeat => None,
     };
 
+    // Does this turn run in a work-thread worktree?
+    //
+    // Resolved before the session key because it *decides* the session key:
+    // a thread turn needs its own ACP session, since a session's cwd is
+    // fixed at `session/new` and the whole point is a different cwd.
+    let turn_worktree = match &source {
+        PromptSource::Channel(cid) => {
+            resolve_turn_worktree(
+                ctx.thread_worktrees.as_ref(),
+                &ctx.repo_bindings,
+                &ctx.rest_client,
+                ctx.relay_self_pubkey.as_deref(),
+                *cid,
+                turn_attribution
+                    .as_ref()
+                    .and_then(|a| a.thread_root_id.as_deref()),
+            )
+            .await
+        }
+        PromptSource::Heartbeat => None,
+    };
+
     // The one session identity for this turn.
     //
     // Hoisted to a single value because three separate places need it — the
@@ -1762,10 +1920,30 @@ pub async fn run_prompt_task(
     // agree. Deriving it independently at each site is how the reviewed
     // prototype desynced: it would look a session up under one key and then
     // increment or invalidate another, so a counter never advanced and
-    // rotation dropped the wrong session. Today every derivation yields the
-    // same key, so this is a pure hoist; it exists so the work-thread case
-    // is a change in one place rather than three.
-    let turn_key = SessionKey::from(&source);
+    // rotation dropped the wrong session.
+    //
+    // A bound thread turn keys on `Thread`, which carries its channel beside
+    // the one-way scope fold so `invalidate_channel` can still sweep it.
+    let turn_key = turn_session_key(
+        &source,
+        turn_attribution
+            .as_ref()
+            .and_then(|a| a.thread_root_id.as_deref()),
+        turn_worktree.is_some(),
+    );
+
+    // Where a turn ran is not otherwise observable: the cwd goes into
+    // `session/new`, which is not logged, and an agent without a shell tool
+    // cannot report it. Without this line "did the worktree bind?" can only
+    // be answered by inference from the absence of checkpoints.
+    if let Some(binding) = turn_worktree.as_ref() {
+        tracing::info!(
+            target: "worktree",
+            path = %binding.path.display(),
+            branch = %binding.branch,
+            "turn bound to work-thread worktree"
+        );
+    }
 
     let (session_id, is_new_session) = match &source {
         PromptSource::Channel(cid) => {
@@ -1782,6 +1960,10 @@ pub async fn run_prompt_task(
                     agent_core.as_deref(),
                     agent_canvas.as_deref(),
                     title_channel.as_deref(),
+                    turn_worktree
+                        .as_ref()
+                        .map(|b| b.path.to_string_lossy())
+                        .as_deref(),
                 )
                 .await
                 {
@@ -1890,7 +2072,8 @@ pub async fn run_prompt_task(
             } else {
                 // Heartbeats are self-prompts with no channel content, so the
                 // tier gate (and its model-fallback re-check) does not apply.
-                match create_session_and_apply_model(&mut agent, &ctx, None, None, None).await {
+                match create_session_and_apply_model(&mut agent, &ctx, None, None, None, None).await
+                {
                     Ok((sid, _)) => {
                         tracing::info!(
                             target: "pool::session",
@@ -5327,6 +5510,97 @@ mod tests {
         assert_eq!(s.id_of(&SessionKey::Heartbeat), Some("hb"));
     }
 
+    // ── turn_session_key: which session a turn runs on ──────────────────
+
+    fn root_hex() -> String {
+        "ab".repeat(32)
+    }
+
+    #[test]
+    fn a_bound_thread_turn_gets_its_own_session() {
+        let ch = Uuid::from_u128(90);
+        let key = turn_session_key(&PromptSource::Channel(ch), Some(&root_hex()), true);
+        assert_eq!(
+            key,
+            SessionKey::Thread {
+                channel: ch,
+                scope: crate::worktree::thread_scope_id(ch, &root_hex()),
+            }
+        );
+        // The channel rides in the key so `invalidate_channel` can sweep it.
+        assert_eq!(key.channel(), Some(ch));
+    }
+
+    /// Two threads in one channel must not share a session — each has its
+    /// own worktree, and a session's cwd is fixed at creation.
+    #[test]
+    fn two_threads_in_one_channel_get_different_sessions() {
+        let ch = Uuid::from_u128(90);
+        let a = turn_session_key(&PromptSource::Channel(ch), Some(&"aa".repeat(32)), true);
+        let b = turn_session_key(&PromptSource::Channel(ch), Some(&"bb".repeat(32)), true);
+        assert_ne!(a, b);
+    }
+
+    /// The deciding input is whether a worktree was actually bound, not
+    /// whether a thread root exists. A thread turn whose worktree could not
+    /// be provisioned runs in the harness cwd, so it must keep sharing the
+    /// channel session — claiming a private one would give it a session
+    /// whose cwd is not the worktree it is named for.
+    #[test]
+    fn an_unbound_thread_turn_keeps_the_channel_session() {
+        let ch = Uuid::from_u128(90);
+        assert_eq!(
+            turn_session_key(&PromptSource::Channel(ch), Some(&root_hex()), false),
+            SessionKey::Channel(ch)
+        );
+    }
+
+    #[test]
+    fn plain_and_heartbeat_turns_are_unchanged() {
+        let ch = Uuid::from_u128(90);
+        assert_eq!(
+            turn_session_key(&PromptSource::Channel(ch), None, false),
+            SessionKey::Channel(ch)
+        );
+        // Defensive: "bound" without a root cannot key on a thread.
+        assert_eq!(
+            turn_session_key(&PromptSource::Channel(ch), None, true),
+            SessionKey::Channel(ch)
+        );
+        assert_eq!(
+            turn_session_key(&PromptSource::Heartbeat, Some(&root_hex()), true),
+            SessionKey::Heartbeat
+        );
+    }
+
+    /// A channel going away must take its thread sessions with it — the
+    /// leak the prototype's second map produced.
+    #[test]
+    fn sweeping_a_channel_removes_its_bound_thread_sessions() {
+        let ch = Uuid::from_u128(90);
+        let mut s = SessionState::default();
+        let key = turn_session_key(&PromptSource::Channel(ch), Some(&root_hex()), true);
+        s.put(key.clone(), "thread-sess", 3);
+        assert!(s.invalidate_channel(&ch));
+        assert!(!s.sessions.contains_key(&key));
+    }
+
+    /// Negative answers must be cached: most channels have no bound repo, and
+    /// without caching the miss every turn in every one of them pays a relay
+    /// query to learn nothing.
+    #[test]
+    fn the_repo_binding_cache_remembers_absence() {
+        let ch = Uuid::from_u128(90);
+        let mut cache = crate::worktree::RepoBindingCache::default();
+        assert!(cache.get(&ch).is_none(), "unknown before resolution");
+        cache.insert(ch, None);
+        assert_eq!(cache.get(&ch), Some(&None), "absence is a cached answer");
+        cache.insert(ch, Some(("owner".into(), "repo".into())));
+        assert_eq!(cache.get(&ch), Some(&Some(("owner".into(), "repo".into()))));
+        cache.forget(&ch);
+        assert!(cache.get(&ch).is_none(), "forgotten re-resolves");
+    }
+
     /// An agent holding *only* thread sessions still owns the channel for
     /// claim affinity. Without the channel dimension in the key it would
     /// look idle, the next turn would bounce to another agent, and this
@@ -6298,6 +6572,9 @@ mod tests {
     ) -> PromptContext {
         use crate::relay::RestClient;
         PromptContext {
+            thread_worktrees: None,
+            repo_bindings: std::sync::Arc::new(tokio::sync::Mutex::new(Default::default())),
+            relay_self_pubkey: None,
             mcp_servers: vec![],
             initial_message: None,
             idle_timeout: Duration::from_secs(60),

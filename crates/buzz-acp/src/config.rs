@@ -278,6 +278,14 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_AGENT_OWNER")]
     pub agent_owner: Option<String>,
 
+    /// Directory holding per-channel clones and per-thread worktrees.
+    ///
+    /// Opt-in: unset means work-thread turns run in the harness cwd exactly
+    /// as they do today. Setting it lets a turn inside a kind:47000/47020
+    /// thread run in a dedicated worktree of the channel's bound repo.
+    #[arg(long, env = "BUZZ_ACP_WORKTREE_ROOT")]
+    pub worktree_root: Option<String>,
+
     #[arg(long, env = "BUZZ_ACP_AGENT_COMMAND", default_value = "goose")]
     pub agent_command: String,
 
@@ -608,6 +616,9 @@ pub struct Config {
     /// Agent owner pubkey (hex). Used for `--respond-to=owner-only` gate.
     /// Replaces the old REST-based owner lookup.
     pub agent_owner: Option<String>,
+    /// Root for per-channel clones and per-thread worktrees. `None` disables
+    /// work-thread worktree binding entirely (the default).
+    pub worktree_root: Option<String>,
     /// Disable the [Base] platform-context section prepended to every prompt.
     pub no_base_prompt: bool,
     /// Resolved content from `--base-prompt-file`, read and validated in
@@ -1174,6 +1185,10 @@ impl Config {
             relay_observer: args.relay_observer,
             lazy_pool: args.lazy_pool,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
+            worktree_root: args
+                .worktree_root
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
         };
@@ -1555,6 +1570,7 @@ mod tests {
             relay_observer: false,
             lazy_pool: false,
             agent_owner: None,
+            worktree_root: None,
             no_base_prompt: false,
             base_prompt_content: None,
         }

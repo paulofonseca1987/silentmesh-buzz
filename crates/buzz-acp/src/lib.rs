@@ -1405,6 +1405,40 @@ async fn tokio_main() -> Result<()> {
         ),
     }
 
+    // Work-thread worktrees, when configured AND the relay identity is known.
+    //
+    // Both are required, and the conjunction is the point: without the relay
+    // pubkey there is nothing to check a kind:30617 repo binding against, and
+    // an unverified binding is the redirection hole that lets any member
+    // point a channel's agent work at a repo they own. Refusing to build the
+    // engine at all is a stronger guarantee than relying on every call site
+    // to pass the check — there is simply no worktree to bind.
+    let thread_worktrees = match (&config.worktree_root, relay_self_pubkey.as_deref()) {
+        (Some(root), Some(_)) => {
+            tracing::info!(root = %root, "work-thread worktrees enabled");
+            Some(std::sync::Arc::new(worktree::ThreadWorktrees::new(
+                std::path::PathBuf::from(root),
+                config.keys.public_key().to_hex(),
+                config.keys.secret_key().to_secret_hex(),
+                &config.relay_url,
+                // The same NIP-OA attestation the harness's own NIP-98 calls
+                // carry, taken from the client that carries them rather than
+                // re-read from the environment, so the push credential and
+                // the REST identity cannot drift apart.
+                relay.rest_client().auth_tag_json.clone(),
+            )))
+        }
+        (Some(root), None) => {
+            tracing::warn!(
+                root = %root,
+                "BUZZ_ACP_WORKTREE_ROOT is set but the relay identity is unknown — \
+                 a repo binding cannot be verified, so worktrees stay disabled"
+            );
+            None
+        }
+        (None, _) => None,
+    };
+
     let presence_publisher = relay.event_publisher();
     let presence_keys = config.keys.clone();
 
@@ -1572,6 +1606,9 @@ async fn tokio_main() -> Result<()> {
 
     let base_prompt_content = config.base_prompt_content.take();
     let ctx = Arc::new(PromptContext {
+        thread_worktrees: thread_worktrees.clone(),
+        repo_bindings: std::sync::Arc::new(tokio::sync::Mutex::new(Default::default())),
+        relay_self_pubkey: relay_self_pubkey.clone(),
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
@@ -5078,6 +5115,7 @@ mod build_mcp_servers_tests {
 
     fn test_config() -> Config {
         Config {
+            worktree_root: None,
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             agent_command: "goose".into(),
@@ -5298,6 +5336,7 @@ mod error_outcome_emission_tests {
 
     fn test_config() -> Config {
         Config {
+            worktree_root: None,
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
             // `true` exits cleanly, so the async respawn fails fast and

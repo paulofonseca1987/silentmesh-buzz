@@ -687,6 +687,37 @@ pub fn repo_binding_from_events(
     None
 }
 
+/// Per-channel repo bindings, resolved once and reused.
+///
+/// The binding is a kind:30617 announcement made when the channel was
+/// created; it effectively never changes, while a turn happens constantly.
+/// Re-querying it every turn would add a relay round trip to the hot path
+/// for a fact that is stable.
+///
+/// Negative results are cached too. A channel with no bound repo is the
+/// common case — most channels are conversations — and without caching the
+/// miss, every turn in every such channel pays two queries to learn nothing.
+#[derive(Debug, Default, Clone)]
+pub struct RepoBindingCache {
+    entries: std::collections::HashMap<Uuid, Option<(String, String)>>,
+}
+
+impl RepoBindingCache {
+    pub fn get(&self, channel_id: &Uuid) -> Option<&Option<(String, String)>> {
+        self.entries.get(channel_id)
+    }
+
+    pub fn insert(&mut self, channel_id: Uuid, binding: Option<(String, String)>) {
+        self.entries.insert(channel_id, binding);
+    }
+
+    /// Forget a channel's binding — used when the harness leaves a channel,
+    /// so a rejoin re-resolves rather than trusting a stale answer.
+    pub fn forget(&mut self, channel_id: &Uuid) {
+        self.entries.remove(channel_id);
+    }
+}
+
 /// Decide whether a turn earns a worktree, and which repo it binds to.
 ///
 /// This is the whole admission rule in one place, so the harness call site
