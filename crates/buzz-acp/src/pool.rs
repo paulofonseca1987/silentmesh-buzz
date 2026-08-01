@@ -104,12 +104,9 @@ pub enum SessionKey {
     Channel(Uuid),
     /// `scope` is `worktree::thread_scope_id(channel, thread_root_hex)`.
     ///
-    /// Constructed by the work-thread wiring that follows this commit. The
-    /// key change lands on its own so it can be reviewed and tested as a
-    /// pure refactor — every existing test passes unchanged, which is the
-    /// evidence that behaviour did not move. The allow goes away with the
-    /// first production caller.
-    #[allow(dead_code)]
+    /// Built by `turn_session_key` for a turn bound to a work-thread
+    /// worktree. Such a turn needs its own ACP session because a session's
+    /// cwd is fixed at `session/new`, and the worktree *is* a different cwd.
     Thread {
         channel: Uuid,
         scope: Uuid,
