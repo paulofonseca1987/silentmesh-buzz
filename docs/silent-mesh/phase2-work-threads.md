@@ -265,9 +265,28 @@ bare remote** by the gated
 `worktree::probe_tests::provision_commit_push_roundtrip`
 (`BUZZ_ACP_WORKTREE_PROBE=1 cargo test -p buzz-acp --lib worktree::probe_tests -- --ignored`).
 
-**Deferred to a dedicated follow-up — the harness wiring.** Binding the
-agent's ACP session cwd to the worktree and firing `checkpoint` at
-end-of-turn was prototyped and put through the adversarial review, which
+**The harness wiring shipped 2026-08-01** (`54329ad6`..`66fa1a03`). A turn
+whose NIP-10 root is a kind:47000/47020 thread runs in a dedicated worktree
+of the channel's bound repo and, on completion, commits, pushes and
+publishes a kind:47010 — opt-in via `BUZZ_ACP_WORKTREE_ROOT`. Both defects
+the review named below were fixed first as their own commits: the
+session-model refactor (`24548db3`, `be8982c1`) and the relay-owner check
+on the kind:30617 binding (`faaccef7`, `54329ad6`, resolving the relay
+pubkey from NIP-11's `self` field — not `pubkey`, which is the operator's
+contact key and is unset on our relays).
+
+Validated live rather than in the sandbox, which is what surfaced three
+silent environmental blockers — git 2.46+ for the credential helper, a
+policy callback that cannot reach loopback on a tailnet-bound relay, and an
+npm `wc-cli` shadowing `/usr/bin/wc` in the pre-receive hook. See
+HANDOFF.md § Work-thread worktrees — operational preconditions.
+
+The history below is kept because the review's findings are why the wiring
+took the shape it did.
+
+**Originally deferred to a dedicated follow-up — the harness wiring.**
+Binding the agent's ACP session cwd to the worktree and firing `checkpoint`
+at end-of-turn was prototyped and put through the adversarial review, which
 surfaced ~20 confirmed defects concentrated in two layers that **cannot be
 validated without a live agent + relay**: (a) the pool's session model —
 work-thread turns need their own session (own cwd), which collides with

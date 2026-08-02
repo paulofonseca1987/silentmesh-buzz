@@ -28,6 +28,28 @@ new session cannot learn from those.
 
 ## Shipped so far
 
+**Work-thread worktrees, end to end (2026-08-01).** `54329ad6`..`66fa1a03`.
+The capability this file listed as next-slice #1 for weeks: an agent turn
+inside a kind:47000/47020 thread runs in its own git worktree of the
+channel's bound repo and leaves a kind:47010 checkpoint behind. Details in
+next-slices #1 and the preconditions section; what is worth carrying
+forward is *how* it went, because the shape repeats:
+
+- **Every blocker found was environmental, and every one failed silently.**
+  git 2.43 vs the 2.46 the credential helper needs; a hook callback to
+  loopback on a relay that binds only a tailnet IP; an npm `wc-cli`
+  shadowing `/usr/bin/wc` so the fail-closed hook refused every push. None
+  was a logic error, none produced a useful message, and all three were
+  invisible because worktree operations are best-effort by design.
+- **The reverted prototype's two named defects were fixed first, as their
+  own commits**, before anything was built on them — the session-model
+  refactor and the 30617 author check. Both landed as pure refactors whose
+  evidence was "every existing test passes unchanged".
+- **Nothing was believed until the round trip ran.** The auth path had zero
+  coverage (every probe passed `repo_url_override`, the branch that skips
+  authentication), so it was proven with a real clone and push before the
+  session binding was written. That is what surfaced all three blockers.
+
 **Nine commits landed without a docs commit** (`faaccef7`..`57b3f906`) before
 this update caught up. The slice→docs pairing held for ~50 commits and then
 stopped; if it slips again, `git log --oneline <last-HANDOFF-commit>..HEAD`
@@ -560,6 +582,44 @@ serialize so exactly one winner survives) and emits kind:47013 notices.
   `.so.3`, then run gates with `OPENSSL_DIR=<prefix>`. Beware masked
   pipeline exit codes (`cargo … | tail` reports tail's status).
 
+## Work-thread worktrees — operational preconditions
+
+Three things must hold before a work-thread turn gets a worktree. Each was
+found by trying the round trip rather than reading the code, each failed
+*silently* (worktree ops are best-effort so nothing fails a turn), and each
+now announces itself at boot or is fixed outright.
+
+- **git ≥ 2.46 on the harness host.** `git-credential-nostr` answers only
+  when git advertises `capability[]=authtype`, added in 2.46; older git gets
+  an empty response and falls through to `could not read Username`. The
+  harness warns at startup. This box's `/usr/bin/git` is 2.43 and production
+  (bookworm) is 2.39 — `brew install git` gives 2.55 at
+  `/home/linuxbrew/.linuxbrew/bin/git`, but brew's bin is **shadowed** by
+  `/usr/bin`, so it must be prepended explicitly. **Production still needs
+  its own answer**: the relay side is fixed, but any client pushing to the
+  forge — including the harness — needs 2.46+ on *its* host.
+- **`BUZZ_UDS_PATH` on a relay bound to a specific address** (`08109f56`).
+  The pre-receive hook calls back to `/internal/git/policy`; a relay bound
+  to a tailnet IP is not listening on loopback, so the TCP callback is
+  refused and *every push* is rejected with "network error reaching policy
+  service". Calling the bound address instead does not help — the
+  locality guard then rejects it, since a same-host call to a tailnet IP
+  has that IP as its peer. The Unix socket is same-host by construction.
+- **A PATH whose `wc` is the real one** (`0fd7aebf`). The hook counts paths
+  with `wc -l` and inherited the relay's PATH; an npm package `wc-cli`
+  shadows `/usr/bin/wc` on this host with one that rejects `-l`, and the
+  fail-closed hook refused every push with `unknown option '-l'`. The hook
+  now puts the system directories first. (The same shadowing breaks `wc -c`
+  in an interactive shell — it is nvm's bin, not hermit's.)
+
+Testbed invocation that works:
+
+```bash
+BUZZ_ACP_WORKTREE_ROOT=/tmp/sm-worktrees \
+PATH="/home/linuxbrew/.linuxbrew/bin:<repo>/target/release:$PATH" \
+  buzz-acp            # target/release also supplies git-credential-nostr
+```
+
 ## Audit (2026-07-31) — status corrections and untracked debt
 
 Built by checking this file and `roadmap.md` against `git log`, the code,
@@ -596,10 +656,10 @@ listed as remaining after they shipped.
    is no reason to believe a stronger sentence holds. A structural fix — a
    reply path that does not round-trip through shell quoting — would touch
    buzz-agent's tool-calls-as-output design. Not scheduled.
-4. **`SessionKey::Thread` carries `#[allow(dead_code)]`.** Deliberate and
-   documented in-place ("the allow goes away with the first production
-   caller"), but next-slices #1 is that caller, so the two should be
-   closed together. Nothing outside `pool.rs` constructs it today.
+4. ~~**`SessionKey::Thread` carries `#[allow(dead_code)]`.**~~ **CLOSED**
+   (`2b8620d6`). `turn_session_key` builds it for every turn bound to a
+   work-thread worktree, so the variant is reachable from production and
+   the allow is gone — closed together with next-slices #1, as predicted.
 5. **The ledger and the events can disagree, and once did.** `model_usage`
    is the durable record; kind:44201 is the transport. The testbed holds a
    `purpose="gate"` row whose source event is **not in the events table**,
@@ -628,29 +688,42 @@ live turn used in-tree `buzz-agent` against Ollama, not claude-code.
 
 ## Next slices (Phase 3+)
 
-Phase 2's scope items (2a–2h) all shipped and the exit criterion runs
-green from buzz-cli. The buzz-acp **worktree engine** landed as the final
-slice; its **harness wiring** is the one remaining Phase-2 follow-up.
+Phase 2's scope items (2a–2h) all shipped, the exit criterion runs green
+from buzz-cli, and **the worktree wiring — this file's long-standing
+next-slice #1 — is done** (`54329ad6`..`66fa1a03`, 2026-08-01). Phase 2 has
+no remaining follow-ups.
 
-1. **buzz-acp worktree wiring** (engine is done — `worktree.rs`, tested;
-   see phase2-work-threads.md §8). Bind a work-thread turn's ACP session
-   cwd to `ThreadWorktrees::ensure_worktree(...)` and call `checkpoint` +
-   emit 47010 at end of turn. Two things the adversarial review proved
-   this needs and that the deferred prototype got wrong:
-   - **A session-model change, not a second map.** Work-thread turns need
-     their own session (own cwd), but the pool's `invalidate`/rotation/
-     `try_claim` affinity/channel-removal GC are all channel-keyed; a
-     bolt-on `thread_sessions` map desynced from all of them (retained a
-     broken session while dropping the healthy channel one; never reset the
-     shared turn counter → every-turn rotation; leaked entries on channel
-     removal). Do it as a proper effective-session-key refactor.
-   - **Verify the 30617 author.** The repo binding must be resolved from
-     the announcement signed by the *known relay owner*, not any author
-     with a matching `d` tag (redirection hole). Resolve the relay pubkey
-     first (NIP-11 or a startup fetch).
-   Must be validated against a **live** claude-code turn in a 47000-rooted
-   thread pushing to a running relay's forge — the whole value is that
-   round trip, unexercisable in the dev sandbox.
+1. ~~**buzz-acp worktree wiring**~~ — **SHIPPED.** A turn whose NIP-10 root
+   is a kind:47000/47020 work thread runs in a dedicated worktree of the
+   channel's bound repo on `sm/thread/<short>`, and on completion commits,
+   pushes, and publishes a kind:47010. Opt-in via
+   `BUZZ_ACP_WORKTREE_ROOT`; unset, nothing changes.
+
+   Both things the adversarial review demanded were done first, as separate
+   reviewable commits: the session-model change (`24548db3` +
+   `be8982c1` — one `SessionKey` map, then one `turn_key` per turn so the
+   lookup, the turn counter and rotation cannot disagree) and the 30617
+   author check (`faaccef7` + `54329ad6` — the relay's own pubkey, resolved
+   from NIP-11).
+
+   **Read `self`, not `pubkey`.** NIP-11 carries both; `pubkey` is the
+   operator's contact key and is `None` on our relays, while `self`
+   (NIP-43) is the signing key that actually signs the 30617s. The wrong
+   field returns `None`, which fails closed and therefore reads as "this
+   channel has no repo bound" rather than "you asked the wrong question".
+
+   Validated live end to end, cross-checked between two independently
+   signed events: the agent's kind:47010 carries
+   `commit=36eb07a6… branch=sm/thread/6e5b88de823e`, and the relay's own
+   kind:30618 for that push records the same commit on the same ref — so
+   the checkpoint names something genuinely fetchable. A plain channel
+   message in the same channel bound no worktree, which is the half that
+   proves the admission rule discriminates.
+
+   **Three preconditions, none of them obvious, all now reported at boot
+   or fixed** (see Environment notes): git ≥ 2.46 on the *harness* host,
+   `BUZZ_UDS_PATH` on a relay bound to a specific address, and a PATH whose
+   `wc` is the real one.
 2. **Phase 3 continues** — slices 1–8 shipped (tier-aware router +
    attribution store; pre-turn tier enforcement; the local Ollama agent
    backend; live-turn attribution 44201 + owner usage read; the gateway's
@@ -705,13 +778,14 @@ slice; its **harness wiring** is the one remaining Phase-2 follow-up.
      the diff half, and it is blocked on item 1 below, not on the client.
    - **The channel repo browser** — file tree and blob view over git smart
      HTTP, so a work thread's checkpoints can be read where they happened.
-   - **Per-turn diffs are blocked upstream, not on the client.**
-     `ThreadWorktrees`/`ensure_worktree` have no callers outside
-     `worktree.rs`, so there are no per-turn commits and `commit^..commit`
-     does not yet mean "what the agent changed this turn". Kinds to carry a
-     patch already exist (`KIND_GIT_PATCH` 1617,
-     `KIND_STREAM_MESSAGE_DIFF` 40008) — this needs the Phase-2 harness
-     wiring, not a new kind.
+   - **Per-turn diffs are now unblocked** — this said they were blocked
+     upstream, and they were, until the worktree wiring shipped. There are
+     per-turn commits now, so `commit^..commit` finally does mean "what the
+     agent changed this turn", and each is named by a kind:47010 the client
+     can already fold. Kinds to carry a patch exist
+     (`KIND_GIT_PATCH` 1617, `KIND_STREAM_MESSAGE_DIFF` 40008), so this is
+     client work plus a fetch, not a new kind and not another upstream
+     dependency.
    - **Streaming needs an owner binding**, not client work: kind:24200 is
      NIP-44-encrypted to the agent's owner and p-gated, so the Mac sees
      nothing until its member key is bound as that agent's owner.

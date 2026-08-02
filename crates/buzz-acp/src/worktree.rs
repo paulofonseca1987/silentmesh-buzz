@@ -11,14 +11,14 @@
 //! **Scope of this module.** It is the self-contained, tested engine —
 //! provisioning ([`ThreadWorktrees::ensure_worktree`]), the end-of-turn
 //! commit/push ([`ThreadWorktrees::checkpoint`]), the NIP-98 push-auth
-//! config ([`push_auth_config`]), and the pure resolution helpers. The
-//! *harness wiring* that calls it (binding an ACP session's cwd to the
-//! worktree and firing `checkpoint` at end of turn) is a **separate
-//! follow-up slice**: an adversarial review of a wiring prototype found it
-//! needs a pool session-model refactor and relay-owner verification, and
-//! its value lives entirely in a live agent→forge round trip that the dev
-//! sandbox can't exercise. This engine is the durable substrate that
-//! wiring will call.
+//! config ([`push_auth_config`]), and the pure resolution helpers.
+//!
+//! The harness wiring that calls it lives in `pool.rs` and shipped
+//! 2026-08-01: `resolve_turn_worktree` decides whether a turn earns a
+//! worktree, `turn_session_key` gives a bound turn its own ACP session
+//! (a session's cwd is fixed at `session/new`, and the worktree is the
+//! different cwd), and `checkpoint_turn_worktree` publishes the kind:47010.
+//! Opt-in via `BUZZ_ACP_WORKTREE_ROOT`.
 //!
 //! Everything here is **best-effort**, mirroring the relay's
 //! canonicalize-on-close: any git failure returns `Err`/`None` and (once
@@ -32,17 +32,23 @@
 //! exercised against local bare repos by the gated `probe_tests`; the pure
 //! helpers have unit tests.
 //!
-//! **The auth path is not covered by any test.** Every `probe_tests` call
-//! passes a `repo_url_override`, which is precisely the branch that skips
-//! `auth_cli_flags` and `apply_push_auth` (see `ensure_worktree`) — a local
-//! bare repo needs no credentials. So `ensure_keyfile`, `auth_cli_flags`
-//! and `apply_push_auth` have no coverage at all; only the pure
-//! `push_auth_config` is unit-tested. That matters more than it looks: the
-//! reverted wiring prototype cloned *unauthenticated* and 401'd against
-//! every live relay, and this is the gap that would have caught it. Live
-//! NIP-98 push auth to the *relay's* smart-HTTP forge needs a running relay
-//! + the `git-credential-nostr`
-//! helper on PATH, like the promote/canonicalize S3 probes.
+//! **The auth path still has no automated test**, though it has now been
+//! exercised by hand. Every `probe_tests` call passes a `repo_url_override`,
+//! which is precisely the branch that skips `auth_cli_flags` and
+//! `apply_push_auth` — a local bare repo needs no credentials — so those
+//! and `ensure_keyfile` have no coverage; only the pure `push_auth_config`
+//! is unit-tested.
+//!
+//! It was proven manually against the live testbed before the wiring was
+//! written (authenticated clone, then an authenticated push landing a
+//! relay-signed kind:30618), which is the only reason the wiring was
+//! trusted — and that exercise is what turned up all three blockers the
+//! automated tests could never have seen, none of them logic errors:
+//! git older than 2.46 cannot use the credential helper at all; a relay
+//! bound to one address cannot reach its own policy endpoint over loopback;
+//! and a shadowed `wc` made the fail-closed pre-receive hook refuse every
+//! push. A standing probe needs a running relay plus `git-credential-nostr`
+//! on PATH, like the promote/canonicalize S3 probes.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
