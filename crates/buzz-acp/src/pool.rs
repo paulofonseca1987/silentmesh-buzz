@@ -1060,7 +1060,128 @@ async fn checkpoint_turn_worktree(
             branch = %branch,
             "checkpoint recorded"
         ),
-        Err(e) => crate::worktree::log_soft_failure("worktree: publish 47010", &e.to_string()),
+        Err(e) => {
+            crate::worktree::log_soft_failure("worktree: publish 47010", &e.to_string());
+            // No diff either: a diff whose checkpoint never landed points at
+            // a commit nothing else references.
+            return;
+        }
+    }
+
+    publish_turn_diff(
+        ctx,
+        channel_id,
+        thread_root_hex,
+        binding,
+        &commit,
+        &branch,
+        worktrees,
+    )
+    .await;
+}
+
+/// Largest diff body to publish, in bytes.
+///
+/// The kind:40008 builder caps content at 60 KiB; staying under it means an
+/// oversized turn is *truncated and published* rather than rejected whole,
+/// which is the difference between "this change was too big to show in full"
+/// and a silence indistinguishable from "nothing happened".
+const MAX_TURN_DIFF_BYTES: usize = 56 * 1024;
+
+/// Publish what the turn changed as a kind:40008 diff message, threaded
+/// under the work thread.
+///
+/// Sent as an event rather than left for clients to fetch, because a client
+/// that has to clone a repo over authenticated smart HTTP to show a diff is
+/// a client that will not show one. The desktop already renders kind:40008
+/// in its own row, so this makes per-turn changes visible with no client
+/// change at all.
+///
+/// Strictly after the checkpoint, never instead of it: the kind:47010 is the
+/// durable anchor and the diff is a convenience view of it. A diff published
+/// without its checkpoint would name a commit nothing else references, so a
+/// failed checkpoint skips the diff entirely.
+#[allow(clippy::too_many_arguments)]
+async fn publish_turn_diff(
+    ctx: &PromptContext,
+    channel_id: Uuid,
+    thread_root_hex: &str,
+    binding: &crate::worktree::WorktreeBinding,
+    commit: &str,
+    branch: &str,
+    worktrees: &std::sync::Arc<crate::worktree::ThreadWorktrees>,
+) {
+    let diff = match worktrees
+        .diff_for_commit(binding, commit, MAX_TURN_DIFF_BYTES)
+        .await
+    {
+        Ok(d) if d.text.is_empty() => {
+            // A commit with no renderable diff (an empty file, a mode-only
+            // change beyond `git show`'s default output, or a first line
+            // over budget). The checkpoint already records that it happened.
+            tracing::debug!(target: "worktree", commit, "no diff body to publish");
+            return;
+        }
+        Ok(d) => d,
+        Err(e) => {
+            crate::worktree::log_soft_failure("worktree: diff", &e);
+            return;
+        }
+    };
+
+    let root = match nostr::EventId::from_hex(thread_root_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            crate::worktree::log_soft_failure("worktree: diff thread root", &e.to_string());
+            return;
+        }
+    };
+    let meta = buzz_sdk::DiffMeta {
+        repo_url: worktrees.remote_url(binding).await,
+        commit_sha: commit.to_owned(),
+        file_path: None,
+        parent_commit: diff.parent.clone(),
+        // Source and target are the same branch: this is what one turn added
+        // to the thread's branch, not a proposed merge between two.
+        branch: Some((branch.to_owned(), branch.to_owned())),
+        pr_number: None,
+        language: None,
+        description: Some(format!(
+            "Agent turn checkpoint {}",
+            &commit[..7.min(commit.len())]
+        )),
+        truncated: diff.truncated,
+        alt_text: None,
+    };
+    let thread_ref = buzz_sdk::ThreadRef {
+        root_event_id: root,
+        parent_event_id: root,
+    };
+
+    let builder =
+        match buzz_sdk::build_diff_message(channel_id, &diff.text, &meta, Some(&thread_ref)) {
+            Ok(b) => b,
+            Err(e) => {
+                crate::worktree::log_soft_failure("worktree: build 40008", &e.to_string());
+                return;
+            }
+        };
+    let event = match builder.sign_with_keys(&ctx.agent_keys) {
+        Ok(e) => e,
+        Err(e) => {
+            crate::worktree::log_soft_failure("worktree: sign 40008", &e.to_string());
+            return;
+        }
+    };
+    match ctx.rest_client.submit_event(&event).await {
+        Ok(_) => tracing::info!(
+            target: "worktree",
+            commit = %commit,
+            bytes = diff.text.len(),
+            truncated = diff.truncated,
+            "turn diff published"
+        ),
+        Err(e) => crate::worktree::log_soft_failure("worktree: publish 40008", &e.to_string()),
     }
 }
 

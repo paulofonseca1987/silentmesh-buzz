@@ -562,6 +562,107 @@ async fn resolve_base(mirror: &Path) -> Option<String> {
     None
 }
 
+/// What one turn changed, ready to publish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnDiff {
+    /// Unified diff text, possibly cut short — see `truncated`.
+    pub text: String,
+    /// The commit's parent, absent for a root commit.
+    pub parent: Option<String>,
+    /// Whether `text` was cut to fit the size budget.
+    pub truncated: bool,
+}
+
+/// Cut `text` to at most `max_bytes`, on a line boundary.
+///
+/// Kept pure and separate from the git call so the boundary cases — a diff
+/// exactly at the limit, one whose first line already exceeds it, multi-byte
+/// characters straddling the cut — are testable without a repository.
+///
+/// The cut is at a **line** boundary, not just a character one, because a
+/// unified diff severed mid-hunk is not a smaller diff, it is a corrupt one:
+/// a renderer that parses hunk headers will mis-associate every line after
+/// the wound. Losing the tail is honest; misattributing it is not.
+pub fn truncate_diff(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_owned(), false);
+    }
+    // Search the **bytes**, not a string slice. `text[..max_bytes]` panics
+    // outright when the budget lands inside a multi-byte character, which a
+    // diff of non-ASCII source hits routinely — a test that walks every
+    // budget over an accented line found it immediately.
+    //
+    // Byte indexing is safe here and the result is still a valid boundary:
+    // UTF-8 encodes `\n` as a single byte that can never appear inside a
+    // multi-byte sequence, so a newline's index is always on a character
+    // boundary even though the budget may not be.
+    match text.as_bytes()[..max_bytes]
+        .iter()
+        .rposition(|&b| b == b'\n')
+    {
+        Some(cut) => (text[..=cut].to_owned(), true),
+        // A first line longer than the whole budget: emit nothing rather
+        // than a fragment of one line, which would render as a bogus hunk.
+        None => (String::new(), true),
+    }
+}
+
+impl ThreadWorktrees {
+    /// The remote a worktree pushes to, read back from the checkout itself.
+    ///
+    /// Read rather than reconstructed: the caller that needs it (publishing
+    /// a diff) would otherwise have to carry the owner and repo name along
+    /// beside the binding, and a rebuilt URL that drifts from the one git
+    /// actually uses would point readers at a repo the commit is not in.
+    /// Falls back to the forge base when the remote cannot be read, which is
+    /// only reachable if the worktree is broken in ways that already
+    /// prevented the push.
+    pub async fn remote_url(&self, binding: &WorktreeBinding) -> String {
+        git(&binding.path, &["remote", "get-url", "origin"], &[])
+            .await
+            .ok()
+            .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+            .unwrap_or_else(|| self.forge_base.clone())
+    }
+
+    /// The unified diff a single commit introduced, bounded to `max_bytes`.
+    ///
+    /// `git show` rather than `<commit>^..<commit>` so a root commit — a
+    /// thread branched from an empty repo — produces its contents instead of
+    /// failing on a parent that does not exist.
+    pub async fn diff_for_commit(
+        &self,
+        binding: &WorktreeBinding,
+        commit: &str,
+        max_bytes: usize,
+    ) -> Result<TurnDiff, String> {
+        let raw = git(
+            &binding.path,
+            &[
+                "show",
+                "--no-color",
+                "--format=",
+                "--unified=3",
+                "--no-ext-diff",
+                commit,
+            ],
+            &[],
+        )
+        .await?;
+        // A missing parent is a root commit, not an error.
+        let parent = git(&binding.path, &["rev-parse", &format!("{commit}^")], &[])
+            .await
+            .ok()
+            .filter(|p| !p.is_empty());
+        let (text, truncated) = truncate_diff(&raw, max_bytes);
+        Ok(TurnDiff {
+            text,
+            parent,
+            truncated,
+        })
+    }
+}
+
 /// Log a best-effort worktree failure without disturbing the turn.
 pub fn log_soft_failure(context: &str, err: &str) {
     warn!(target: "worktree", "{context}: {err} (turn unaffected)");
@@ -874,6 +975,49 @@ mod tests {
         assert_eq!(event_kind_by_id(evs, "zz"), None);
         assert!(is_work_thread_root_kind(47000) && is_work_thread_root_kind(47020));
         assert!(!is_work_thread_root_kind(9) && !is_work_thread_root_kind(47001));
+    }
+
+    // ── truncate_diff ───────────────────────────────────────────────────
+
+    #[test]
+    fn a_diff_within_budget_is_untouched() {
+        let d = "diff --git a/x b/x\n+one\n";
+        assert_eq!(truncate_diff(d, 1024), (d.to_owned(), false));
+        // Exactly at the limit is still within it.
+        assert_eq!(truncate_diff(d, d.len()), (d.to_owned(), false));
+    }
+
+    /// A unified diff cut mid-hunk is not a smaller diff, it is a corrupt
+    /// one — a renderer parsing hunk headers mis-associates everything after
+    /// the wound. Losing the tail is honest; misattributing it is not.
+    #[test]
+    fn truncation_lands_on_a_line_boundary() {
+        let d = "aaaa\nbbbb\ncccc\n";
+        let (out, truncated) = truncate_diff(d, 12);
+        assert!(truncated);
+        assert_eq!(out, "aaaa\nbbbb\n", "must not cut inside a line");
+        assert!(out.ends_with('\n'));
+    }
+
+    /// Multi-byte characters must not be split. A newline is a single byte
+    /// and can never sit inside one, so cutting at a newline is always a
+    /// valid boundary — this pins that reasoning rather than assuming it.
+    #[test]
+    fn truncation_never_splits_a_multibyte_character() {
+        let d = "+é ligature ﬁ\n+second line here\n";
+        for budget in 1..d.len() {
+            let (out, _) = truncate_diff(d, budget);
+            assert!(d.starts_with(&out), "budget {budget} produced a non-prefix");
+        }
+    }
+
+    /// A single line longer than the whole budget yields nothing rather than
+    /// a fragment, which would render as a bogus hunk.
+    #[test]
+    fn a_first_line_over_budget_yields_nothing() {
+        let (out, truncated) = truncate_diff("one enormous line with no newline", 8);
+        assert_eq!(out, "");
+        assert!(truncated, "and it must say it was truncated");
     }
 
     /// The boundary is exact and load-bearing: 2.45 cannot authenticate to
