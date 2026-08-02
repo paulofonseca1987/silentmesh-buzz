@@ -795,14 +795,28 @@ no remaining follow-ups.
      the diff half, and it is blocked on item 1 below, not on the client.
    - **The channel repo browser** — file tree and blob view over git smart
      HTTP, so a work thread's checkpoints can be read where they happened.
-   - **Per-turn diffs are now unblocked** — this said they were blocked
-     upstream, and they were, until the worktree wiring shipped. There are
-     per-turn commits now, so `commit^..commit` finally does mean "what the
-     agent changed this turn", and each is named by a kind:47010 the client
-     can already fold. Kinds to carry a patch exist
-     (`KIND_GIT_PATCH` 1617, `KIND_STREAM_MESSAGE_DIFF` 40008), so this is
-     client work plus a fetch, not a new kind and not another upstream
-     dependency.
+   - **Per-turn diffs: the data is on the wire, only the Swift view is
+     missing.** This entry used to say they were blocked upstream — true
+     until the worktree wiring shipped — and then that they needed "client
+     work plus a fetch". Neither is true now: the harness publishes the diff
+     itself as a **kind:40008** threaded under the work thread
+     (`10460083`), so no client needs to clone a repo to show one.
+
+     **The event shape is verified against a real renderer, not assumed.**
+     The exact kind:40008 the harness published live — same content, same
+     `repo`/`commit`/`parent-commit`/`branch`/`description` tags — was
+     injected into the desktop through the E2E mock bridge and rendered
+     correctly: the `commit` tag as the header chip, `description` as the
+     subtitle, the body parsed into a file card with a NEW FILE badge, a
+     `+3` count, per-line numbering, and non-ASCII intact. Every tag the
+     publisher emits is consumed by a renderer that predates it.
+
+     So the remaining work is a `MeshProtocol` fold plus a thread-view row.
+     Note the contract is **verified but not regression-locked**: the lock
+     belongs in the Swift client's fold tests, not in a desktop spec — the
+     desktop is inherited, unbuilt and unmaintained under D35/D36, and
+     adding tests there would be investing in a tree we have declared we do
+     not maintain.
    - **Streaming needs an owner binding**, not client work: kind:24200 is
      NIP-44-encrypted to the agent's owner and p-gated, so the Mac sees
      nothing until its member key is bound as that agent's owner.
