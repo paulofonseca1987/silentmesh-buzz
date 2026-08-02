@@ -32,23 +32,25 @@
 //! exercised against local bare repos by the gated `probe_tests`; the pure
 //! helpers have unit tests.
 //!
-//! **The auth path still has no automated test**, though it has now been
-//! exercised by hand. Every `probe_tests` call passes a `repo_url_override`,
-//! which is precisely the branch that skips `auth_cli_flags` and
-//! `apply_push_auth` — a local bare repo needs no credentials — so those
-//! and `ensure_keyfile` have no coverage; only the pure `push_auth_config`
-//! is unit-tested.
+//! **The auth path is covered by `forge_probe_tests`, and only there.**
+//! Every `probe_tests` case passes a `repo_url_override`, which is exactly
+//! the branch that skips `auth_cli_flags` and `apply_push_auth` — a local
+//! bare repo needs no credentials — so those and `ensure_keyfile` have no
+//! coverage from the local-repo probes at all, and only the pure
+//! `push_auth_config` is unit-tested.
 //!
-//! It was proven manually against the live testbed before the wiring was
-//! written (authenticated clone, then an authenticated push landing a
-//! relay-signed kind:30618), which is the only reason the wiring was
-//! trusted — and that exercise is what turned up all three blockers the
-//! automated tests could never have seen, none of them logic errors:
-//! git older than 2.46 cannot use the credential helper at all; a relay
-//! bound to one address cannot reach its own policy endpoint over loopback;
-//! and a shadowed `wc` made the fail-closed pre-receive hook refuse every
-//! push. A standing probe needs a running relay plus `git-credential-nostr`
-//! on PATH, like the promote/canonicalize S3 probes.
+//! That gap was expensive twice: the reverted wiring prototype cloned
+//! unauthenticated and 401'd against every live relay, and the wiring that
+//! replaced it hit three further failures in the same path, none a logic
+//! error — git older than 2.46 cannot use the credential helper at all, a
+//! relay bound to one address cannot reach its own policy endpoint over
+//! loopback, and a shadowed `wc` made the fail-closed pre-receive hook
+//! refuse every push. All three are invisible in production, because
+//! worktree operations are best-effort so git can never fail an agent's
+//! turn — which also means nothing announces when git cannot authenticate.
+//! `forge_probe_tests` turns each into an assertion failure with git's own
+//! error attached. It needs a live relay plus `git-credential-nostr` on
+//! PATH, like the promote/canonicalize S3 probes.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
