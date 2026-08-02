@@ -135,6 +135,7 @@ func kindParity() throws {
     }
 
     let expected: [(String, Int)] = [
+        ("KIND_STREAM_MESSAGE_DIFF", MeshKind.streamMessageDiff),
         ("KIND_WORK_THREAD_OPEN", MeshKind.workThreadOpen),
         ("KIND_WORK_THREAD_METADATA", MeshKind.workThreadMetadata),
         ("KIND_WORK_THREAD_STATE", MeshKind.workThreadState),

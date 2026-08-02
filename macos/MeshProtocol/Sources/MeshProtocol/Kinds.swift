@@ -19,6 +19,10 @@ public enum MeshKind {
     /// nothing**, because it is sent best-effort and dropped under load.
     public static let typingIndicator = 20002
     public static let channelMessage = 40002
+    /// A per-turn diff the ACP harness publishes alongside each kind:47010
+    /// checkpoint, so a client can show what an agent changed without
+    /// cloning the repo.
+    public static let streamMessageDiff = 40008
     public static let channelMetadata = 39000
     public static let channelMembers = 39002
     public static let clientAuth = 22242
