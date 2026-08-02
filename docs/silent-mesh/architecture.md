@@ -53,7 +53,7 @@ codebases, D33 re-decided the foundation. **All D1–D32 product semantics survi
 | D32 | Deep seal | Optional retroactive git-history purge as the leak-correction mechanism; owner-only, blast-radius-confirmed, heavily audited |
 | **D33** | **Base (final)** | **Fork block/buzz (v0.5.x)**. T3 Code becomes the **design blueprint** for the work-thread + approval layer, not the code base. Rationale: the two projects have complementary holes — Buzz's hardened relay/forge/tenancy (~110k lines, 3,717 tests) is the bigger, subtler half to rebuild; T3's work-thread + approval design is the smaller port and is exactly Buzz's one unfinished area |
 | D34 | Stack | Rust-first backend accepted; TS only where inherited surfaces need it; Swift for clients |
-| D35 | Fork posture | **Track upstream**: additive crates/middleware/new kinds over invasive edits; no mass renames (brand at config/deploy level); upstream-owned trees (desktop/mobile/web) stay in-tree **unbuilt** rather than deleted, so rebases stay clean; upstream our governance work where Block will take it |
+| D35 | Fork posture | **Hard fork at `90e058eb`** (revised 2026-08-02; originally "track upstream"). No merges or rebases: the tracking intent was never implemented — no `upstream` remote, `main` never moved, no rebase ever ran — and the gap between written intent and practice was itself the risk. Additive crates/middleware/new kinds over invasive edits, no mass renames, and upstream-inherited trees kept in-tree are all **retained** as hygiene, not as merge preparation. Accepted cost: upstream fixes (including security fixes) no longer arrive and must be cherry-picked deliberately; contributing the governance work back means cherry-picking onto a fresh upstream clone, not merging. See FORK.md |
 | D36 | Interim client | **CLI-only until the Swift MVP** (buzz-cli + scripted/test clients + admin CLI). Inherited Buzz clients are not shipped or supported, though the in-tree desktop app remains available as a developer debugging tool |
 | D37 | Indexing & retrieval | The server continuously runs an **indexing + embedding service** (FTS + vectors) over all workspace content so users and agents retrieve information fast. Embeddings are computed **exclusively on owned hardware** (embedding via remote backends is wholesale egress and is prohibited by design); every retrieval query is **ACL-scoped** to the requester's readable channels |
 | D38 | Canonical docs per channel | **Every channel is a knowledge channel** — no dedicated wiki channels. Each channel carries its own **canonical docs**: the current truth about its topic, living alongside its chat in the same repo. The workspace wiki is the **ACL-scoped union of all canons**, browsable wiki-style and searchable, with provenance. The service auto-maintains distilled canon it owns and opens **update proposals** elsewhere — never silent edits |
@@ -322,9 +322,11 @@ Silent Mesh's thesis, so it is the **first build** (roadmap Phase 1):
   kind-46011, "who approved what" provable) → decision returned to the agent →
   audit chain.
 - Grant/deny surfaces: buzz-cli (interim, D36), then the Swift client.
-- This work is deliberately structured for **upstreaming** (D35): Block's own
-  architecture docs claim the endpoints should exist, so the contribution has a
-  natural home.
+- This work is still *shaped* for upstreaming — Block's own architecture docs
+  claim these endpoints should exist, so the contribution has a natural home —
+  but under the revised D35 the fork no longer tracks upstream, so offering it
+  means cherry-picking these commits onto a fresh clone of upstream rather
+  than merging. Deliberate act, not a side effect of a merge cadence.
 
 ## 9. Files, git, and sync
 

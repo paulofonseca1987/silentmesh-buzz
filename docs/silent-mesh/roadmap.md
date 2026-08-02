@@ -4,7 +4,9 @@ Companion to [architecture.md](./architecture.md), re-cut for the **Buzz base**
 (D33). Ordering principle: wire governance first (Buzz's one unfinished area and
 Silent Mesh's thesis), then port T3's work-thread model, then the model plane and
 seals, then the Swift client — with buzz-cli and scripted clients as the only
-interim surface (D36) and upstream-tracking discipline throughout (D35).
+interim surface (D36). **D35 was revised to a hard fork on 2026-08-02** — the
+upstream-tracking discipline this ordering assumed was never implemented and is
+no longer intended; see FORK.md.
 
 Each phase lists scope and an exit criterion — the observable thing that must work
 before moving on.
@@ -16,7 +18,9 @@ before moving on.
   server with the 2× RTX 4060 GPUs visible to it.
 - Build discipline per D35: exclude desktop/mobile/web/admin-web from our CI
   (trees stay in-tree, unbuilt); pin the toolchain; establish the scheduled
-  upstream-rebase workflow with the conformance + E2E harness as the gate.
+  ~~upstream-rebase workflow~~ — dropped with the D35 revision; the fork is
+  frozen at `90e058eb` and takes upstream commits only as deliberate
+  cherry-picks.
 - Community bootstrap: single community, owner enrolled, invites verified (wire
   the deferred invite side-effect handler if upstream hasn't by then).
 - Migrate these plan docs into the fork; branding at config level only.
@@ -25,8 +29,11 @@ before moving on.
 
 **Exit**: `just ci` (our slimmed profile) green on the fork; a scripted client
 and buzz-cli exchange kind-9 messages in a members-only channel on the deployed
-single-host stack; an @mentioned claude-code agent replies; upstream rebase
-executed once end-to-end.
+single-host stack; an @mentioned claude-code agent replies. ~~upstream rebase
+executed once end-to-end~~ — **struck** with the D35 revision: this criterion
+was never met and, under a hard fork, never will be. It is removed rather than
+left permanently unmet. (The claude-code clause is also still unconfirmed —
+the live turn used in-tree `buzz-agent` against Ollama.)
 
 ## Phase 1 — Governance: approvals wired end-to-end
 
@@ -243,7 +250,7 @@ Workspace Admin publishes, a Channel Admin's publish attempt is refused.
 
 | Risk | Mitigation |
 |---|---|
-| Upstream velocity vs fork divergence (Buzz ships daily; key files are 5–6k lines) | D35 discipline: additive crates, no renames, unbuilt-not-deleted trees, scheduled rebases gated by the conformance/E2E harness; upstream the governance work |
+| ~~Upstream velocity vs fork divergence~~ — **accepted, not mitigated** (D35 revised 2026-08-02) | The fork is frozen at `90e058eb`. Divergence is now permanent and grows: upstream was 107 commits / 300 files ahead within five days, overlapping 29 of our files. The risk is **taken**, not managed. Residual exposure: upstream fixes, including security fixes, no longer arrive in the ~5k-line files we depend on but do not maintain — a specific fix must be cherry-picked deliberately. Additive crates, no renames and unbuilt-not-deleted trees are retained as hygiene |
 | Approval wiring may collide with upstream's own approval plans | engage Block early; our patches structured as the endpoints their docs already describe |
 | sqlx runtime-only query validation (~27k lines of DB code) | our new code uses compile-checked queries where feasible; migration lint + integration tests on every rebase |
 | Rust learning curve on a 233k-line codebase | Rust-first accepted (D34); T3 remains the design blueprint so the hard part is porting semantics, not inventing them |
@@ -278,7 +285,11 @@ Workspace Admin publishes, a Channel Admin's publish attempt is refused.
     redaction envelopes for events quoting leaked values).
 11. Which dormant Buzz features to eventually adopt (huddles, canvases, forum,
     workflows, mesh compute) — Phase 8 review.
-12. Upstreaming cadence and relationship with Block (governance patches first).
+12. Relationship with Block — **no longer a cadence question** after the D35
+    revision. There is nothing to keep in sync, so the only remaining question
+    is whether to offer the governance work to Block at all, once, as
+    cherry-picks onto a fresh clone of upstream. Worth deciding on its own
+    merits rather than as a by-product of merging.
 13. Knowledge-plane detail: embedding model + chunking strategy (Phase 3 spike,
     alongside the serving-stack spike), claim-extraction approach for dispute
     detection, `canon/` structure and ownership conventions (service-owned vs

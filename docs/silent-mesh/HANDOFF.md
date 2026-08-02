@@ -12,19 +12,23 @@ new session cannot learn from those.
 > before planning anything.** This file twice claimed the Phase 3 exit
 > criterion was closed when only its metering clause was, and it listed two
 > shipped items as remaining. Those are corrected in place, but the audit
-> also collects seven pieces of debt that no document tracked — including
-> that the roadmap's #1 standing risk (fork divergence) has no mechanism at
-> all. Status claims here are only as good as their last check against the
-> code; the audit records which ones were checked, and which were not.
+> also collects seven pieces of debt that no document tracked. The largest
+> of those — the roadmap's #1 standing risk, fork divergence, having no
+> mechanism at all — was **decided on 2026-08-02**: this is a hard fork,
+> D35 is revised, and the risk is accepted rather than managed (FORK.md).
+> Status claims here are only as good as their last check against the code;
+> the audit records which ones were checked, and which were not.
 
 ## Where the work lives
 
 - **Branch: `claude/fork-sync-0vdsko`** on `paulofonseca1987/silentmesh-buzz`
-  (fork of `block/buzz`, in sync with upstream main at fork time). All Silent
-  Mesh work to date is on this branch; continue on it (or a branch cut from
-  it) — the commit history is slice-per-commit and self-describing
-  (`git log --oneline` is the index). **There is no `upstream` remote and no
-  rebase has ever run** — `main` is still the fork point. See Audit #1.
+  (**hard fork** of `block/buzz` at `90e058eb`, 2026-07-28 — D35 revised
+  2026-08-02, see FORK.md). All Silent Mesh work to date is on this branch;
+  continue on it (or a branch cut from it) — the commit history is
+  slice-per-commit and self-describing (`git log --oneline` is the index).
+  `main` is the frozen fork point and there is deliberately no `upstream`
+  remote. The branch name predates the decision and no longer describes a
+  sync.
 
 ## Shipped so far
 
@@ -633,14 +637,27 @@ listed as remaining after they shipped.
 
 **Untracked, in the order I would act on it:**
 
-1. **The fork's top standing risk has no mechanism.** `roadmap.md` names
-   upstream velocity vs fork divergence as risk #1 and D35 prescribes
-   *scheduled* rebases gated by the conformance/E2E harness. Neither
-   exists: there is **no `upstream` remote** (only `origin`, the fork), and
-   `main` is still at the fork point `90e058eb` with 0 commits ahead — so
-   **no upstream rebase has ever run**, contrary to Phase 0's exit
-   criterion ("upstream rebase executed once end-to-end"). Every day this
-   waits, the rebase gets harder, which is precisely the risk.
+1. ~~**The fork's top standing risk has no mechanism.**~~ **DECIDED
+   2026-08-02: the fork is a hard fork.** D35 is revised from "track
+   upstream" to a snapshot at `90e058eb`; there are no merges or rebases,
+   and Phase 0's "upstream rebase executed once end-to-end" is struck
+   rather than left permanently unmet. See FORK.md for the posture and the
+   accepted costs.
+
+   The decision was made against measured numbers, not in the abstract:
+   five days after the fork point upstream was **107 commits and 300 files
+   ahead**, overlapping **29** of our files — concentrated in exactly the
+   ~5k-line files the risk table named (`pool.rs`, `ingest.rs`, `req.rs`,
+   `kind.rs`, `migration.rs`) — with **no migration-number collision yet**.
+   D35's additive discipline demonstrably worked: 144 files touched, only
+   29 colliding.
+
+   **The risk is now taken, not managed.** Upstream fixes, including
+   security fixes, no longer arrive in code this fork depends on but does
+   not maintain; bringing one in is a deliberate cherry-pick. That is a
+   real, permanent exposure and it is accepted knowingly — which is the
+   point of deciding rather than continuing to drift while the documents
+   claimed a cadence that had never once run.
 2. **`mobile/` is outside declared scope, and `0a5d9d9b` went there
    anyway.** Phase 0 excludes desktop/mobile/web/admin-web from our CI
    ("trees stay in-tree, unbuilt"), and `mobile/lib/shared/crypto/nip44.dart`
