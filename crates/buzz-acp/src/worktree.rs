@@ -1265,3 +1265,141 @@ mod probe_tests {
         assert!(err.contains("no commits"), "clear empty-repo error: {err}");
     }
 }
+
+/// The auth path, against a live relay forge.
+///
+/// This is the gap the module doc names: every `probe_tests` case passes a
+/// `repo_url_override`, which is exactly the branch that skips
+/// `auth_cli_flags` and `apply_push_auth`, so a local bare repo proves the
+/// git mechanics and nothing about credentials. The reverted wiring
+/// prototype cloned unauthenticated and 401'd against every live relay, and
+/// this is the shape of test that would have caught it in seconds.
+///
+/// Deliberately end-to-end rather than mocked. Running it by hand is what
+/// found all three blockers the unit tests could never see — none of them a
+/// logic error:
+///
+/// - git older than **2.46** never answers the credential helper, so the
+///   clone falls through to `could not read Username`;
+/// - a relay bound to a specific address cannot reach its own policy
+///   endpoint over loopback, so the pre-receive hook rejects every push;
+/// - a shadowed `wc` makes that fail-closed hook reject every push with
+///   `unknown option '-l'`.
+///
+/// Each failure surfaces here as a plain assertion failure with the git
+/// error attached, which is the point: they are otherwise invisible,
+/// because worktree operations are best-effort so git can never fail an
+/// agent's turn.
+///
+/// ```text
+/// BUZZ_ACP_FORGE_PROBE=1 \
+/// BUZZ_RELAY_URL=ws://<host>:<port> \
+/// BUZZ_ACP_PROBE_AGENT_SK=<64-hex agent secret> \
+/// BUZZ_ACP_PROBE_CHANNEL=<channel uuid with a bound repo> \
+/// BUZZ_AUTH_TAG='<NIP-OA auth tag json>' \
+/// PATH="<brew-git-2.46+>:<repo>/target/release:$PATH" \
+///   cargo test -p buzz-acp --lib worktree::forge_probe_tests -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod forge_probe_tests {
+    use super::*;
+
+    /// Fixed so repeated runs reuse one branch instead of littering the
+    /// channel repo with a new `sm/thread/*` ref per run.
+    const PROBE_ROOT: &str = "9704be00000000000000000000000000000000000000000000000000000000fe";
+
+    #[tokio::test]
+    #[ignore = "requires a live relay + git>=2.46 + git-credential-nostr; BUZZ_ACP_FORGE_PROBE=1"]
+    async fn authenticated_clone_and_push_against_the_relay_forge() {
+        if std::env::var("BUZZ_ACP_FORGE_PROBE").as_deref() != Ok("1") {
+            eprintln!("skipping: set BUZZ_ACP_FORGE_PROBE=1");
+            return;
+        }
+        let relay_url = std::env::var("BUZZ_RELAY_URL").expect("BUZZ_RELAY_URL");
+        let sk_hex = std::env::var("BUZZ_ACP_PROBE_AGENT_SK").expect("BUZZ_ACP_PROBE_AGENT_SK");
+        let channel: Uuid = std::env::var("BUZZ_ACP_PROBE_CHANNEL")
+            .expect("BUZZ_ACP_PROBE_CHANNEL")
+            .parse()
+            .expect("channel uuid");
+        let auth_tag = std::env::var("BUZZ_AUTH_TAG").ok();
+
+        let keys = nostr::Keys::parse(&sk_hex).expect("agent key");
+        let rest = crate::relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: crate::relay::relay_ws_to_http(&relay_url),
+            keys: keys.clone(),
+            auth_tag_json: auth_tag.clone(),
+        };
+
+        // Resolve the binding the way production does, so a probe failure
+        // also covers "the relay stopped advertising what we depend on".
+        let relay_self = rest
+            .relay_self_pubkey()
+            .await
+            .expect("relay must advertise NIP-11 `self`");
+        let filter = nostr::Filter::new().kind(nostr::Kind::Custom(30617));
+        let events: Vec<serde_json::Value> = rest
+            .query(std::slice::from_ref(&filter))
+            .await
+            .expect("30617 query")
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let (repo_owner, repo_name) = repo_binding_from_events(&events, channel, &relay_self)
+            .expect("channel must have a relay-signed repo binding");
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let wt = ThreadWorktrees::new(
+            tmp.path().to_path_buf(),
+            keys.public_key().to_hex(),
+            sk_hex.clone(),
+            &relay_url,
+            auth_tag,
+        );
+
+        // No `repo_url_override` — this is the whole point of the probe.
+        let binding = wt
+            .ensure_worktree(channel, &repo_owner, &repo_name, PROBE_ROOT, None)
+            .await
+            .expect("authenticated clone + worktree");
+        assert_eq!(binding.branch, thread_branch(PROBE_ROOT));
+        assert!(binding.path.join(".git").exists(), "worktree is a checkout");
+
+        // A clean tree must not manufacture a commit.
+        assert_eq!(
+            wt.checkpoint(&binding).await.expect("clean checkpoint"),
+            CheckpointOutcome::NothingToCommit,
+            "an unchanged worktree must not produce a checkpoint"
+        );
+
+        // Now change something and push it for real.
+        let stamp = nostr::Timestamp::now().as_secs();
+        std::fs::write(
+            binding.path.join("FORGE-PROBE.md"),
+            format!("authenticated push probe {stamp}\n"),
+        )
+        .expect("write probe file");
+
+        match wt.checkpoint(&binding).await.expect("authenticated push") {
+            CheckpointOutcome::Committed { commit, branch } => {
+                assert_eq!(branch, thread_branch(PROBE_ROOT));
+                assert!(
+                    (commit.len() == 40 || commit.len() == 64)
+                        && commit.chars().all(|c| c.is_ascii_hexdigit()),
+                    "checkpoint must name a full oid, got {commit:?}"
+                );
+                eprintln!("pushed {commit} to {branch}");
+            }
+            CheckpointOutcome::NothingToCommit => {
+                panic!("a modified worktree must produce a commit")
+            }
+        }
+
+        // Re-entry must reuse the same worktree rather than re-clone.
+        let again = wt
+            .ensure_worktree(channel, &repo_owner, &repo_name, PROBE_ROOT, None)
+            .await
+            .expect("idempotent re-entry");
+        assert_eq!(again.path, binding.path);
+    }
+}
