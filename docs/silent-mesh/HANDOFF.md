@@ -756,11 +756,20 @@ no remaining follow-ups.
    what its operator can read. None of that exists. What is left, in
    dependency order — the first three are roadmap Phase 3 scope that this
    file previously did not track at all:
-   - **Content Seals (D31)** — registry, workspace sweep, ingestion guards,
-     delivery redaction envelopes, gateway resolution/scrub, mandatory-
-     redaction integration with the gate. **Zero code**: no
-     `content_seal`/`ContentSeal` anywhere in `crates/`. The only "seal" in
-     this document is MeshVault's Secure Enclave, which is unrelated.
+   - **Content Seals (D31)** — **slice 1 shipped** (`c0794f7b`,
+     2026-08-06): kind:47100 allocated (owner-signed announcement, label +
+     min tier, **never the literal** — events fan out to every tier) and
+     `buzz_core::seal`, the pure half: `[sm-seal:<16-hex>]` tokens
+     (ASCII, diff/merge-safe per the risk table), strict token parsing,
+     server-side literal detection whose hits never echo the value,
+     longest-first redaction (containment-safe), and `violating_seals` as
+     the single home of the tier rule. Mutation-checked one kill per
+     property. **Remaining slices**: the relay registry (owner-only writes,
+     literal stored server-side — the approvals-API shape, since the
+     literal cannot ride an event), the ingest guard (a raw sealed value
+     pasted below its tier is refused — the exit-criterion clause),
+     workspace sweep, delivery redaction envelopes, gateway scrub, and gate
+     integration.
    - **Retrieval foundation (D37)** — pgvector + a continuous owned-tier
      embedding pipeline, ACL-scoped search over buzz-search FTS, retrieval
      tools for copilot and harness agents. **Not started**: `pg_extension`
