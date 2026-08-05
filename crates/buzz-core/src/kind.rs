@@ -641,6 +641,17 @@ pub const KIND_WORK_THREAD_GATE_REVIEW: u32 = 47022;
 /// new leak path. Relay-only.
 pub const KIND_WORK_THREAD_GATE_REVIEWED: u32 = 47023;
 
+// Content Seals (47100–47109 — Silent Mesh, D31)
+/// A seal exists: owner-signed, addressable (`d` = the seal's 16-hex id),
+/// carrying the label and minimum tier — and **never the sealed literal**.
+///
+/// The literal lives server-side only (D31: "server-side-only literal
+/// matching"): events fan out to every member of every tier, so a literal in
+/// any event would republish the exact value the seal exists to contain.
+/// Clients render the token and the label; only the relay can match text
+/// against the value itself.
+pub const KIND_SEAL_ANNOUNCE: u32 = 47100;
+
 // System / admin custom range (48000–48999)
 /// An audit log entry was recorded.
 pub const KIND_AUDIT_ENTRY: u32 = 48001;
@@ -784,6 +795,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_WORK_THREAD_PROMOTE,
     KIND_WORK_THREAD_GATE_REVIEW,
     KIND_WORK_THREAD_GATE_REVIEWED,
+    KIND_SEAL_ANNOUNCE,
     KIND_AGENT_TURN_METRIC,
     KIND_AGENT_TURN_ATTRIBUTION,
     KIND_WORKFLOW_DEF,
