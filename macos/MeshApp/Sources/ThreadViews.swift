@@ -124,8 +124,127 @@ struct ThreadComposer: View {
     }
 }
 
+/// One turn's changes, as published by the harness (kind:40008).
+///
+/// This is where a member decides whether to trust what an agent did, so
+/// the card leans the same way the fold does: strict about attribution,
+/// explicit about omission. Every line is shown under the file it belongs
+/// to with its real line number, and a truncated diff says so — a cut diff
+/// that presents as complete invites the reader to conclude the agent
+/// changed less than it did.
+struct TurnDiffCard: View {
+    let diff: MeshTurnDiff
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "plus.forwardslash.minus")
+                    .foregroundStyle(.blue)
+                Text(diff.note ?? "Turn changes")
+                    .font(.caption.weight(.semibold))
+                Text(String(diff.commit.prefix(8)))
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .help("The commit this turn pushed — the same oid its checkpoint records.")
+                if diff.truncated {
+                    Label("truncated", systemImage: "exclamationmark.triangle")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .help(
+                            "The turn changed more than fits in one event. "
+                                + "The full change is on the thread branch.")
+                }
+                Spacer(minLength: 6)
+                Text("+\(diff.additions)")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.green)
+                Text("−\(diff.deletions)")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.red)
+            }
+            ForEach(Array(diff.files.enumerated()), id: \.offset) { _, file in
+                DiffFileView(file: file)
+            }
+        }
+    }
+}
+
+private struct DiffFileView: View {
+    let file: MeshDiffFile
+
+    private var statusBadge: (String, Color)? {
+        switch file.status {
+        case .added: return ("new file", .green)
+        case .deleted: return ("deleted", .red)
+        case .renamed(let from): return ("renamed from \(from)", .orange)
+        case .modified: return nil
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Text(file.path)
+                    .font(.caption.monospaced().weight(.medium))
+                    .textSelection(.enabled)
+                if let badge = statusBadge {
+                    Text(badge.0)
+                        .font(.caption2)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(badge.1.opacity(0.15), in: Capsule())
+                        .foregroundStyle(badge.1)
+                }
+                Spacer()
+            }
+            .padding(.vertical, 4)
+            // Lazy because a turn can legitimately touch hundreds of lines,
+            // and the whole detail view is already inside a ScrollView.
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(file.lines.enumerated()), id: \.offset) { _, line in
+                    DiffLineView(line: line)
+                }
+            }
+        }
+    }
+}
+
+private struct DiffLineView: View {
+    let line: MeshDiffLine
+
+    private var marker: (String, Color, Color) {
+        switch line.kind {
+        case .added: return ("+", .green, Color.green.opacity(0.10))
+        case .removed: return ("−", .red, Color.red.opacity(0.10))
+        case .context: return (" ", .secondary, .clear)
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 6) {
+            // One number per line, from the side it exists on. A removed
+            // line has no new-side number and must not borrow one.
+            Text((line.newLine ?? line.oldLine).map(String.init) ?? "")
+                .font(.caption2.monospaced())
+                .foregroundStyle(.tertiary)
+                .frame(width: 34, alignment: .trailing)
+            Text(marker.0)
+                .font(.caption.monospaced())
+                .foregroundStyle(marker.1)
+            Text(line.text.isEmpty ? " " : line.text)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.vertical, 1)
+        .background(marker.2)
+    }
+}
+
 struct ThreadDetailView: View {
     let thread: MeshThread
+    var diffs: [MeshTurnDiff] = []
     var model: WorkspaceModel?
 
     var body: some View {
@@ -210,6 +329,20 @@ struct ThreadDetailView: View {
                                         .font(.caption.monospaced())
                                         .textSelection(.enabled)
                                 }
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+
+                if !diffs.isEmpty {
+                    // What the agent actually changed, turn by turn — the
+                    // evidence behind the checkpoint list above. Oldest
+                    // first, matching the checkpoint order.
+                    GroupBox("Changes") {
+                        VStack(alignment: .leading, spacing: 12) {
+                            ForEach(Array(diffs.enumerated()), id: \.offset) { _, diff in
+                                TurnDiffCard(diff: diff)
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)

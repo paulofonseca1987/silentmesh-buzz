@@ -40,6 +40,12 @@ final class WorkspaceModel: ObservableObject {
     @Published private(set) var identity: String = ""
     @Published var selectedChannel: String?
     @Published private(set) var threads: [MeshThread] = []
+    /// Per-turn diffs by thread root, in turn order (oldest first, matching
+    /// the checkpoint trail they annotate). Loaded with the threads: a diff
+    /// is a kind:40008 the harness publishes beside each kind:47010, and it
+    /// carries the channel's `h` tag, so the same channel-scoped query
+    /// returns both.
+    @Published private(set) var threadDiffs: [String: [MeshTurnDiff]] = [:]
     @Published var selectedThread: String?
     /// The relay's own words when it refuses something. Silent Mesh
     /// refuses for reasons a member needs to read — a tier mismatch, the
@@ -284,6 +290,10 @@ final class WorkspaceModel: ObservableObject {
                 MeshKind.workThreadOverdue, MeshKind.workThreadCanon,
                 MeshKind.workThreadSiblingArchived, MeshKind.workThreadPromoted,
                 MeshKind.workThreadGateReviewed,
+                // A turn's diff lands seconds after its checkpoint; without
+                // this the changes only appear on the next manual reload,
+                // which reads as "the agent did nothing".
+                MeshKind.streamMessageDiff,
                 // An agent asking permission is blocked until someone
                 // answers, so this is the one push that must not wait for a
                 // reload to be noticed.
@@ -336,10 +346,12 @@ final class WorkspaceModel: ObservableObject {
         default:
             break
         }
-        if MeshKind.isWorkThread(event.kind) {
+        if MeshKind.isWorkThread(event.kind) || event.kind == MeshKind.streamMessageDiff {
             // Thread state is a fold over many events, so re-fold rather
             // than trying to patch it in place — a partial application is
             // how a client ends up showing a state the relay never had.
+            // Diffs ride the same reload: they annotate that fold's
+            // checkpoint trail, and loadThreads is what builds them.
             await loadThreads(channel: channel)
             return
         }
@@ -592,16 +604,33 @@ final class WorkspaceModel: ObservableObject {
             MeshKind.workThreadSiblingArchived, MeshKind.workThreadPromoted,
             MeshKind.workThreadFork, MeshKind.workThreadPromote,
             MeshKind.workThreadGateReviewed,
+            MeshKind.streamMessageDiff,
         ]
         do {
             let events = try await client.query(
                 MeshFilter(kinds: kinds, limit: 500, tags: ["#h": [channel]]))
+            // The thread fold gets only the kinds it speaks; handing it the
+            // diffs too would make its behaviour on unknown kinds part of
+            // this view's correctness, which is a dependency nobody asked
+            // for.
+            let diffEvents = events.filter { $0.kind == MeshKind.streamMessageDiff }
+            let threadEvents = events.filter { $0.kind != MeshKind.streamMessageDiff }
             // Newest first, ties by id — re-sorting without the tie-break
             // would throw away the deterministic order the fold just
             // established, since `sort` is not stable.
-            threads = MeshFold.threads(from: events).sorted {
+            threads = MeshFold.threads(from: threadEvents).sorted {
                 $0.createdAt != $1.createdAt ? $0.createdAt > $1.createdAt : $0.id < $1.id
             }
+            // Oldest first: the diffs annotate the checkpoint trail, which
+            // reads in the order the turns happened. Same tie-break rule as
+            // everywhere else — anything sharing a second is otherwise free
+            // to swap between two loads of the same channel.
+            let ordered = diffEvents.sorted {
+                $0.createdAt != $1.createdAt ? $0.createdAt < $1.createdAt : $0.id < $1.id
+            }
+            threadDiffs = Dictionary(
+                grouping: ordered.compactMap(MeshTurnDiff.from(event:)),
+                by: { $0.threadRoot ?? "" })
             FileHandle.standardError.write(
                 Data("mesh: threads query -> \(events.count) events, \(threads.count) threads\n".utf8))
             if let selected = selectedThread, !threads.contains(where: { $0.id == selected }) {

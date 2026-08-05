@@ -285,7 +285,13 @@ struct ContentView: View {
                 if let selectedThread = model.selectedThread,
                     let thread = model.threads.first(where: { $0.id == selectedThread })
                 {
-                    ThreadDetailView(thread: thread, model: model)
+                    // Diffs ride in as a value, like `thread` itself: this
+                    // view observes the model, so state its children render
+                    // must flow through here to re-render when it changes.
+                    ThreadDetailView(
+                        thread: thread,
+                        diffs: model.threadDiffs[thread.id] ?? [],
+                        model: model)
                     // A thread without this is read-only: the channel
                     // composer is hidden while one is open, so there would
                     // be no way to speak in it — or to summon an agent.

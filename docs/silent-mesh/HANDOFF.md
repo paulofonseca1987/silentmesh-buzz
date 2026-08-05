@@ -811,12 +811,21 @@ no remaining follow-ups.
      `+3` count, per-line numbering, and non-ASCII intact. Every tag the
      publisher emits is consumed by a renderer that predates it.
 
-     So the remaining work is a `MeshProtocol` fold plus a thread-view row.
-     Note the contract is **verified but not regression-locked**: the lock
-     belongs in the Swift client's fold tests, not in a desktop spec — the
-     desktop is inherited, unbuilt and unmaintained under D35/D36, and
-     adding tests there would be investing in a tree we have declared we do
-     not maintain.
+     ~~So the remaining work is a `MeshProtocol` fold plus a thread-view
+     row.~~ **Both shipped.** `dea0167d` added `MeshTurnDiff` (the fold,
+     10 tests incl. the real turn's bytes as fixture, plus the kind-parity
+     entry); the thread-view row followed and was verified **live**: the
+     Mac app, launched headlessly against the testbed relay, rendered the
+     real kind:40008 in the thread detail — commit chip, `+3 −0`, NEW FILE
+     badge, numbered added lines — with the Changes card's commit matching
+     the Checkpoints list's oid, which is the tie the design demanded. The
+     fold's tests are the regression lock the desktop deliberately does not
+     provide (that tree is unmaintained under D35/D36).
+
+     AX-automation note for the next screenshot: the threads outline's row
+     indices count section headers and the composer row — "first visible
+     thread" was row **6**, not row 1. Enumerate rows via AX before
+     selecting rather than trusting visual order.
    - **Streaming needs an owner binding**, not client work: kind:24200 is
      NIP-44-encrypted to the agent's owner and p-gated, so the Mac sees
      nothing until its member key is bound as that agent's owner.
