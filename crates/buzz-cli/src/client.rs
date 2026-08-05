@@ -849,6 +849,41 @@ impl BuzzClient {
         .await
     }
 
+    /// POST a JSON body to an authenticated relay API endpoint.
+    ///
+    /// NIP-98 is re-signed per attempt like every other authed call — the
+    /// nonce tag gives each retry a fresh event id past the replay guard.
+    pub async fn post_authed(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<String, CliError> {
+        let url = format!("{}{path}", self.relay_url);
+        let bytes = bytes::Bytes::from(
+            serde_json::to_vec(body)
+                .map_err(|e| CliError::Other(format!("body serialization failed: {e}")))?,
+        );
+        self.with_retry_body(|| {
+            let url = url.clone();
+            let bytes = bytes.clone();
+            async move {
+                let auth = sign_nip98(&self.keys, "POST", &url, Some(&bytes))?;
+                let resp = self
+                    .with_auth_tag(
+                        self.http
+                            .post(&url)
+                            .header("Authorization", auth)
+                            .header("Content-Type", "application/json")
+                            .body(bytes),
+                    )
+                    .send()
+                    .await?;
+                self.handle_response(resp).await
+            }
+        })
+        .await
+    }
+
     /// Submit a signed Nostr event via POST /events.
     ///
     /// For non-idempotent moderation command kinds (9040–9044), an ambiguous

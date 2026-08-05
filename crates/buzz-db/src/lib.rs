@@ -53,6 +53,7 @@ pub mod relay_invite;
 pub mod relay_members;
 /// Replica freshness fence for keyset-cursor read routing.
 pub mod replica_fence;
+pub mod seal;
 /// Thread metadata persistence.
 pub mod thread;
 /// Per-community usage rollup queries for Prometheus gauges.
@@ -3008,6 +3009,19 @@ impl Db {
         owner_pubkey: &[u8],
     ) -> Result<Option<Uuid>> {
         personal_channel::get_personal_channel_for(&self.pool, community_id, owner_pubkey).await
+    }
+
+    /// Create one Content Seal (D31). Owner-only — enforced by the caller.
+    pub async fn create_seal(&self, params: seal::CreateSealParams<'_>) -> Result<()> {
+        seal::create_seal(&self.pool, params).await
+    }
+
+    /// Every sealed literal in the community — enforcement-side read only.
+    pub async fn load_sealed_literals(
+        &self,
+        community: CommunityId,
+    ) -> Result<Vec<buzz_core::seal::SealedLiteral>> {
+        seal::load_sealed_literals(&self.pool, community).await
     }
 
     /// Record one routed model request (D16 metering). Returns the row id.

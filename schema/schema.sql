@@ -1212,3 +1212,16 @@ INSERT INTO _operator_global_tables (table_name, reason) VALUES
     ('push_gateway_endpoint_quotas', 'public gateway endpoint abuse ceilings span relay communities'),
     ('push_gateway_delivery_auth_replays', 'public gateway signed-event replay admission spans relay communities'),
     ('push_gateway_delivery_request_replays', 'public gateway stable request-id admission spans relay communities');
+
+-- Content Seals (D31): the owner's registry. The literal lives here and
+-- only here — never in an event (server-side-only literal matching).
+CREATE TABLE content_seals (
+    community_id UUID NOT NULL REFERENCES communities(id),
+    id           TEXT NOT NULL CHECK (id ~ '^[0-9a-f]{16}$'),
+    label        TEXT NOT NULL CHECK (char_length(label) BETWEEN 1 AND 120),
+    literal      TEXT NOT NULL CHECK (char_length(literal) BETWEEN 1 AND 512),
+    min_tier     channel_tier NOT NULL,
+    created_by   BYTEA NOT NULL CHECK (length(created_by) = 32),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (community_id, id)
+);

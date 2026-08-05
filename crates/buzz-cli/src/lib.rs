@@ -212,6 +212,9 @@ enum Cmd {
     /// Read your own agent model usage — token totals and where they ran
     #[command(subcommand)]
     Usage(UsageCmd),
+    /// Content Seals — contain a literal to channels at or above a tier (owner-only create)
+    #[command(subcommand)]
+    Seals(SealsCmd),
     /// Publish notes and manage the social graph (NIP-01/02)
     #[command(subcommand)]
     Social(SocialCmd),
@@ -1266,6 +1269,28 @@ pub enum UsageCmd {
     },
 }
 
+/// Content Seals (D31). `create` sends the literal over authenticated HTTP
+/// to the relay's registry — never as an event — and is refused for anyone
+/// but the workspace Owner. `list` reads the relay-signed kind:47100
+/// announcements, which carry label and tier and never the literal.
+#[derive(Subcommand)]
+pub enum SealsCmd {
+    /// Seal a literal (owner-only)
+    Create {
+        /// What refusals will call it — must be safe to say anywhere
+        #[arg(long)]
+        label: String,
+        /// The exact value to contain (sent over authed HTTP, never an event)
+        #[arg(long)]
+        literal: String,
+        /// Loosest tier the literal may appear in: owned or private
+        #[arg(long)]
+        min_tier: String,
+    },
+    /// List seals — labels and tiers, never literals
+    List,
+}
+
 #[derive(Subcommand)]
 pub enum SocialCmd {
     /// Publish a text note (NIP-01 kind:1)
@@ -2112,6 +2137,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Workflows(sub) => commands::workflows::dispatch(sub, &client).await,
         Cmd::Feed(sub) => commands::feed::dispatch(sub, &client, &cli.format).await,
         Cmd::Usage(sub) => commands::usage::dispatch(sub, &client, &cli.format).await,
+        Cmd::Seals(sub) => commands::seals::dispatch(sub, &client, &cli.format).await,
         Cmd::Social(sub) => commands::social::dispatch(sub, &client).await,
         Cmd::Notes(sub) => commands::notes::dispatch(sub, &client).await,
         Cmd::Repos(sub) => commands::repos::dispatch(sub, &client).await,
@@ -2182,6 +2208,7 @@ mod tests {
             "pr",
             "reactions",
             "repos",
+            "seals",
             "social",
             "threads",
             "upload",

@@ -97,6 +97,9 @@ pub fn find_tokens(text: &str) -> Vec<TokenHit> {
 pub struct SealedLiteral {
     /// The seal's 16-hex id.
     pub id: String,
+    /// What refusals call it. Every enforcement point refuses by label —
+    /// the label is chosen to be sayable anywhere, the literal is not.
+    pub label: String,
     /// The exact value the seal contains. Never from an event.
     pub literal: String,
     /// The loosest tier the literal may appear in.
@@ -205,6 +208,7 @@ mod tests {
     fn seal(id: &str, literal: &str, min_tier: ChannelTier) -> SealedLiteral {
         SealedLiteral {
             id: id.to_owned(),
+            label: format!("label-{id}"),
             literal: literal.to_owned(),
             min_tier,
         }

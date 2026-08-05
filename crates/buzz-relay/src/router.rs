@@ -115,6 +115,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/approvals",
             post(api::approvals::create_approval).get(api::approvals::list_approvals),
         )
+        .route("/api/seals", post(api::seals::create_seal))
         .route(
             "/api/approvals/resolve",
             post(api::approvals::resolve_approval),

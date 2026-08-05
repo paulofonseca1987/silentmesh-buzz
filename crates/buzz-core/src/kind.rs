@@ -938,7 +938,8 @@ pub const fn is_command_kind(kind: u32) -> bool {
 pub const fn is_relay_only_kind(kind: u32) -> bool {
     matches!(
         kind,
-        KIND_NIP43_MEMBERSHIP_LIST
+        KIND_SEAL_ANNOUNCE
+            | KIND_NIP43_MEMBERSHIP_LIST
             | KIND_CHANNEL_SUMMARY
             | KIND_PRESENCE_SNAPSHOT
             | KIND_DM_VISIBILITY

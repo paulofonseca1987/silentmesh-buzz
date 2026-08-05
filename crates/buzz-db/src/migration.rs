@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 35);
+        assert_eq!(migrations.len(), 36);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1050,6 +1050,17 @@ mod tests {
             "team channels must still be refused a tier change",
         );
 
+        let content_seals = migrations[35].sql.as_str();
+        assert!(content_seals.contains("CREATE TABLE content_seals"));
+        assert!(
+            content_seals.contains("id ~ '^[0-9a-f]{16}$'"),
+            "seal ids must be shape-checked at the store, not only in Rust",
+        );
+        assert!(
+            content_seals.contains("min_tier     channel_tier NOT NULL"),
+            "seals must reuse the channel_tier enum, not a parallel one",
+        );
+
         let desired_schema = include_str!("../../../schema/schema.sql");
         assert!(
             desired_schema.contains("CREATE TABLE join_policy_acceptances"),
@@ -1062,6 +1073,10 @@ mod tests {
         assert!(
             desired_schema.contains("CREATE TABLE channel_repos"),
             "desired-state schema must include channel repo bindings",
+        );
+        assert!(
+            desired_schema.contains("CREATE TABLE content_seals"),
+            "desired-state schema must include the seal registry",
         );
         assert!(
             desired_schema.contains("CREATE TABLE work_threads"),
@@ -1337,7 +1352,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(35));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(36));
     }
 
     #[tokio::test]

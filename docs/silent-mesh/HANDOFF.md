@@ -764,12 +764,31 @@ no remaining follow-ups.
      server-side literal detection whose hits never echo the value,
      longest-first redaction (containment-safe), and `violating_seals` as
      the single home of the tier rule. Mutation-checked one kill per
-     property. **Remaining slices**: the relay registry (owner-only writes,
-     literal stored server-side — the approvals-API shape, since the
-     literal cannot ride an event), the ingest guard (a raw sealed value
-     pasted below its tier is refused — the exit-criterion clause),
-     workspace sweep, delivery redaction envelopes, gateway scrub, and gate
-     integration.
+     property.
+
+     **Slice 2 shipped the same night**: migration 0036 (`content_seals`,
+     community-fenced, the literal lives there and nowhere else), owner-only
+     `POST /api/seals` (403 for a workspace *admin* — verified live, the
+     sharper test than a mere member), relay-signed kind:47100
+     announcements (relay-only kind, so members cannot forge registry
+     entries), the **ingest guard**, and `buzz seals create|list`.
+
+     The exit-criterion clause ran live on the testbed: the same literal
+     was refused in an open channel — naming the seal's *label*, never the
+     value — and accepted in private and owned; the token passed where the
+     literal did not; `seals list` showed label and tier only. Owned
+     channels skip the seal query entirely (strictest tier — nothing can
+     violate there).
+
+     Honest gap from the live run: the forge-a-47100 test was blocked by
+     the **CLI's** --kind allowlist, not the relay, so the relay-side
+     refusal is pinned by a unit test on the relay-only kind set rather
+     than exercised end-to-end. A PG-gated ingest test for the guard
+     itself (channel row + seals + refusal) is worth adding.
+
+     **Remaining slices**: workspace sweep, delivery redaction envelopes
+     (stored history + fan-out), gateway scrub, gate integration, and seal
+     revocation (nothing deletes a seal yet).
    - **Retrieval foundation (D37)** — pgvector + a continuous owned-tier
      embedding pipeline, ACL-scoped search over buzz-search FTS, retrieval
      tools for copilot and harness agents. **Not started**: `pg_extension`

@@ -2241,6 +2241,70 @@ async fn ingest_event_inner(
         }
     }
 
+    // silent-mesh (D31): a raw sealed literal must not enter a channel
+    // looser than its seal's minimum tier. This is the ingestion guard —
+    // the exit criterion's "a raw-value paste is caught at ingestion".
+    //
+    // Placement: after membership (an outsider's paste is already refused
+    // above for the ordinary reason) and before storage, because a refusal
+    // after storage is not containment — the row would exist and fan-out
+    // would race the delete.
+    //
+    // Scope: channel-scoped kinds whose content is member-authored text.
+    // That includes edits (or the edit path re-introduces what the original
+    // was refused for) and diffs (an agent pasting a sealed value into a
+    // file would otherwise publish it through the diff event).
+    //
+    // Owned channels skip the seal query entirely: owned is the strictest
+    // tier, so no seal can be violated there and the workspace's most
+    // sensitive channels pay nothing for this guard.
+    if matches!(
+        kind_u32,
+        KIND_STREAM_MESSAGE
+            | KIND_STREAM_MESSAGE_V2
+            | KIND_STREAM_MESSAGE_EDIT
+            | KIND_STREAM_MESSAGE_DIFF
+            | KIND_FORUM_POST
+            | KIND_FORUM_COMMENT
+            | KIND_WORK_THREAD_OPEN
+    ) && !event.content.is_empty()
+    {
+        if let Some(row) = &channel_row {
+            let tier = row
+                .tier
+                .parse::<buzz_core::channel::ChannelTier>()
+                .unwrap_or(buzz_core::channel::ChannelTier::Owned);
+            if tier != buzz_core::channel::ChannelTier::Owned {
+                let seals = state
+                    .db
+                    .load_sealed_literals(tenant.community())
+                    .await
+                    .map_err(|e| IngestError::Internal(format!("error: seal load: {e}")))?;
+                let violating: Vec<buzz_core::seal::SealedLiteral> =
+                    buzz_core::seal::violating_seals(&seals, tier)
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                if let Some(hit) =
+                    buzz_core::seal::find_literals(&event.content, &violating).first()
+                {
+                    // Refuse by LABEL. The label was validated at creation
+                    // to be sayable anywhere; the literal, by definition,
+                    // is not — and this message travels into the very
+                    // channel the value is barred from.
+                    let label = violating
+                        .iter()
+                        .find(|s| s.id == hit.id)
+                        .map(|s| s.label.as_str())
+                        .unwrap_or("a sealed value");
+                    return Err(IngestError::AuthFailed(format!(
+                        "restricted: \"{label}\" is sealed and may not appear in a {tier} channel"
+                    )));
+                }
+            }
+        }
+    }
+
     // Handled directly — these mutate relay_members and do NOT get stored.
     // The handler enforces the durable community ban itself: the write-path
     // gate above exempts relay-admin kinds so timed-out admins keep their
@@ -3899,6 +3963,21 @@ mod tests {
             .tags(nostr_tags)
             .sign_with_keys(&keys)
             .unwrap()
+    }
+
+    /// silent-mesh D31: a seal announcement is the relay's record and only
+    /// the relay's. A member-authored kind:47100 would let anyone invent
+    /// seals — phantom labels, wrong tiers — and clients render these as
+    /// the registry, so the forgery would *look* authoritative. The generic
+    /// relay-only refusal at ingest is the enforcement; this pins 47100's
+    /// membership in that set, because the live CLI test could not reach it
+    /// (the CLI's own --kind allowlist refuses first, which proves nothing
+    /// about the relay).
+    #[test]
+    fn seal_announcements_are_relay_only() {
+        assert!(buzz_core::kind::is_relay_only_kind(
+            buzz_core::kind::KIND_SEAL_ANNOUNCE
+        ));
     }
 
     /// silent-mesh D30: a gate review (47022) must name exactly one thread
