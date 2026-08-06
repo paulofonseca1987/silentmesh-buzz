@@ -193,6 +193,92 @@ pub async fn create_seal(
 /// `truncated`.
 const SWEEP_LIMIT: i64 = 500;
 
+#[derive(serde::Deserialize)]
+struct RevokeSealBody {
+    /// The 16-hex id of the seal to revoke.
+    seal_id: String,
+}
+
+/// `POST /api/seals/revoke` — revoke a seal. Owner-only, like creation:
+/// a seal binds every channel in the workspace, so only the authority that
+/// could impose it may lift it (D42).
+///
+/// Revocation means "this value no longer binds anything from now on" —
+/// the literal is hard-deleted (it is the most sensitive value the relay
+/// stores, and after revocation retaining it is pure liability), and every
+/// enforcement point stops seeing it on its next read. It does NOT mean
+/// "unpublish": stored tokens keep standing as text, and history the seal
+/// once refused stays as it was. Rewriting history is deep seal (D32) and
+/// deliberately out of scope here.
+pub async fn revoke_seal(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let (tenant, pubkey) =
+        authenticate(&state, &headers, "POST", "/api/seals/revoke", Some(&body)).await?;
+
+    let revoker_hex = pubkey.to_hex();
+    let is_owner = state
+        .db
+        .get_relay_member(tenant.community(), &revoker_hex)
+        .await
+        .map_err(|e| internal_error(&format!("relay member lookup: {e}")))?
+        .is_some_and(|m| m.role == "owner");
+    if !is_owner {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "sealing is the workspace Owner's alone",
+        ));
+    }
+
+    let body: RevokeSealBody = serde_json::from_slice(&body)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid body: {e}")))?;
+    let id = body.seal_id.trim().to_ascii_lowercase();
+    if !buzz_core::seal::is_valid_id(&id) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "seal_id must be 16 lowercase hex characters",
+        ));
+    }
+
+    let revoked = state
+        .db
+        .revoke_seal(tenant.community(), &id)
+        .await
+        .map_err(|e| internal_error(&format!("seal revoke: {e}")))?;
+    let Some(revoked) = revoked else {
+        return Err(api_error(StatusCode::NOT_FOUND, "no such seal"));
+    };
+
+    // The revocation announcement: a second kind:47100 under the same `d`,
+    // carrying the same public fields plus `revoked: true`. 47100 is not a
+    // replaceable kind, so both events exist and readers take the newest —
+    // which also means the registry's history (sealed, then revoked, when,
+    // by whom) stays reconstructible from events alone. Best-effort like
+    // the creation announcement: enforcement already stopped when the row
+    // died, and a failed announcement must not resurrect it.
+    let min_tier = revoked
+        .min_tier
+        .parse::<ChannelTier>()
+        .unwrap_or(ChannelTier::Private);
+    emit_seal_announce_full(
+        &state,
+        &tenant,
+        &id,
+        &revoked.label,
+        min_tier,
+        &revoker_hex,
+        true,
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "seal_id": id,
+        "revoked": true,
+    })))
+}
+
 /// Publish the relay-signed kind:47100 announcement — the member-visible
 /// record. Carries the id, label, tier and creator; **never the literal**.
 ///
@@ -208,6 +294,22 @@ async fn emit_seal_announce(
     min_tier: ChannelTier,
     creator_hex: &str,
 ) {
+    emit_seal_announce_full(state, tenant, id, label, min_tier, creator_hex, false).await;
+}
+
+/// The full announcement shape: `revoked: false` is a creation, `true` a
+/// revocation. Split so the two call sites cannot drift apart in tags or
+/// content — a reader deduping by `d` must be able to trust that every
+/// 47100 for one seal has the same shape.
+async fn emit_seal_announce_full(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    id: &str,
+    label: &str,
+    min_tier: ChannelTier,
+    creator_hex: &str,
+    revoked: bool,
+) {
     let tags: Result<Vec<Tag>, _> = [["d", id], ["tier", min_tier.as_str()], ["p", creator_hex]]
         .into_iter()
         .map(Tag::parse)
@@ -222,6 +324,7 @@ async fn emit_seal_announce(
     let content = serde_json::json!({
         "label": label,
         "min_tier": min_tier.as_str(),
+        "revoked": revoked,
     });
     let event =
         match EventBuilder::new(Kind::Custom(KIND_SEAL_ANNOUNCE as u16), content.to_string())

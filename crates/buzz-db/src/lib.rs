@@ -3016,6 +3016,17 @@ impl Db {
         seal::create_seal(&self.pool, params).await
     }
 
+    /// Revoke one seal (D31): hard-delete the literal, return what it was.
+    /// `None` if no such seal exists in this community. Owner-only —
+    /// enforced by the caller, like [`Db::create_seal`].
+    pub async fn revoke_seal(
+        &self,
+        community: CommunityId,
+        id: &str,
+    ) -> Result<Option<seal::RevokedSeal>> {
+        seal::revoke_seal(&self.pool, community, id).await
+    }
+
     /// Where a sealed literal already appears in stored events (D31 sweep).
     /// Returns counts and channels only — never the matched text.
     pub async fn sweep_sealed_literal(

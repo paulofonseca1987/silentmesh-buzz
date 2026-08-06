@@ -965,11 +965,46 @@ no remaining follow-ups.
      signature. That decision is yours, not something to settle by
      implementation.
 
+     **Slice 8 is revocation — the OFF switch.** `POST /api/seals/revoke`
+     (owner-only, same authority that can impose a seal may lift it, D42),
+     `buzz seals revoke --seal-id <id>`, and a **hard delete**: the literal
+     is the most sensitive value the relay stores, and once the Owner says
+     it no longer binds, retaining it is pure liability. Enforcement stops
+     by construction — every enforcement point reads
+     `load_sealed_literals`, and a deleted row is absent from that read.
+     The PG test drives the real path: the same message the seal refused is
+     accepted after revocation, and a second revoke returns "no such seal"
+     rather than succeeding idempotently.
+
+     kind:47100 is not replaceable, so revocation publishes a **second**
+     announcement under the same `d` with `revoked: true` — the registry's
+     history (sealed, then revoked, when, by whom) stays reconstructible
+     from events alone. `seals list` dedupes by seal id keeping the newest
+     (extracted into a pure, order-independent, mutation-checked function),
+     or a revoked seal would list twice and read as both live and dead.
+     What revocation does NOT do: rewrite history. Stored tokens keep
+     standing as text; unpublishing is deep seal (D32 / open question 10).
+
+     Honest gap: the HTTP layer (route, NIP-98 on the new path, owner 403,
+     announcement emission) is structurally a copy of create's — which was
+     live-verified in slice 2 — but was not itself live-validated, because
+     **the testbed bootstrap was wiped this same night** (see below).
+
      What remains for D31: remediation for what the sweep finds (blocked on
-     open question 10), gate integration, revocation (nothing deletes a seal
-     yet), a re-sweep endpoint for checking after cleanup, and the
-     client-side placeholder rendering that completes the exit criterion's
-     "renders as a placeholder in `open`".
+     open question 10), gate integration, a re-sweep endpoint for checking
+     after cleanup, and the client-side placeholder rendering that completes
+     the exit criterion's "renders as a placeholder in `open`".
+
+     **Testbed state warning (2026-08-06 ~02:35):** running the full
+     `cargo test -p buzz-db --lib -- --ignored` suite during the gate audit
+     tripped the three destructive migration tests, which **drop and
+     recreate the dev schema**. The E2E testbed's bootstrap — community,
+     LOBBY/VAULT channels, WSADMIN membership, agent-owner user rows — is
+     gone (153 `.example` test communities remain); the testbed relay
+     process still runs over the empty schema and its binary predates
+     slices 3–8. Before the next live demo: rebuild, restart with
+     `~/.silentmesh-e2e/relay-e2e.env` + `BUZZ_UDS_PATH`, and re-run the
+     bootstrap order documented in the e2e-testbed memory.
    - **Retrieval foundation (D37)** — pgvector + a continuous owned-tier
      embedding pipeline, ACL-scoped search over buzz-search FTS, retrieval
      tools for copilot and harness agents. **Not started**: `pg_extension`

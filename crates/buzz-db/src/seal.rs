@@ -216,6 +216,58 @@ pub async fn load_sealed_literals(
     Ok(seals)
 }
 
+/// What a revoked seal was, for the revocation announcement. The label and
+/// tier are public already (they ride in the kind:47100 announcement);
+/// the literal is deliberately **not** here — it has just been erased and
+/// nothing downstream may need it.
+#[derive(Debug, Clone)]
+pub struct RevokedSeal {
+    /// The seal's public label.
+    pub label: String,
+    /// The tier the seal enforced, as its DB string.
+    pub min_tier: String,
+}
+
+/// Revoke one seal: a hard DELETE, returning what it was, or `None` if no
+/// such seal exists in this community.
+///
+/// Hard delete, not a `revoked_at` column, and that is a privacy decision:
+/// the literal is the most sensitive value the relay stores — the entire
+/// D31 design exists to keep it from travelling — and once the Owner says
+/// it no longer binds, retaining it is pure liability. Enforcement stops by
+/// construction: every enforcement point (ingest guard, thread metadata,
+/// promotion, gateway resolve/scrub) reads [`load_sealed_literals`], and a
+/// deleted row is simply absent from that read.
+///
+/// What revocation does NOT do: rewrite history. Tokens already stored keep
+/// standing as text, and content the seal once refused stays refused-then
+/// (deep seal / purge is D32 and the D-log's open question 10). Announcement
+/// lifecycle is the API layer's job — kind:47100 is not replaceable, so the
+/// relay publishes a second announcement with the same `d` and a revoked
+/// marker, and readers take the newest.
+pub async fn revoke_seal(
+    pool: &PgPool,
+    community: CommunityId,
+    id: &str,
+) -> Result<Option<RevokedSeal>> {
+    let row = sqlx::query(
+        "DELETE FROM content_seals \
+         WHERE community_id = $1 AND id = $2 \
+         RETURNING label, min_tier::text AS min_tier",
+    )
+    .bind(community.as_uuid())
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|r| -> Result<RevokedSeal> {
+        Ok(RevokedSeal {
+            label: r.try_get("label")?,
+            min_tier: r.try_get("min_tier")?,
+        })
+    })
+    .transpose()
+}
+
 #[cfg(test)]
 mod pg_tests {
     //! Postgres-gated: the workspace sweep against real stored events.

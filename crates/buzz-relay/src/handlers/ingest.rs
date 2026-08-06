@@ -3595,6 +3595,122 @@ mod tests {
             .expect("unsealed text is unaffected");
     }
 
+    /// Revocation is the OFF switch, and it must actually turn things off:
+    /// the same message the seal refused must be accepted after the seal is
+    /// revoked. Driven through `ingest_event` — the real enforcement path —
+    /// not by inspecting the table, because "the row is gone" and "the
+    /// guard stopped refusing" are only the same fact if every enforcement
+    /// point truly reads the table on every check.
+    ///
+    /// Also pins the return contract: revoking returns what the seal was
+    /// (label, tier — the public fields, never the literal), and revoking
+    /// again returns None rather than succeeding idempotently, so a caller
+    /// can tell "I turned it off" from "it was already off".
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn a_revoked_seal_stops_binding_immediately() {
+        use buzz_core::channel::{ChannelTier, ChannelType, ChannelVisibility, MemberRole};
+
+        let state = super::super::work_thread::pg_tests::test_state().await;
+        let owner = nostr::Keys::generate();
+        let member = nostr::Keys::generate();
+        let host = format!("seal-revoke-{}.example", Uuid::new_v4().simple());
+        let community = match state
+            .db
+            .create_community_with_owner(&host, &owner.public_key().to_hex())
+            .await
+            .expect("create community")
+        {
+            buzz_db::CreateCommunityWithOwnerResult::Created(rec) => rec.id,
+            other => panic!("expected fresh community, got {other:?}"),
+        };
+        let tenant = TenantContext::resolved(community, host);
+        for keys in [&owner, &member] {
+            state
+                .db
+                .ensure_user(community, keys.public_key().to_bytes().as_ref())
+                .await
+                .expect("ensure user");
+        }
+        state
+            .db
+            .create_seal(buzz_db::seal::CreateSealParams {
+                community_id: community,
+                id: "00112233445566ee",
+                label: "the northern client",
+                literal: "Aurora Dynamics GmbH",
+                min_tier: ChannelTier::Private,
+                created_by: owner.public_key().to_bytes().as_ref(),
+            })
+            .await
+            .expect("create seal");
+        let ch = state
+            .db
+            .create_channel_tiered(
+                community,
+                "open-ch",
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                ChannelTier::Open,
+                None,
+                &owner.public_key().to_bytes(),
+                None,
+            )
+            .await
+            .expect("create channel");
+        state
+            .db
+            .add_member(
+                community,
+                ch.id,
+                &member.public_key().to_bytes(),
+                MemberRole::Member,
+                None,
+            )
+            .await
+            .expect("add member");
+
+        let post = || {
+            let event = EventBuilder::new(
+                Kind::Custom(KIND_STREAM_MESSAGE as u16),
+                "notes: Aurora Dynamics GmbH wants Q3".to_owned(),
+            )
+            .tags([nostr::Tag::parse(["h", &ch.id.to_string()]).unwrap()])
+            .sign_with_keys(&member)
+            .expect("sign");
+            let auth = super::super::work_thread::pg_tests::http_auth(&member);
+            let state = &state;
+            let tenant = &tenant;
+            async move { ingest_event(state, tenant, event, auth).await }
+        };
+
+        // While the seal stands: refused.
+        post().await.expect_err("sealed literal must be refused");
+
+        // Revoke. The returned record carries the public fields only.
+        let revoked = state
+            .db
+            .revoke_seal(community, "00112233445566ee")
+            .await
+            .expect("revoke")
+            .expect("seal existed");
+        assert_eq!(revoked.label, "the northern client");
+        assert_eq!(revoked.min_tier, "private");
+
+        // The exact message that was refused is now accepted.
+        post()
+            .await
+            .expect("a revoked seal must stop binding immediately");
+
+        // A second revoke is a miss, not a silent success.
+        assert!(state
+            .db
+            .revoke_seal(community, "00112233445566ee")
+            .await
+            .expect("revoke")
+            .is_none());
+    }
+
     /// The guard covers channel-scoped kinds it was never explicitly told
     /// about. It used to be an allowlist of seven kinds, and the ones it
     /// silently omitted — fork goals, canvas documents, agent

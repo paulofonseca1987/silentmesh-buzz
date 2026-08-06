@@ -1289,6 +1289,13 @@ pub enum SealsCmd {
     },
     /// List seals — labels and tiers, never literals
     List,
+    /// Revoke a seal by id (owner-only). Stops enforcement; does not
+    /// rewrite history.
+    Revoke {
+        /// The 16-hex seal id (from `seals list`)
+        #[arg(long)]
+        seal_id: String,
+    },
 }
 
 #[derive(Subcommand)]
