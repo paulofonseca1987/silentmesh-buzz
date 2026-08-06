@@ -2012,6 +2012,197 @@ pub(crate) mod pg_tests {
     /// checkpoint validity, and the summary half of the Privacy Gate.
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn the_gate_review_names_seals_and_offers_the_tokenized_draft() {
+        use buzz_core::kind::{KIND_WORK_THREAD_GATE_REVIEW, KIND_WORK_THREAD_OPEN};
+
+        let state = test_state().await;
+        let ws_owner = nostr::Keys::generate();
+        let member = nostr::Keys::generate();
+        let host = format!("gate-seal-{}.example", Uuid::new_v4().simple());
+        let community = match state
+            .db
+            .create_community_with_owner(&host, &ws_owner.public_key().to_hex())
+            .await
+            .expect("create community")
+        {
+            CreateCommunityWithOwnerResult::Created(rec) => rec.id,
+            other => panic!("expected fresh community, got {other:?}"),
+        };
+        let tenant = TenantContext::resolved(community, host);
+        for keys in [&ws_owner, &member] {
+            state
+                .db
+                .ensure_user(community, keys.public_key().to_bytes().as_ref())
+                .await
+                .expect("ensure user");
+        }
+
+        // Two seals: one the draft trips, one only the conversation does.
+        // Both must surface — the summary hit because the member is about
+        // to carry it out, the conversation hit because that is where the
+        // next draft would come from.
+        for (id, label, literal) in [
+            (
+                "aa112233445566aa",
+                "the northern client",
+                "Aurora Dynamics GmbH",
+            ),
+            ("bb112233445566bb", "the codename", "Project Kestrel"),
+        ] {
+            state
+                .db
+                .create_seal(buzz_db::seal::CreateSealParams {
+                    community_id: community,
+                    id,
+                    label,
+                    literal,
+                    min_tier: buzz_core::channel::ChannelTier::Private,
+                    created_by: ws_owner.public_key().to_bytes().as_ref(),
+                })
+                .await
+                .expect("create seal");
+        }
+
+        let personal_id = Uuid::new_v4();
+        assert!(matches!(
+            state
+                .db
+                .create_personal_channel(
+                    community,
+                    personal_id,
+                    "my-space",
+                    ChannelType::Stream,
+                    None,
+                    &member.public_key().to_bytes(),
+                    None,
+                )
+                .await
+                .expect("create personal channel"),
+            buzz_db::personal_channel::CreatePersonalChannelResult::Created(_)
+        ));
+        let personal_hex = personal_id.to_string();
+
+        let root = signed_event(
+            &member,
+            KIND_WORK_THREAD_OPEN,
+            "private exploration",
+            &[tag(&["h", &personal_hex])],
+        );
+        crate::handlers::side_effects::handle_side_effects(
+            &tenant,
+            KIND_WORK_THREAD_OPEN,
+            &root,
+            &state,
+        )
+        .await
+        .expect("47000 side effect");
+        let root_hex = root.id.to_hex();
+
+        // A conversation message carrying the second seal's literal.
+        let chat = signed_event(
+            &member,
+            buzz_core::kind::KIND_STREAM_MESSAGE,
+            "we should fold Project Kestrel into this",
+            &[tag(&["e", &root_hex]), tag(&["h", &personal_hex])],
+        );
+        state
+            .db
+            .insert_event(community, &chat, Some(personal_id))
+            .await
+            .expect("store conversation message");
+
+        // The review request: draft trips the FIRST seal only.
+        let review = |draft: &str| {
+            signed_event(
+                &member,
+                KIND_WORK_THREAD_GATE_REVIEW,
+                draft,
+                &[tag(&["e", &root_hex]), tag(&["h", &personal_hex])],
+            )
+        };
+        let request = review("ready to share the Aurora Dynamics GmbH work");
+        run_gate_review(&tenant, &request, &state).await;
+
+        let notice_for = |req: &Event| {
+            let mut q = buzz_db::event::EventQuery::for_community(community);
+            q.channel_id = Some(personal_id);
+            q.kinds = Some(vec![buzz_core::kind::KIND_WORK_THREAD_GATE_REVIEWED as i32]);
+            let req_hex = hex::encode(req.id.to_bytes());
+            let state = &state;
+            async move {
+                let events = state.db.query_events(&q).await.expect("query notices");
+                events
+                    .into_iter()
+                    .find(|e| {
+                        e.event.tags.iter().any(|t| {
+                            let p = t.as_slice();
+                            p.len() >= 2 && p[0].as_str() == "req" && p[1].as_str() == req_hex
+                        })
+                    })
+                    .expect("review notice published")
+            }
+        };
+        let notice = notice_for(&request).await;
+        let body: serde_json::Value =
+            serde_json::from_str(&notice.event.content).expect("notice content is JSON");
+
+        // Both seals reported, each where it actually appeared, each with
+        // its own floor — and by LABEL.
+        let seals = body["seals"].as_array().expect("seals array");
+        let has = |label: &str, where_: &str| {
+            seals
+                .iter()
+                .any(|s| s["label"] == label && s["where"] == where_ && s["minTier"] == "private")
+        };
+        assert!(has("the northern client", "summary"), "{body}");
+        assert!(has("the codename", "conversation"), "{body}");
+        assert!(
+            !has("the northern client", "conversation"),
+            "the draft literal is not in the conversation: {body}"
+        );
+
+        // The offered draft carries the token where the literal was.
+        let sealed_draft = body["sealedDraft"].as_str().expect("sealedDraft present");
+        assert!(
+            sealed_draft.contains(&buzz_core::seal::token("aa112233445566aa")),
+            "{sealed_draft}"
+        );
+
+        // The absolute rule: the relay-signed notice never carries a
+        // literal, anywhere in its content — not in findings, not in the
+        // offered draft.
+        for literal in ["Aurora Dynamics GmbH", "Project Kestrel"] {
+            assert!(
+                !notice.event.content.contains(literal),
+                "review notice echoed a sealed literal: {}",
+                notice.event.content
+            );
+        }
+
+        // Control: a clean draft reports no seals and offers no draft —
+        // without this, the assertions above would also pass for a review
+        // that flags everything always.
+        let clean = review("ready to share the parser work");
+        run_gate_review(&tenant, &clean, &state).await;
+        let clean_body: serde_json::Value =
+            serde_json::from_str(&notice_for(&clean).await.event.content).expect("JSON");
+        assert_eq!(
+            clean_body["seals"].as_array().map(Vec::len),
+            Some(1),
+            "{clean_body}"
+        );
+        assert!(
+            clean_body["seals"][0]["where"] == "conversation",
+            "only the conversation hit remains for a clean draft: {clean_body}"
+        );
+        assert!(
+            clean_body["sealedDraft"].is_null(),
+            "a clean draft gets no substitute: {clean_body}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn promotion_authority_and_gate_validation() {
         use buzz_core::kind::KIND_WORK_THREAD_PROMOTE;
 
@@ -2511,6 +2702,32 @@ async fn run_gate_review(tenant: &TenantContext, event: &Event, state: &Arc<AppS
 
     let draft_summary = event.content.trim().to_owned();
     let deterministic = deterministic_findings(&draft_summary, &messages);
+
+    // silent-mesh (D31): the seal half of the pre-flight. Promotion will
+    // refuse a sealed literal at its own gate, but a refusal there is the
+    // member discovering the seal at the worst moment; the review's job is
+    // to say it now, and to hand over the fix — the draft with each
+    // literal already replaced by its token, which is safe at any
+    // destination tier.
+    //
+    // Deliberately ALL seals, not `violating_seals` against this channel's
+    // tier: the review runs in a personal channel, which is `owned`, where
+    // every literal is legal — filtering by the current tier would report
+    // nothing, ever. The question the member is asking is about the way
+    // OUT, and the destination is not known yet, so each finding carries
+    // the seal's own floor and the member picks a target accordingly.
+    let seals = match state.db.load_sealed_literals(tenant.community()).await {
+        Ok(s) => s,
+        Err(e) => {
+            // The review must not fail (same contract as the assist): a
+            // missing seal report reads as "unknown", and the promotion
+            // gate still stands behind it.
+            warn!("gate review: seal load failed: {e}");
+            Vec::new()
+        }
+    };
+    let (seal_findings, sealed_draft) = seal_findings(&draft_summary, &messages, &seals);
+
     let (findings, status, model_used, summary_vetting) = run_gate_assist(
         tenant,
         state,
@@ -2530,6 +2747,8 @@ async fn run_gate_review(tenant: &TenantContext, event: &Event, state: &Arc<AppS
         &event.id.to_bytes(),
         GateReviewOutcome {
             deterministic,
+            seal_findings,
+            sealed_draft,
             findings,
             status,
             model: model_used,
@@ -2538,6 +2757,55 @@ async fn run_gate_review(tenant: &TenantContext, event: &Event, state: &Arc<AppS
         },
     )
     .await;
+}
+
+/// Seal findings for the review: which sealed values appear in the draft
+/// or the conversation, each as `(label, min_tier, where)` — the label and
+/// floor are public (they ride in kind:47100 announcements); the literal
+/// never leaves this function. Deduped per (seal, where) and sorted, so
+/// the output is deterministic whatever the registry's order.
+///
+/// The second return is the redacted draft — every sealed literal replaced
+/// by its `[sm-seal:…]` token — and only when the draft itself had a hit:
+/// a "fixed" copy of an already-clean draft would invite pasting it over
+/// member text for no reason.
+fn seal_findings(
+    draft_summary: &str,
+    messages: &[buzz_core::StoredEvent],
+    seals: &[buzz_core::seal::SealedLiteral],
+) -> (Vec<(String, String, String)>, Option<String>) {
+    if seals.is_empty() {
+        return (Vec::new(), None);
+    }
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let mut push = |seal: &buzz_core::seal::SealedLiteral, where_: &str| {
+        let row = (
+            seal.label.clone(),
+            seal.min_tier.as_str().to_owned(),
+            where_.to_owned(),
+        );
+        if !out.contains(&row) {
+            out.push(row);
+        }
+    };
+    let draft_hits = buzz_core::seal::find_literals(draft_summary, seals);
+    for hit in &draft_hits {
+        if let Some(seal) = seals.iter().find(|s| s.id == hit.id) {
+            push(seal, "summary");
+        }
+    }
+    for m in messages {
+        for hit in buzz_core::seal::find_literals(&m.event.content, seals) {
+            if let Some(seal) = seals.iter().find(|s| s.id == hit.id) {
+                push(seal, "conversation");
+            }
+        }
+    }
+    out.sort();
+    let sealed_draft = (!draft_hits.is_empty())
+        .then(|| buzz_core::seal::redact(draft_summary, seals))
+        .map(|(text, _)| text);
+    (out, sealed_draft)
 }
 
 /// The `(source_root, channel)` a review targets, or `None` if the tags do
@@ -2728,6 +2996,11 @@ async fn self_check_summary(
 /// Everything the review found, ready to publish.
 struct GateReviewOutcome {
     deterministic: Vec<(String, String)>,
+    /// Sealed values present, as `(label, min_tier, where)` — never the
+    /// literal (D31).
+    seal_findings: Vec<(String, String, String)>,
+    /// The draft with sealed literals tokenized, when the draft had any.
+    sealed_draft: Option<String>,
     findings: sm_gateway::assist::ReviewFindings,
     status: sm_gateway::assist::AssistStatus,
     model: Option<String>,
@@ -2768,8 +3041,19 @@ async fn emit_gate_review_notice(
         .iter()
         .map(|(rule, where_)| serde_json::json!({ "rule": rule, "where": where_ }))
         .collect();
+    let seals: Vec<serde_json::Value> = outcome
+        .seal_findings
+        .iter()
+        .map(|(label, min_tier, where_)| {
+            serde_json::json!({ "label": label, "minTier": min_tier, "where": where_ })
+        })
+        .collect();
     let content = serde_json::json!({
         "deterministic": deterministic,
+        // D31: labels, floors and places only — this event fans out, and
+        // `sealedDraft` carries tokens where the literals were.
+        "seals": seals,
+        "sealedDraft": outcome.sealed_draft,
         "advisory": outcome.findings.advisory,
         "suggestedSummary": outcome.findings.suggested_summary,
         "assist": outcome.status.as_str(),

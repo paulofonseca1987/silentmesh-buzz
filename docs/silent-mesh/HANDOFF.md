@@ -990,10 +990,36 @@ no remaining follow-ups.
      live-verified in slice 2 — but was not itself live-validated, because
      **the testbed bootstrap was wiped this same night** (see below).
 
+     **Slice 9 is the gate integration** — the roadmap's
+     "mandatory-redaction integration with the gate". The D30 gate review
+     (kind:47022 → relay-signed 47023) now reports sealed values *before*
+     promotion instead of letting the member discover the seal as a
+     refusal at the worst moment. The 47023 carries a `seals` array —
+     `{label, minTier, where}` for every sealed literal found in the draft
+     summary or the thread conversation — and `sealedDraft`, the member's
+     draft with each literal already replaced by its token, offered only
+     when the draft itself had a hit.
+
+     Two decisions worth knowing. The review scans against **all** seals,
+     not `violating_seals` for the channel's tier: it runs in a personal
+     channel, which is `owned`, where every literal is legal — filtering by
+     the current tier would report nothing, ever. The member is asking
+     about the way OUT, the destination is unknown, so each finding carries
+     the seal's own floor and the member picks a target accordingly. And
+     the 47023 never carries a literal — labels, floors and places in the
+     findings; tokens in the offered draft — pinned by an assertion over
+     the entire notice content.
+
+     Mutations killed: disabling the scan, and the sharp one — `sealedDraft`
+     carrying the raw draft instead of the redacted one, which still
+     "reports the seal" and fails only the literal-absent assertion. A
+     clean-draft control pins that the review is not a flag-everything.
+
      What remains for D31: remediation for what the sweep finds (blocked on
-     open question 10), gate integration, a re-sweep endpoint for checking
-     after cleanup, and the client-side placeholder rendering that completes
-     the exit criterion's "renders as a placeholder in `open`".
+     open question 10), a re-sweep endpoint for checking after cleanup, and
+     the client-side placeholder rendering that completes the exit
+     criterion's "renders as a placeholder in `open`" (client work — the
+     relay side of D31 is now complete).
 
      **Testbed state warning (2026-08-06 ~02:35):** running the full
      `cargo test -p buzz-db --lib -- --ignored` suite during the gate audit
