@@ -188,6 +188,75 @@ pub fn redact(text: &str, seals: &[SealedLiteral]) -> (String, usize) {
     (out, count)
 }
 
+/// Replace every token whose seal is in `seals` with that seal's literal.
+/// Returns the resolved text and how many tokens were substituted.
+///
+/// The inverse of [`redact`], and the gateway's half of D31's
+/// "token-by-reference": a prompt written in an `open` channel carries
+/// tokens, and the value is put back only on the leg of the journey that is
+/// allowed to see it.
+///
+/// A token whose seal is **absent from `seals` is left standing**. That is
+/// the load-bearing behaviour, not an oversight: the caller passes only the
+/// seals permitted on this destination, so a barred seal's token survives
+/// into the request as a token. Silently dropping unknown tokens would turn
+/// a policy decision into a formatting quirk.
+///
+/// Single pass over [`find_tokens`]' offsets rather than repeated
+/// `str::replace`: substituted literals are never rescanned, so a literal
+/// that itself contains something token-shaped cannot be re-resolved by a
+/// later seal in the list.
+pub fn resolve(text: &str, seals: &[SealedLiteral]) -> (String, usize) {
+    let hits = find_tokens(text);
+    if hits.is_empty() {
+        return (text.to_owned(), 0);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut count = 0usize;
+    for hit in hits {
+        let Some(seal) = seals.iter().find(|s| s.id == hit.id) else {
+            // Left in place: the next copy picks it up verbatim.
+            continue;
+        };
+        out.push_str(&text[cursor..hit.offset]);
+        out.push_str(&seal.literal);
+        cursor = hit.offset + TOKEN_PREFIX.len() + ID_LEN + 1;
+        count += 1;
+    }
+    out.push_str(&text[cursor..]);
+    (out, count)
+}
+
+/// Split `seals` by whether their literal may travel to `backend`.
+/// Returns `(permitted, barred)`.
+///
+/// The rule composes the two policies rather than inventing a third: a
+/// literal may reach a backend exactly when a channel at the **seal's own**
+/// minimum tier would be allowed to use that backend. A seal at `private`
+/// therefore resolves into a TEE request and is scrubbed from a vendor one
+/// — which is D31's exit criterion stated as code.
+///
+/// Note it is the *seal's* tier that decides, not the channel's. The
+/// channel's tier already gated which backends are reachable at all; this
+/// asks the narrower question of whether this particular value may ride
+/// along, and a seal is by definition stricter than the room it is sitting
+/// in.
+///
+/// Returned as a partition rather than two independent filters so the two
+/// halves are exact complements by construction — a seal that fell into
+/// neither would be silently unenforced, and one in both would be resolved
+/// and scrubbed at once.
+pub fn partition_for_backend(
+    seals: &[SealedLiteral],
+    backend: crate::model_route::Backend,
+    purpose: crate::model_route::InferencePurpose,
+) -> (Vec<&SealedLiteral>, Vec<&SealedLiteral>) {
+    seals
+        .iter()
+        .partition(|s| crate::model_route::allowed_backends(s.min_tier, purpose).contains(&backend))
+}
+
 /// First occurrence of `needle` in `haystack`, byte-wise.
 ///
 /// Byte search rather than `str::find` so offsets are byte offsets by
@@ -357,5 +426,107 @@ mod tests {
         assert!(!is_valid_id("0123456789abcde"));
         assert!(!is_valid_id("0123456789abcdef0"));
         assert!(!is_valid_id(""));
+    }
+
+    #[test]
+    fn resolve_is_the_inverse_of_redact() {
+        let seals = [
+            seal(ID_A, "Aurora Dynamics GmbH", ChannelTier::Private),
+            seal(ID_B, "Project Kestrel", ChannelTier::Private),
+        ];
+        let original = "brief Project Kestrel for Aurora Dynamics GmbH, twice: Project Kestrel";
+        let (redacted, n) = redact(original, &seals);
+        assert_eq!(n, 3);
+        assert!(!redacted.contains("Aurora Dynamics GmbH"));
+        let (restored, m) = resolve(&redacted, &seals);
+        assert_eq!(m, 3);
+        assert_eq!(restored, original, "round trip must be lossless");
+    }
+
+    #[test]
+    fn resolve_leaves_a_token_whose_seal_is_not_permitted() {
+        // The gateway passes only the seals allowed on this destination, so
+        // "not in the list" means "barred" — the token must survive as a
+        // token rather than silently vanishing.
+        let permitted = [seal(ID_A, "Aurora Dynamics GmbH", ChannelTier::Private)];
+        let text = format!("{} and {}", token(ID_A), token(ID_B));
+        let (out, n) = resolve(&text, &permitted);
+        assert_eq!(n, 1);
+        assert_eq!(out, format!("Aurora Dynamics GmbH and {}", token(ID_B)));
+    }
+
+    #[test]
+    fn resolve_never_rescans_what_it_substituted() {
+        // A literal that itself looks like another seal's token must come
+        // out verbatim — repeated str::replace would resolve it a second
+        // time and leak a value the caller never asked to resolve.
+        let seals = [
+            seal(ID_A, &format!("see {}", token(ID_B)), ChannelTier::Private),
+            seal(ID_B, "Aurora Dynamics GmbH", ChannelTier::Private),
+        ];
+        let (out, n) = resolve(&token(ID_A), &seals);
+        assert_eq!(n, 1);
+        assert_eq!(out, format!("see {}", token(ID_B)));
+        assert!(
+            !out.contains("Aurora Dynamics GmbH"),
+            "a substituted literal must not be resolved again: {out}"
+        );
+    }
+
+    #[test]
+    fn a_seal_travels_to_the_backends_its_own_tier_permits() {
+        use crate::model_route::{Backend, InferencePurpose};
+
+        let seals = [
+            seal(ID_A, "owned-only value", ChannelTier::Owned),
+            seal(ID_B, "private-floor value", ChannelTier::Private),
+        ];
+        let ids = |backend| -> (Vec<String>, Vec<String>) {
+            let (ok, barred) = partition_for_backend(&seals, backend, InferencePurpose::AgentTurn);
+            (
+                ok.iter().map(|s| s.id.clone()).collect(),
+                barred.iter().map(|s| s.id.clone()).collect(),
+            )
+        };
+
+        // Local: zero egress, so every seal may resolve.
+        let (ok, barred) = ids(Backend::Local);
+        assert_eq!(ok.len(), 2, "local must carry both");
+        assert!(barred.is_empty());
+
+        // TEE: the exit criterion's case — the `private` seal resolves,
+        // the `owned`-only one does not.
+        let (ok, barred) = ids(Backend::Tee);
+        assert_eq!(ok, vec![ID_B.to_owned()]);
+        assert_eq!(barred, vec![ID_A.to_owned()]);
+
+        // Vendor: cleartext egress, so both are scrubbed.
+        let (ok, barred) = ids(Backend::Vendor);
+        assert!(ok.is_empty(), "no sealed value may reach a vendor");
+        assert_eq!(barred.len(), 2);
+    }
+
+    #[test]
+    fn the_partition_is_total_and_disjoint() {
+        use crate::model_route::{Backend, InferencePurpose};
+
+        // Every seal lands in exactly one half for every backend. A seal in
+        // neither would be silently unenforced; one in both would be
+        // resolved and scrubbed at the same time.
+        let seals = [
+            seal(ID_A, "a", ChannelTier::Owned),
+            seal(ID_B, "b", ChannelTier::Private),
+        ];
+        for backend in [Backend::Local, Backend::Tee, Backend::Vendor] {
+            let (ok, barred) = partition_for_backend(&seals, backend, InferencePurpose::AgentTurn);
+            assert_eq!(ok.len() + barred.len(), seals.len(), "{backend:?}");
+            for s in &ok {
+                assert!(
+                    !barred.iter().any(|b| b.id == s.id),
+                    "{backend:?}: {} is in both halves",
+                    s.id
+                );
+            }
+        }
     }
 }

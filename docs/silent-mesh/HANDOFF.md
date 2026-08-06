@@ -884,10 +884,54 @@ no remaining follow-ups.
 
      With that, **every ingestion path a member can reach is covered**:
      content and tags on all channel-scoped kinds, the two command kinds
-     that bypass the guard (47001, 47021), and the promoted git tree. What
-     remains for D31 is not ingestion but the rest of the lifecycle — the
-     workspace sweep, delivery redaction envelopes, gateway scrub, gate
-     integration, and revocation.
+     that bypass the guard (47001, 47021), and the promoted git tree.
+
+     **Slice 6 is the egress half — the gateway.** Ingestion stops a value
+     entering a channel; it says nothing about a value leaving to a model
+     provider, and raw literals genuinely reach the gateway without ever
+     passing an ingestion guard, because an agent's prompt carries worktree
+     file contents. `sm-gateway::route_and_record` now resolves and scrubs
+     as the last step before dispatch.
+
+     The rule was **derived, not invented**: a literal may reach a backend
+     exactly when a channel at the *seal's own* minimum tier would be
+     allowed to use that backend — `allowed_backends(seal.min_tier,
+     purpose).contains(backend)`. That composition turns out to be D31's
+     exit criterion verbatim: a seal at `private` resolves into a TEE
+     request and is scrubbed from a vendor one, and nothing sealed ever
+     reaches a vendor. It is the *seal's* tier that decides, not the
+     channel's — the channel's tier already gated which backends are
+     reachable at all.
+
+     Pure half in `buzz_core::seal`: `resolve` (the inverse of `redact`,
+     single-pass over `find_tokens` offsets so a substituted literal is
+     never rescanned) and `partition_for_backend`, returned as a partition
+     rather than two filters so the halves are exact complements by
+     construction — a seal in neither would be silently unenforced, one in
+     both would be resolved and scrubbed at once.
+
+     Order is resolve-then-scrub, and that is load-bearing: resolving can
+     introduce text containing a *barred* literal (one seal's value quoting
+     another's), which the later scrub then catches. The reverse order
+     leaks. A token whose seal is barred is deliberately left standing
+     rather than dropped — the caller passes only the permitted seals, so
+     "absent" means "barred", and silently deleting it would turn a policy
+     decision into a formatting quirk.
+
+     Three mutations killed against the PG-gated gateway test (the stubs
+     echo their prompt, so the response is a faithful view of what actually
+     left): dropping the scrub sends `Aurora Dynamics GmbH` to the vendor
+     stub in cleartext; dropping the resolve leaves TEE with a token it
+     cannot use; inverting the partition breaks both. A local-backend
+     control asserts a raw literal passes through untouched, so the vendor
+     assertions cannot be satisfied by a gateway that simply scrubs
+     everything.
+
+     What remains for D31 is neither ingestion nor egress but the rest of
+     the lifecycle: the workspace sweep, delivery redaction envelopes
+     (stored history + fan-out), gate integration, revocation (nothing
+     deletes a seal yet), and the client-side placeholder rendering that
+     completes the exit criterion's "renders as a placeholder in `open`".
    - **Retrieval foundation (D37)** — pgvector + a continuous owned-tier
      embedding pipeline, ACL-scoped search over buzz-search FTS, retrieval
      tools for copilot and harness agents. **Not started**: `pg_extension`

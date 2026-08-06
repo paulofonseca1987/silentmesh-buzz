@@ -7,8 +7,18 @@
 //! every routed request is attributed `(user, agent, channel, thread,
 //! model, tier, backend, purpose)` in `model_usage`.
 //!
-//! The gateway is the routing gate, the metering write, an optional
-//! per-user token budget, and a registry of [`ModelBackend`] impls. The
+//! A third invariant rides on the first: **Content Seals (D31)**. Routing
+//! decides where a request may go; seals decide which *values* may go with
+//! it. The last thing to touch a prompt before dispatch resolves the
+//! tokens this destination is allowed to see and scrubs the literals it is
+//! not, by the rule that a literal may reach a backend exactly when a
+//! channel at the seal's own tier could use that backend. This is the only
+//! place that catches raw literals in agent prompts, which carry worktree
+//! file contents and so never passed the relay's ingestion guard.
+//!
+//! The gateway is the routing gate, the seal transform, the metering write,
+//! an optional per-user token budget, and a registry of [`ModelBackend`]
+//! impls. The
 //! `local` class is real — [`ollama::OllamaBackend`], an Ollama server that
 //! must prove its locality to be built at all. The remaining classes are
 //! still [`stub`]s: a TEE provider with attestation-then-send, and per-user
@@ -219,17 +229,63 @@ impl Gateway {
             }
         }
 
-        // 3. Dispatch.
+        // 3. Content Seals (D31) — resolve what this destination may see,
+        // scrub what it may not. The routing gate above decided *where* the
+        // request may go; this decides which values may ride along, and it
+        // is the last thing to touch the prompt before it leaves.
+        //
+        // Order matters: resolve first, scrub second. Resolving may
+        // introduce text that itself contains a barred literal (one seal's
+        // value quoting another's), and scrubbing afterwards catches it.
+        // The reverse order would let that through.
+        //
+        // Both halves are needed. Resolution alone would leave raw literals
+        // untouched, and raw literals genuinely do reach here — an agent's
+        // prompt carries worktree file contents, which never passed the
+        // ingestion guard.
+        let seals = self.db.load_sealed_literals(req.community_id).await?;
+        let (permitted, barred) =
+            buzz_core::seal::partition_for_backend(&seals, backend, req.purpose);
+        let owned =
+            |v: Vec<&buzz_core::seal::SealedLiteral>| -> Vec<buzz_core::seal::SealedLiteral> {
+                v.into_iter().cloned().collect()
+            };
+        let (permitted, barred) = (owned(permitted), owned(barred));
+        let (prompt, resolved) = buzz_core::seal::resolve(&req.prompt, &permitted);
+        let (prompt, scrubbed) = buzz_core::seal::redact(&prompt, &barred);
+        if resolved > 0 || scrubbed > 0 {
+            // Counts and the destination only. A seal id is a reference and
+            // safe to log; the literal never is, and this line is written
+            // wherever relay logs go.
+            tracing::info!(
+                backend = %backend,
+                resolved,
+                scrubbed,
+                "content seals applied to outbound prompt"
+            );
+        }
+        // Borrow in the overwhelmingly common case where nothing changed;
+        // a prompt can be large and this is the hot path.
+        let outbound: std::borrow::Cow<'_, InferenceRequest> = if resolved == 0 && scrubbed == 0 {
+            std::borrow::Cow::Borrowed(req)
+        } else {
+            std::borrow::Cow::Owned(InferenceRequest {
+                prompt,
+                ..req.clone()
+            })
+        };
+
+        // 4. Dispatch.
         let impl_backend = self
             .backends
             .get(&backend)
             .ok_or(GatewayError::NoBackend(backend))?;
         let raw = impl_backend
-            .infer(req)
+            .infer(&outbound)
             .await
             .map_err(GatewayError::Backend)?;
 
-        // 4. Meter.
+        // 5. Meter.
         let usage_id = self
             .db
             .record_model_usage(RecordModelUsageParams {
@@ -495,5 +551,98 @@ mod pg_tests {
             ))
             .await;
         assert!(ok.is_ok());
+    }
+
+    /// D31's exit criterion for seals, on the gateway leg: "a value sealed
+    /// at `private` resolves in the TEE request, arrives scrubbed
+    /// vendor-bound".
+    ///
+    /// The stub backends echo the prompt they were handed, so the response
+    /// text is a faithful view of what actually left the gateway — the
+    /// thing that matters here is not the return value but what the backend
+    /// saw.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn a_sealed_value_resolves_for_tee_and_is_scrubbed_vendor_bound() {
+        const SEAL_ID: &str = "00112233445566dd";
+        const LITERAL: &str = "Aurora Dynamics GmbH";
+
+        let raw_pool = pool().await;
+        let community = make_community(&raw_pool).await;
+        let db = Db::from_pool(raw_pool.clone());
+        db.create_seal(buzz_db::seal::CreateSealParams {
+            community_id: community,
+            id: SEAL_ID,
+            label: "the northern client",
+            literal: LITERAL,
+            min_tier: ChannelTier::Private,
+            created_by: &[0xccu8; 32],
+        })
+        .await
+        .expect("create seal");
+        let gw = full_gateway(db);
+
+        let sent = |tier, backend, prompt: String| {
+            let mut r = request(community, tier, backend, InferencePurpose::AgentTurn);
+            r.prompt = prompt;
+            let gw = &gw;
+            async move { gw.route_and_record(&r).await.expect("route").text }
+        };
+        let tok = buzz_core::seal::token(SEAL_ID);
+
+        // Resolves in the TEE request: a private channel may reach TEE, and
+        // the seal's own floor is private, so the value is put back.
+        let tee = sent(
+            ChannelTier::Private,
+            Some(Backend::Tee),
+            format!("brief {tok} on the renewal"),
+        )
+        .await;
+        assert!(tee.contains(LITERAL), "TEE must receive the value: {tee}");
+        assert!(!tee.contains(&tok), "the token must be gone: {tee}");
+
+        // Arrives scrubbed vendor-bound: the same value typed raw, in an
+        // open channel routed to a vendor, must leave as a token. This is
+        // the case ingestion cannot cover — the text could have come from a
+        // worktree file that never passed the guard.
+        let vendor = sent(
+            ChannelTier::Open,
+            Some(Backend::Vendor),
+            format!("brief {LITERAL} on the renewal"),
+        )
+        .await;
+        assert!(
+            !vendor.contains(LITERAL),
+            "a vendor must never receive the sealed value: {vendor}"
+        );
+        assert!(
+            vendor.contains(&tok),
+            "the value must leave as its token: {vendor}"
+        );
+
+        // A token bound for a barred destination stays a token — resolution
+        // is not "expand every token I recognize".
+        let vendor_tok = sent(
+            ChannelTier::Open,
+            Some(Backend::Vendor),
+            format!("brief {tok} on the renewal"),
+        )
+        .await;
+        assert!(!vendor_tok.contains(LITERAL), "{vendor_tok}");
+        assert!(vendor_tok.contains(&tok), "{vendor_tok}");
+
+        // Control: zero-egress local inference is permitted every seal, so
+        // a raw literal passes through untouched. Without this the tests
+        // above would also pass if the gateway simply scrubbed everything.
+        let local = sent(
+            ChannelTier::Owned,
+            Some(Backend::Local),
+            format!("brief {LITERAL} on the renewal"),
+        )
+        .await;
+        assert!(
+            local.contains(LITERAL),
+            "local inference must not be scrubbed: {local}"
+        );
     }
 }
