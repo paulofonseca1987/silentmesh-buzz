@@ -78,23 +78,23 @@ ensure_infra() {
 run_unit_tests() {
   section "Unit Tests (no infra required)"
 
-  run_test_step "buzz-core tests" \
-    cargo test -p buzz-core --lib -- --nocapture
+  # The whole workspace, mirroring `just test-unit`. This used to name five
+  # crates explicitly and silently omitted buzz-relay and sm-gateway — the
+  # crates holding the Silent Mesh guards — so the gate ran green without
+  # touching the code most changes land in.
+  #
+  # --lib keeps it infra-free: Postgres-backed tests are #[ignore]d and the
+  # E2E `tests/` targets need a live relay. The workspace excludes
+  # desktop/src-tauri, so no GTK/WebKitGTK is pulled in.
+  # --no-fail-fast: cargo stops after the first failing test *binary*, so a
+  # break in an early crate hides every later one and you rediscover them one
+  # push at a time. Report the whole picture in a single run.
+  run_test_step "workspace unit tests" \
+    cargo test --workspace --lib --no-fail-fast -- --nocapture
 
-  run_test_step "buzz-auth unit tests" \
-    cargo test -p buzz-auth --lib -- --nocapture
-
-  # buzz-db migrator/lint unit tests (no infra): guard the embedded-migrator
-  # invariant (exactly the consolidated 0001; cutover/backfill stays an operator
-  # script, not startup state) and the tenant-scoping lints. The Postgres-backed
-  # buzz-db tests are #[ignore]d; nothing here (or in integration mode below,
-  # which runs `cargo test -p buzz-db` without --ignored) runs them — they need a
-  # separate isolated-DB gate, so --lib keeps this step infra-free.
-  run_test_step "buzz-db unit tests" \
-    cargo test -p buzz-db --lib -- --nocapture
-
-  # Multi-tenant conformance gate: independent replay checker + golden
-  # fixtures (buzz-conformance). Pure in-process trace replay, no infra.
+  # These two additionally have infra-free integration targets that --lib
+  # skips: buzz-conformance's replay fixtures (the independent multi-tenant
+  # checker) and buzz-push-gateway's black-box HTTP tests.
   run_test_step "buzz-conformance tests" \
     cargo test -p buzz-conformance -- --nocapture
 

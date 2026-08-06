@@ -50,9 +50,19 @@ pre-push:
   commands:
     branch-skew:
       run: ./scripts/check-branch-skew.sh
+    # `Justfile` is capital-J on disk; the lowercase "justfile" this glob
+    # used to carry never matched on a case-sensitive filesystem, so editing
+    # the recipes themselves did not run them.
     rust-tests:
-      glob: ["crates/**", "migrations/**", "schema/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml", "scripts/run-tests.sh", "justfile"]
+      glob: ["crates/**", "migrations/**", "schema/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml", "scripts/run-tests.sh", "Justfile"]
       run: just test-unit
+    # Workspace clippy with -D warnings. This stage did not exist: pre-push
+    # ran tests but never linted Rust, while AGENTS.md claimed otherwise.
+    # Clippy also catches what `--lib` tests cannot — errors in #[cfg(test)]
+    # code only surface under --all-targets.
+    rust-clippy:
+      glob: ["crates/**", "migrations/**", "schema/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "Justfile"]
+      run: just clippy
     desktop-check:
       glob: ["desktop/**", "pnpm-lock.yaml"]
       exclude: ["desktop/src-tauri/**"]
@@ -62,10 +72,22 @@ pre-push:
       exclude: ["desktop/src-tauri/**"]
       run: just desktop-test
     desktop-tauri-test:
-      # ci.yml:113 — Desktop Core triggers on `rust` OR `desktop-rust`;
       # desktop/src-tauri path-depends on crates/buzz-core, buzz-persona,
-      # buzz-sdk, buzz-agent (desktop/src-tauri/Cargo.toml:88-91).
-      glob: ["desktop/src-tauri/**", "crates/**", "migrations/**", "schema/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml", "scripts/run-tests.sh", "justfile"]
+      # buzz-sdk, buzz-agent (desktop/src-tauri/Cargo.toml:88-91), so
+      # upstream triggered this on any `crates/**` change.
+      #
+      # D35 Phase 0 drops that trigger here: the desktop tree stays in-tree
+      # but unbuilt on this fork, and the Tauri crate needs system
+      # GTK/WebKitGTK that the dev machine cannot install. Firing it on
+      # every Rust diff meant every push failed at this stage and went out
+      # with `--no-verify` — which silently disabled the *other* pre-push
+      # stages too. Scoped to the desktop tree, the hook is one you can
+      # actually leave on.
+      #
+      # The cost is real and accepted: a change under crates/** that breaks
+      # the Tauri build is now caught when desktop/ is next touched, not at
+      # the moment it lands.
+      glob: ["desktop/src-tauri/**"]
       run: just desktop-tauri-test
     mobile-test:
       glob: ["mobile/**"]

@@ -91,8 +91,11 @@ build:
 build-release:
     cargo build --workspace --release
 
-# Run repo lint and formatting checks
-check: fmt-check clippy desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check
+# Run repo lint and formatting checks (all trees, including the clients)
+check: check-rust desktop-check desktop-tauri-fmt-check desktop-tauri-clippy web-check mobile-check
+
+# Rust-only lint + format gate — the fork's default (D35 Phase 0).
+check-rust: fmt-check clippy
 
 # Format all Rust code
 fmt:
@@ -262,8 +265,19 @@ desktop-e2e-pre-push: _ensure-migrations
     git fetch origin main
     cd {{desktop_dir}} && pnpm build:e2e && pnpm exec playwright test --only-changed=origin/main
 
-# Run all checks suitable for CI / pre-push (no infra needed)
-ci: check test-unit desktop-test desktop-build desktop-tauri-check desktop-tauri-test web-build mobile-test
+# Run all checks suitable for CI / pre-push (no infra needed).
+#
+# Rust-only, per D35 Phase 0: the desktop, web and mobile trees stay in-tree
+# but unbuilt on this fork. Including them made `just ci` unrunnable on a
+# machine without GTK/WebKitGTK — which is the machine this fork is
+# developed on — so the documented gate was one nobody could run, and
+# pushes went out with `--no-verify` instead. A gate that cannot be run is
+# not a gate.
+ci: check-rust test-unit
+
+# The upstream profile, including the client trees. Needs the pnpm, Tauri
+# and Flutter toolchains plus system GTK/WebKitGTK.
+ci-all: check test-unit desktop-test desktop-build desktop-tauri-check desktop-tauri-test web-build mobile-test
 
 # ─── Test ─────────────────────────────────────────────────────────────────────
 
@@ -274,23 +288,32 @@ test:
 # Run unit tests only (no infra needed)
 test-unit:
     #!/usr/bin/env bash
+    # `set -e` is load-bearing, not boilerplate. just does NOT fail-fast
+    # inside a shebang recipe: without this, a script of N commands exits
+    # with the status of the LAST one. This recipe used to run four
+    # `cargo nextest` invocations in sequence, so a failure in buzz-core,
+    # buzz-auth, buzz-db or buzz-conformance was masked outright as long as
+    # the final command passed.
+    set -euo pipefail
+    # The whole workspace, not a hand-kept crate list. The list this
+    # replaced named five crates and silently omitted buzz-relay (793 unit
+    # tests) and sm-gateway — the two crates holding every Silent Mesh
+    # guard: seals, the promotion gate, work threads, the tier router. The
+    # pre-push glob fires on `crates/**`, so editing the relay ran this
+    # gate, went green, and proved nothing about the change.
+    #
+    # `--lib` keeps it infra-free: Postgres-backed tests are #[ignore]d and
+    # the E2E `tests/` targets need a live relay. The workspace excludes
+    # desktop/src-tauri (its own manifest), so this never pulls in
+    # GTK/WebKitGTK.
     if command -v cargo-nextest &>/dev/null; then
-        cargo nextest run -p buzz-core -p buzz-auth --lib
-        # buzz-db migrator/lint tests: pure SQL-parsing unit tests (no infra).
-        # They guard the embedded-migrator invariant (exactly the consolidated
-        # 0001; cutover/backfill stays an operator script, not startup state)
-        # and the tenant-scoping lints. The Postgres-backed buzz-db tests are
-        # #[ignore]d, so --lib runs only the infra-free set. Without this gate a
-        # stray file in migrations/ or a broken lint ships green.
-        cargo nextest run -p buzz-db --lib
-        # Multi-tenant conformance gate (buzz-conformance): the independent
-        # replay checker + golden fixtures. No infra — pure in-process trace
-        # replay — so it belongs in the unit job. Run all targets (lib + the
-        # tests/replay_fixtures.rs integration test), not just --lib.
-        cargo nextest run -p buzz-conformance
-        # Gateway unit and black-box HTTP tests are infra-free. Postgres-backed
-        # contract/race tests run in the dedicated CI job below.
-        cargo nextest run -p buzz-push-gateway
+        cargo nextest run --workspace --lib
+        # These two also have infra-free integration targets that --lib
+        # skips: buzz-conformance's replay fixtures (the independent
+        # multi-tenant checker) and buzz-push-gateway's black-box HTTP
+        # tests. Their lib tests run twice; that is cheap and beats
+        # hand-maintaining target lists.
+        cargo nextest run -p buzz-conformance -p buzz-push-gateway
     else
         ./scripts/run-tests.sh unit
     fi

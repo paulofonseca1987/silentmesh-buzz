@@ -90,23 +90,49 @@ See CONTRIBUTING.md for full setup details and dependency requirements.
 
 ## Quality Gates
 
-Run `just ci` before every PR — it runs `fmt` + `clippy` + desktop lint +
-unit tests + builds. Clippy passing does not mean fmt passes; run both.
+Run `just ci` before every PR. On this fork it is **Rust-only** (D35 Phase 0):
+`fmt-check` + workspace `clippy -D warnings` + `test-unit`. The desktop, web
+and mobile trees stay in-tree but unbuilt, so `just ci` runs on a machine
+without the pnpm/Tauri/Flutter toolchains or system GTK/WebKitGTK. Use
+`just ci-all` for the upstream profile that also builds the client trees.
+Clippy passing does not mean fmt passes; run both.
+
+`just test-unit` runs **the whole workspace** (`cargo test --workspace --lib`),
+not a curated crate list — anything you add is covered the day you add it.
 
 Run `just test` for integration tests if you touched `buzz-relay`,
 `buzz-db`, or `buzz-auth` — these require a running Postgres and Redis.
+
+**OpenSSL:** `openssl-sys` enters through dev-dependencies, so `cargo test`
+and `cargo clippy --all-targets` need OpenSSL headers even though a plain
+`cargo check` does not. If your distro has no `libssl-dev`, point cargo at a
+Homebrew build — resolve the version rather than pinning it, since any
+`brew install` can bump it out from under you:
+`export OPENSSL_DIR=$(ls -d /home/linuxbrew/.linuxbrew/Cellar/openssl@3/* | sort -V | tail -1)`
 
 **Pre-commit hooks** are installed automatically by `just setup` and auto-fix
 formatting via `stage_fixed`. Pre-commit runs fix variants in parallel (Rust
 fmt, Tauri Rust fmt, desktop biome fix, web biome fix, mobile dart format).
 Auto-fixable issues are fixed and re-staged; unfixable lint issues block the
-commit. **Pre-push hooks** run clippy (workspace + Tauri) and fast unit tests
-in parallel (Rust, desktop JS, Tauri Rust, mobile Flutter) — no overlap with
-pre-commit. Builds are CI-only. Run `just fix-all` to auto-fix all formatting
-in one shot. Run `just ci` for the full local gate. Run `just hooks` to
-re-install hooks after env changes. Before agents run Git or hooks, activate the
-repo's Hermit environment (`. ./bin/activate-hermit`); do not rewrite hook
-commands to compensate for an unconfigured shell `PATH`.
+commit. **Pre-push hooks** run, in parallel: branch-skew, workspace clippy
+(`rust-clippy`), workspace unit tests (`rust-tests`), and the desktop/mobile
+stages — each gated by a glob so it only fires when its own tree changes.
+Builds are CI-only. Run `just fix-all` to auto-fix all formatting in one shot.
+Run `just hooks` to re-install hooks after env changes. Before agents run Git
+or hooks, activate the repo's Hermit environment (`. ./bin/activate-hermit`);
+do not rewrite hook commands to compensate for an unconfigured shell `PATH`.
+
+**If a hook fails, read which stage failed before reaching for `--no-verify`.**
+lefthook prints the failing stage with 🥊 and passing ones with ✔️, and a plain
+`git push` that fails pushes *nothing* — `git status -sb` showing `[ahead N]`
+is the cheap confirmation. `--no-verify` disables *every* stage, not just the
+one that failed, so use it only after running the equivalent gates by hand,
+and say so.
+
+**Writing a shebang recipe in the `Justfile`? Start it with `set -euo
+pipefail`.** `just` does not fail-fast inside a shebang recipe: a script of N
+commands exits with the status of the *last* one, so an earlier failure is
+silently discarded. `test-unit` masked failures in four crates this way.
 
 **Commit with `git commit -s`.** The required **DCO Check** fails any PR with a commit missing a `Signed-off-by` trailer, and `just hooks` installs a `commit-msg` hook that adds it to commits you create locally (`git rebase` and `git cherry-pick` still need `--signoff`) — if you build commit commands programmatically, include `-s` every time. To repair a branch that already has unsigned commits: `git rebase --signoff main`, then force-push.
 
