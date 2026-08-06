@@ -107,6 +107,12 @@ fmt-check:
 
 # Run clippy with warnings as errors
 clippy:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # openssl-sys enters via dev-dependencies, so --all-targets needs OpenSSL
+    # headers a plain `cargo check` does not. No-op where the system provides
+    # them; see the script for why it cannot make things worse.
+    source scripts/openssl-env.sh
     cargo clippy --workspace --all-targets -- -D warnings
 
 # Install JS dependencies (pnpm workspace — installs all packages from root)
@@ -295,6 +301,9 @@ test-unit:
     # buzz-auth, buzz-db or buzz-conformance was masked outright as long as
     # the final command passed.
     set -euo pipefail
+    # openssl-sys enters via dev-dependencies, so building tests needs
+    # OpenSSL headers a plain `cargo check` does not.
+    source scripts/openssl-env.sh
     # The whole workspace, not a hand-kept crate list. The list this
     # replaced named five crates and silently omitted buzz-relay (793 unit
     # tests) and sm-gateway — the two crates holding every Silent Mesh

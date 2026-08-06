@@ -14,6 +14,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MODE="${1:-all}"
 
+# openssl-sys enters through dev-dependencies, so every cargo command here
+# needs OpenSSL headers even though a plain `cargo check` does not. No-op
+# where the system provides them (CI included).
+# shellcheck source=./openssl-env.sh
+source "${SCRIPT_DIR}/openssl-env.sh"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
