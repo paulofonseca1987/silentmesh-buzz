@@ -1187,7 +1187,8 @@ fn do_verify(sig_file: &str, status: &mut StatusWriter) -> Result<(), Error> {
         });
     }
 
-    // Validate pk is a valid BIP-340 x-only public key
+    // Curve validity for `pk` is settled in `parse_envelope` (above),
+    // alongside oa[0] — both are structural properties of the envelope.
     let pk = PublicKey::from_hex(&envelope.pk).map_err(|e| {
         write_errsig(status, Some(&envelope.pk));
         Error::VerifyFailed {
@@ -1373,6 +1374,15 @@ fn parse_envelope(json_str: &str) -> Result<Envelope, String> {
         .as_str()
         .ok_or("pk must be a string")?;
     validate_hex_field(pk, 64, "pk")?;
+    // ...and that it is a point on the curve, not just 64 hex characters.
+    // Same trap as oa[0] below: `PublicKey::from_hex` validates only the
+    // encoding and accepts an all-zero key. An off-curve key could never
+    // verify a signature, so this buys a clear structural refusal naming
+    // the key rather than a downstream "signature verification failed".
+    PublicKey::from_hex(pk)
+        .map_err(|e| format!("pk is not a valid BIP-340 public key: {e}"))?
+        .xonly()
+        .map_err(|e| format!("pk is not a valid BIP-340 public key: {e}"))?;
 
     // sig (required, 128-char lowercase hex)
     let sig = obj
@@ -1419,8 +1429,18 @@ fn parse_envelope(json_str: &str) -> Result<Envelope, String> {
             );
         }
 
-        // Validate oa[0] is a valid BIP-340 x-only public key (not just hex)
+        // Validate oa[0] is a valid BIP-340 x-only public key — a point that
+        // is actually on the curve, not merely 64 hex characters.
+        //
+        // `PublicKey::from_hex` alone does NOT do this: it validates the
+        // encoding and stores the bytes, so an all-zero key parses happily.
+        // The curve check has to be explicit, and `xonly()` is what performs
+        // it. This comment previously claimed "not just hex" while calling
+        // only `from_hex`, and the test asserting an all-zero owner key is
+        // refused had been failing ever since.
         PublicKey::from_hex(owner)
+            .map_err(|e| format!("oa[0] is not a valid BIP-340 public key: {e}"))?
+            .xonly()
             .map_err(|e| format!("oa[0] is not a valid BIP-340 public key: {e}"))?;
 
         // Self-attestation is meaningless — owner must differ from signer
@@ -2135,6 +2155,45 @@ Initial commit"
         let result = parse_envelope(&json);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("BIP-340"));
+    }
+
+    /// The signer key gets the same treatment as oa[0]: 64 hex characters
+    /// that are not a point on the curve are refused as a structural error
+    /// naming the key, rather than left to surface later as a mystery
+    /// signature mismatch.
+    ///
+    /// Checked in `parse_envelope`, not in the verify flow, and that
+    /// placement is deliberate on two counts.
+    ///
+    /// First, `verify_sig` in this module is a test *helper* that
+    /// reimplements verification, and it has always had its own `xonly()`
+    /// check (see its "xonly conversion failed" arm) — so it was stricter
+    /// than production. A test written against it would have passed against
+    /// the unfixed code and proved nothing. That is precisely how the
+    /// missing curve check survived.
+    ///
+    /// Second, the real entry point `do_verify` reads its payload from
+    /// stdin. A test driving it only returns early *because* the check
+    /// fires, so deleting the check makes the test hang rather than fail —
+    /// a hang is far worse than a red test in CI. Validating during parse
+    /// keeps this a pure function call with no stdin anywhere near it.
+    #[test]
+    fn test_parse_envelope_rejects_pk_that_is_not_a_curve_point() {
+        let zero_pk = "0".repeat(64);
+        let sig_field = "a".repeat(128);
+        let json = [
+            r#"{"v":1,"pk":""#,
+            &zero_pk,
+            r#"","sig":""#,
+            &sig_field,
+            r#"","t":1700000000}"#,
+        ]
+        .concat();
+        let err = parse_envelope(&json).expect_err("an off-curve pk must be refused");
+        assert!(
+            err.contains("BIP-340"),
+            "refusal must name the key as invalid, not the signature: {err}"
+        );
     }
 
     #[test]
