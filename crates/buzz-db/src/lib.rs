@@ -3016,6 +3016,18 @@ impl Db {
         seal::create_seal(&self.pool, params).await
     }
 
+    /// Where a sealed literal already appears in stored events (D31 sweep).
+    /// Returns counts and channels only — never the matched text.
+    pub async fn sweep_sealed_literal(
+        &self,
+        community: CommunityId,
+        literal: &str,
+        min_tier: buzz_core::channel::ChannelTier,
+        limit: i64,
+    ) -> Result<seal::SweepReport> {
+        seal::sweep_literal(&self.pool, community, literal, min_tier, limit).await
+    }
+
     /// Every sealed literal in the community — enforcement-side read only.
     pub async fn load_sealed_literals(
         &self,

@@ -927,11 +927,49 @@ no remaining follow-ups.
      assertions cannot be satisfied by a gateway that simply scrubs
      everything.
 
-     What remains for D31 is neither ingestion nor egress but the rest of
-     the lifecycle: the workspace sweep, delivery redaction envelopes
-     (stored history + fan-out), gate integration, revocation (nothing
-     deletes a seal yet), and the client-side placeholder rendering that
-     completes the exit criterion's "renders as a placeholder in `open`".
+     **Slice 7 is the workspace sweep**, and it exists to close an honesty
+     gap rather than a leak. Slices 3–6 bind what happens *next*; a seal
+     said nothing about content stored before it existed, so creating one
+     implied a containment it had not delivered. `POST /api/seals` now
+     reports, in the creation response, exactly where the value already is:
+     per-channel counts, which channels are looser than the seal's floor
+     (`exposed`), and whether the scan was truncated. `buzz seals create`
+     prints the JSON on stdout unchanged and puts a warning on **stderr**
+     when `exposed > 0`, so the machine contract is untouched while a human
+     sealing something sees the number.
+
+     Deliberate choices: the report is an aggregate, not a list of event ids
+     (a page of ids is neither actionable nor safe to leaf through); it is
+     serialized and asserted never to contain the literal, because it lands
+     in CLI output and logs; it scans `content` **and** `tags`, matching
+     what the ingestion guard covers; deleted events are excluded; and an
+     unparseable tier counts as *exposed*, because a sweep exists to
+     over-report, not to reassure. `sweep: null` means the sweep could not
+     run and is distinguishable from `occurrences: 0`.
+
+     Bounded at 500 matches — a substring scan cannot use an index, so this
+     is a latency ceiling on seal creation, and past it the report says
+     `truncated` rather than lying by omission.
+
+     Three mutations killed: inverting the exposure comparison, dropping the
+     tag scan, and counting deleted events. A second sweep of the *same*
+     rows at a stricter floor returns a different `exposed` count, which
+     pins the tier as the deciding input rather than anything about the
+     rows.
+
+     **Not done, and deliberately not front-run**: the sweep *detects*; it
+     does not rewrite history. `architecture.md:420` assumes post-sweep
+     content is tokenized, but how to tokenize an already-signed event is
+     the D-log's **open question 10** (redaction envelopes, tied to deep
+     seal D32) — rewriting `content` in place would invalidate every
+     signature. That decision is yours, not something to settle by
+     implementation.
+
+     What remains for D31: remediation for what the sweep finds (blocked on
+     open question 10), gate integration, revocation (nothing deletes a seal
+     yet), a re-sweep endpoint for checking after cleanup, and the
+     client-side placeholder rendering that completes the exit criterion's
+     "renders as a placeholder in `open`".
    - **Retrieval foundation (D37)** — pgvector + a continuous owned-tier
      embedding pipeline, ACL-scoped search over buzz-search FTS, retrieval
      tools for copilot and harness agents. **Not started**: `pg_extension`

@@ -36,6 +36,50 @@ pub async fn cmd_create_seal(
     });
     let resp = client.post_authed("/api/seals", &body).await?;
     println!("{resp}");
+
+    // The sweep says where the value already is. It rides in the JSON above
+    // for machine callers; a human sealing something needs the exposure
+    // count in front of them, and stderr keeps stdout's contract intact.
+    //
+    // Silence here means "the relay could not sweep", not "nothing found" —
+    // the two are distinguishable in the JSON (`sweep: null` vs
+    // `occurrences: 0`), and neither is worth shouting about.
+    if let Some(sweep) = serde_json::from_str::<serde_json::Value>(&resp)
+        .ok()
+        .and_then(|v| v.get("sweep").cloned())
+        .filter(|s| !s.is_null())
+    {
+        let n = |key: &str| sweep.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+        let exposed = n("exposed");
+        if exposed > 0 {
+            let where_ = sweep
+                .get("channels")
+                .and_then(|c| c.as_array())
+                .map(|chans| {
+                    chans
+                        .iter()
+                        .filter(|c| c.get("exposed").and_then(|e| e.as_bool()) == Some(true))
+                        .filter_map(|c| {
+                            let name = c.get("name")?.as_str()?;
+                            let tier = c.get("tier")?.as_str().unwrap_or("?");
+                            Some(format!("{name} ({tier})"))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "warning: this value already appears in {exposed} stored event(s) in channels \
+                 looser than '{min_tier}': {where_}"
+            );
+            eprintln!(
+                "         the seal binds what happens from now on; it does not rewrite history."
+            );
+            if sweep.get("truncated").and_then(|t| t.as_bool()) == Some(true) {
+                eprintln!("         (scan stopped at its limit — there may be more)");
+            }
+        }
+    }
     Ok(())
 }
 

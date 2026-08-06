@@ -158,11 +158,40 @@ pub async fn create_seal(
 
     emit_seal_announce(&state, &tenant, &id, label, min_tier, &creator_hex).await;
 
+    // The workspace sweep (D31). A seal binds what happens next; it does
+    // nothing about what is already stored, and without telling the Owner
+    // so, creating one implies a containment it has not delivered. So the
+    // creation response says plainly where the value already is.
+    //
+    // Best-effort, and deliberately after the seal is stored and announced:
+    // a sweep that fails must not unwind a seal that is already enforcing.
+    // A missing report reads as "unknown", never as "clean".
+    let sweep = match state
+        .db
+        .sweep_sealed_literal(tenant.community(), &body.literal, min_tier, SWEEP_LIMIT)
+        .await
+    {
+        Ok(report) => serde_json::to_value(&report).ok(),
+        Err(e) => {
+            tracing::warn!("seal sweep failed for {id}: {e}");
+            None
+        }
+    };
+
     Ok(Json(serde_json::json!({
         "seal_id": id,
         "token": buzz_core::seal::token(&id),
+        // `null` when the sweep could not run — distinguishable from a
+        // sweep that ran and found nothing (`occurrences: 0`).
+        "sweep": sweep,
     })))
 }
+
+/// How many matching events one sweep will look at. A substring scan cannot
+/// use an index, so this is a latency ceiling on seal creation rather than a
+/// judgement about how much exposure matters; past it the report says
+/// `truncated`.
+const SWEEP_LIMIT: i64 = 500;
 
 /// Publish the relay-signed kind:47100 announcement — the member-visible
 /// record. Carries the id, label, tier and creator; **never the literal**.
