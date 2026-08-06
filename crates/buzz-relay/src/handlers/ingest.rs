@@ -497,22 +497,52 @@ pub(crate) async fn refuse_sealed_literals(
     tier: buzz_core::channel::ChannelTier,
     text: &str,
 ) -> Result<(), IngestError> {
-    // `owned` is the strictest tier — nothing can be violated there, so the
-    // workspace's most sensitive channels pay nothing for this check.
-    if tier == buzz_core::channel::ChannelTier::Owned || text.is_empty() {
+    if text.is_empty() {
         return Ok(());
+    }
+    let violating = load_violating_seals(state, tenant, tier).await?;
+    refuse_sealed_in([text], &violating, tier)
+}
+
+/// The seals a channel at `tier` may not hold, loaded once so a caller with
+/// many strings to check pays one query rather than one per string.
+///
+/// `owned` is the strictest tier — nothing can be violated there — so the
+/// workspace's most sensitive channels skip the query entirely.
+pub(crate) async fn load_violating_seals(
+    state: &AppState,
+    tenant: &TenantContext,
+    tier: buzz_core::channel::ChannelTier,
+) -> Result<Vec<buzz_core::seal::SealedLiteral>, IngestError> {
+    if tier == buzz_core::channel::ChannelTier::Owned {
+        return Ok(Vec::new());
     }
     let seals = state
         .db
         .load_sealed_literals(tenant.community())
         .await
         .map_err(|e| IngestError::Internal(format!("error: seal load: {e}")))?;
-    let violating: Vec<buzz_core::seal::SealedLiteral> =
-        buzz_core::seal::violating_seals(&seals, tier)
-            .into_iter()
-            .cloned()
-            .collect();
-    if let Some(hit) = buzz_core::seal::find_literals(text, &violating).first() {
+    Ok(buzz_core::seal::violating_seals(&seals, tier)
+        .into_iter()
+        .cloned()
+        .collect())
+}
+
+/// Refuse if any of `texts` carries one of `violating`. Pure — the query
+/// already happened.
+pub(crate) fn refuse_sealed_in<'a>(
+    texts: impl IntoIterator<Item = &'a str>,
+    violating: &[buzz_core::seal::SealedLiteral],
+    tier: buzz_core::channel::ChannelTier,
+) -> Result<(), IngestError> {
+    if violating.is_empty() {
+        return Ok(());
+    }
+    for text in texts {
+        let hits = buzz_core::seal::find_literals(text, violating);
+        let Some(hit) = hits.first() else {
+            continue;
+        };
         let label = violating
             .iter()
             .find(|s| s.id == hit.id)
@@ -2324,21 +2354,45 @@ async fn ingest_event_inner(
     // `api::git::promote`, kind:47001 thread metadata in
     // `work_thread::handle_thread_metadata`.
     //
-    // Still uncovered, and structurally out of this guard's reach:
-    // kind:9002 carries its free text (`name`, `about`, `topic`, `purpose`)
-    // in TAGS, not `content`, so scanning content does nothing for it. That
-    // wants a tag-scanning check of its own.
+    // TAGS are scanned as well as content, because a tag value fans out
+    // with the event exactly as content does — a sealed literal in
+    // `["alt", "..."]` leaves the tier just as surely as one in the body.
+    // kind:9002 makes this unavoidable rather than merely prudent: ALL of
+    // its member-written text (`name`, `about`, `topic`, `purpose`) lives
+    // in tags and its `content` is empty, so a content-only guard is blind
+    // to it. Every tag value is scanned rather than a list of the prose
+    // ones, for the same fail-closed reason the kind list was inverted.
+    // Structural values (event ids, UUIDs, pubkeys) simply never match a
+    // sealed literal — and if one did, refusing is the safe direction.
     //
     // Owned channels skip the seal query entirely: owned is the strictest
     // tier, so no seal can be violated there and the workspace's most
     // sensitive channels pay nothing for this guard.
-    if requires_h_channel_scope(kind_u32) && !event.content.is_empty() {
+    //
+    // Cost, stated plainly: every channel-scoped event in a non-owned
+    // channel now costs one indexed SELECT against a small table, where
+    // before only the seven listed kinds with non-empty content did. That
+    // is small next to the membership, channel and insert queries already
+    // on this path, and correctness came first — but a per-community seal
+    // cache invalidated on `POST /api/seals` is the obvious next
+    // optimization if this ever shows up in a profile.
+    if requires_h_channel_scope(kind_u32) {
         if let Some(row) = &channel_row {
             let tier = row
                 .tier
                 .parse::<buzz_core::channel::ChannelTier>()
                 .unwrap_or(buzz_core::channel::ChannelTier::Owned);
-            refuse_sealed_literals(state, tenant, tier, &event.content).await?;
+            let violating = load_violating_seals(state, tenant, tier).await?;
+            refuse_sealed_in(
+                std::iter::once(event.content.as_str()).chain(
+                    event
+                        .tags
+                        .iter()
+                        .flat_map(|t| t.as_slice().iter().skip(1).map(String::as_str)),
+                ),
+                &violating,
+                tier,
+            )?;
         }
     }
 
@@ -3640,6 +3694,34 @@ mod tests {
                 buzz_core::kind::KIND_CANVAS,
                 "# Accounts\n\n- Aurora Dynamics GmbH — renewal in Q3\n".to_owned(),
                 vec![],
+            ),
+            // A tag on an ordinary message. Listed before the kind:9002
+            // case deliberately: this is the one an ordinary member can
+            // actually reach (9002 additionally needs channel authority),
+            // so it must be the first thing to break if tag scanning is
+            // ever dropped.
+            (
+                "a tag on a plain message",
+                KIND_STREAM_MESSAGE,
+                "see attached".to_owned(),
+                vec![vec![
+                    "alt".to_owned(),
+                    "quote from Aurora Dynamics GmbH".to_owned(),
+                ]],
+            ),
+            // kind:9002's content is empty — every word a member writes
+            // (name/about/topic/purpose) rides in tags, so a content-only
+            // guard cannot see it at all. The seal must outrank channel
+            // authority here: an admin may rename a channel, but not into a
+            // value the workspace owner sealed above this tier.
+            (
+                "channel metadata in a tag",
+                buzz_core::kind::KIND_NIP29_EDIT_METADATA,
+                String::new(),
+                vec![vec![
+                    "about".to_owned(),
+                    "renewals for Aurora Dynamics GmbH".to_owned(),
+                ]],
             ),
         ] {
             let refused = post(kind, &content, extra).await.expect_err(label);

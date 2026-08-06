@@ -852,12 +852,42 @@ no remaining follow-ups.
      Two more mutations killed: reverting the guard to the old seven-kind
      allowlist, and removing the 47001 check.
 
-     **Still open, and structurally out of the guard's reach**: kind:9002
-     (channel metadata edit) carries its free text — `name`, `about`,
-     `topic`, `purpose` — in **tags**, not `content`, and writes straight to
-     the channels table (`side_effects.rs:1855-1857`). Adding 9002 to the
-     guard would do nothing, because the guard scans `event.content`. That
-     wants a tag-scanning check of its own, and is the next seal slice.
+     **Slice 5 closed the tag surface**, which the 9002 finding turned out
+     to be a special case of. A tag value fans out with the event exactly as
+     the body does, so a literal in `["alt", "…"]` on an ordinary kind:9
+     leaves the tier just as surely as one in the message text — and no
+     member needs any authority to send it. kind:9002 only made it
+     unmissable: its `content` is empty and *all* of its member-written text
+     (`name`, `about`, `topic`, `purpose`) rides in tags, so a content-only
+     guard was blind to it entirely.
+
+     The guard now scans `content` **and every tag value**, for the same
+     fail-closed reason the kind list was inverted — not a list of the prose
+     tag names. Structural values (event ids, UUIDs, pubkeys) simply never
+     match a sealed literal, and if one did, refusing is the safe direction.
+     The seal query moved out of the per-string path into
+     `load_violating_seals`, so an event with twenty tags still costs one
+     query; `refuse_sealed_in` is the pure check over many strings.
+
+     Mutation: dropping tag scanning lets a plain member's message through
+     with `accepted: true`, carrying the sealed value in an `alt` tag. The
+     test deliberately orders that case first, ahead of the 9002 case, since
+     9002 additionally requires channel authority — the member-reachable
+     hole is the one that must break first.
+
+     Cost, stated plainly: every channel-scoped event in a non-owned channel
+     now costs one indexed SELECT on a small table, where before only seven
+     kinds with non-empty content did. Small next to the membership,
+     channel and insert queries already on that path, but a per-community
+     seal cache invalidated on `POST /api/seals` is the obvious next
+     optimization if it ever shows up in a profile.
+
+     With that, **every ingestion path a member can reach is covered**:
+     content and tags on all channel-scoped kinds, the two command kinds
+     that bypass the guard (47001, 47021), and the promoted git tree. What
+     remains for D31 is not ingestion but the rest of the lifecycle — the
+     workspace sweep, delivery redaction envelopes, gateway scrub, gate
+     integration, and revocation.
    - **Retrieval foundation (D37)** — pgvector + a continuous owned-tier
      embedding pipeline, ACL-scoped search over buzz-search FTS, retrieval
      tools for copilot and harness agents. **Not started**: `pg_extension`
