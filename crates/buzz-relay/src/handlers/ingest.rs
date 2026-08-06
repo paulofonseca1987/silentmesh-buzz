@@ -477,6 +477,54 @@ pub(crate) fn is_global_only_kind(kind: u32) -> bool {
     )
 }
 
+/// Refuse `text` if it carries a literal that a Content Seal (D31) bars
+/// from a channel at `tier`.
+///
+/// One home for the rule, because the enforcement points are necessarily
+/// scattered: the ingest guard covers ordinary channel-scoped events, but
+/// *command* kinds are dispatched before the guard runs and have to call
+/// this themselves (kind:47001 does; kind:47021 uses the pre-filtered form
+/// in `api::git::promote`, which scans many blobs and must not re-query per
+/// blob).
+///
+/// Refuses by the seal's **label**, never the literal. The label was
+/// validated at creation to be sayable anywhere; the literal, by
+/// definition, is not — and this refusal travels to a member standing in
+/// the very channel the value is barred from.
+pub(crate) async fn refuse_sealed_literals(
+    state: &AppState,
+    tenant: &TenantContext,
+    tier: buzz_core::channel::ChannelTier,
+    text: &str,
+) -> Result<(), IngestError> {
+    // `owned` is the strictest tier — nothing can be violated there, so the
+    // workspace's most sensitive channels pay nothing for this check.
+    if tier == buzz_core::channel::ChannelTier::Owned || text.is_empty() {
+        return Ok(());
+    }
+    let seals = state
+        .db
+        .load_sealed_literals(tenant.community())
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: seal load: {e}")))?;
+    let violating: Vec<buzz_core::seal::SealedLiteral> =
+        buzz_core::seal::violating_seals(&seals, tier)
+            .into_iter()
+            .cloned()
+            .collect();
+    if let Some(hit) = buzz_core::seal::find_literals(text, &violating).first() {
+        let label = violating
+            .iter()
+            .find(|s| s.id == hit.id)
+            .map(|s| s.label.as_str())
+            .unwrap_or("a sealed value");
+        return Err(IngestError::AuthFailed(format!(
+            "restricted: \"{label}\" is sealed and may not appear in a {tier} channel"
+        )));
+    }
+    Ok(())
+}
+
 /// Kinds that require an `h` tag for channel scoping.
 pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
     matches!(
@@ -2250,58 +2298,47 @@ async fn ingest_event_inner(
     // after storage is not containment — the row would exist and fan-out
     // would race the delete.
     //
-    // Scope: channel-scoped kinds whose content is member-authored text.
-    // That includes edits (or the edit path re-introduces what the original
-    // was refused for) and diffs (an agent pasting a sealed value into a
-    // file would otherwise publish it through the diff event).
+    // Scope: EVERY channel-scoped kind with non-empty content, not a
+    // hand-kept list of the text-bearing ones.
+    //
+    // This started as an allowlist (kind:9, V2, edits, diffs, forum posts
+    // and comments, thread goals) and that was the wrong shape. An
+    // allowlist has to be extended each time a content-bearing kind is
+    // added, and the kinds it silently missed were exactly the ones nobody
+    // thought to add: fork goals (47020), whole canvas documents (40100),
+    // agent recommendations (47003), checkpoint notes (47010), gate-review
+    // drafts (47022), scheduled messages (40006), reminders (40007) and
+    // huddle guidelines (48106) — every one of them member- or
+    // agent-authored text landing in a channel. Keying off
+    // `requires_h_channel_scope` makes the guard fail closed: a new kind is
+    // covered the day it is introduced, and skipping one becomes a
+    // deliberate act rather than an oversight.
+    //
+    // Scanning a kind whose content is structured JSON rather than prose is
+    // not waste — a sealed literal embedded in a JSON field is still the
+    // literal leaving the tier, and an exact substring match finds it there
+    // too.
+    //
+    // Command kinds never reach here (they are dispatched earlier), so
+    // their seal checks live in their own handlers: kind:47021 promotion in
+    // `api::git::promote`, kind:47001 thread metadata in
+    // `work_thread::handle_thread_metadata`.
+    //
+    // Still uncovered, and structurally out of this guard's reach:
+    // kind:9002 carries its free text (`name`, `about`, `topic`, `purpose`)
+    // in TAGS, not `content`, so scanning content does nothing for it. That
+    // wants a tag-scanning check of its own.
     //
     // Owned channels skip the seal query entirely: owned is the strictest
     // tier, so no seal can be violated there and the workspace's most
     // sensitive channels pay nothing for this guard.
-    if matches!(
-        kind_u32,
-        KIND_STREAM_MESSAGE
-            | KIND_STREAM_MESSAGE_V2
-            | KIND_STREAM_MESSAGE_EDIT
-            | KIND_STREAM_MESSAGE_DIFF
-            | KIND_FORUM_POST
-            | KIND_FORUM_COMMENT
-            | KIND_WORK_THREAD_OPEN
-    ) && !event.content.is_empty()
-    {
+    if requires_h_channel_scope(kind_u32) && !event.content.is_empty() {
         if let Some(row) = &channel_row {
             let tier = row
                 .tier
                 .parse::<buzz_core::channel::ChannelTier>()
                 .unwrap_or(buzz_core::channel::ChannelTier::Owned);
-            if tier != buzz_core::channel::ChannelTier::Owned {
-                let seals = state
-                    .db
-                    .load_sealed_literals(tenant.community())
-                    .await
-                    .map_err(|e| IngestError::Internal(format!("error: seal load: {e}")))?;
-                let violating: Vec<buzz_core::seal::SealedLiteral> =
-                    buzz_core::seal::violating_seals(&seals, tier)
-                        .into_iter()
-                        .cloned()
-                        .collect();
-                if let Some(hit) =
-                    buzz_core::seal::find_literals(&event.content, &violating).first()
-                {
-                    // Refuse by LABEL. The label was validated at creation
-                    // to be sayable anywhere; the literal, by definition,
-                    // is not — and this message travels into the very
-                    // channel the value is barred from.
-                    let label = violating
-                        .iter()
-                        .find(|s| s.id == hit.id)
-                        .map(|s| s.label.as_str())
-                        .unwrap_or("a sealed value");
-                    return Err(IngestError::AuthFailed(format!(
-                        "restricted: \"{label}\" is sealed and may not appear in a {tier} channel"
-                    )));
-                }
-            }
+            refuse_sealed_literals(state, tenant, tier, &event.content).await?;
         }
     }
 
@@ -3502,6 +3539,282 @@ mod tests {
         post(open_ch, "notes: some other client wants Q3")
             .await
             .expect("unsealed text is unaffected");
+    }
+
+    /// The guard covers channel-scoped kinds it was never explicitly told
+    /// about. It used to be an allowlist of seven kinds, and the ones it
+    /// silently omitted — fork goals, canvas documents, agent
+    /// recommendations, scheduled messages — were text-bearing kinds nobody
+    /// remembered to add. These two are picked because neither was in that
+    /// list: if the guard is ever narrowed back to a hand-kept set, this
+    /// fails.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn the_seal_guard_covers_kinds_no_one_remembered_to_list() {
+        use buzz_core::channel::{ChannelTier, ChannelType, ChannelVisibility, MemberRole};
+
+        let state = super::super::work_thread::pg_tests::test_state().await;
+        let owner = nostr::Keys::generate();
+        let member = nostr::Keys::generate();
+        let host = format!("seal-cover-{}.example", Uuid::new_v4().simple());
+        let community = match state
+            .db
+            .create_community_with_owner(&host, &owner.public_key().to_hex())
+            .await
+            .expect("create community")
+        {
+            buzz_db::CreateCommunityWithOwnerResult::Created(rec) => rec.id,
+            other => panic!("expected fresh community, got {other:?}"),
+        };
+        let tenant = TenantContext::resolved(community, host);
+        for keys in [&owner, &member] {
+            state
+                .db
+                .ensure_user(community, keys.public_key().to_bytes().as_ref())
+                .await
+                .expect("ensure user");
+        }
+        state
+            .db
+            .create_seal(buzz_db::seal::CreateSealParams {
+                community_id: community,
+                id: "00112233445566bb",
+                label: "the northern client",
+                literal: "Aurora Dynamics GmbH",
+                min_tier: ChannelTier::Private,
+                created_by: owner.public_key().to_bytes().as_ref(),
+            })
+            .await
+            .expect("create seal");
+        let ch = state
+            .db
+            .create_channel_tiered(
+                community,
+                "open-ch",
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                ChannelTier::Open,
+                None,
+                &owner.public_key().to_bytes(),
+                None,
+            )
+            .await
+            .expect("create channel");
+        state
+            .db
+            .add_member(
+                community,
+                ch.id,
+                &member.public_key().to_bytes(),
+                MemberRole::Member,
+                None,
+            )
+            .await
+            .expect("add member");
+
+        let post = |kind: u32, content: &str, extra: Vec<Vec<String>>| {
+            let mut tags = vec![nostr::Tag::parse(["h", &ch.id.to_string()]).unwrap()];
+            for t in extra {
+                tags.push(nostr::Tag::parse(t).unwrap());
+            }
+            let event = EventBuilder::new(Kind::Custom(kind as u16), content.to_owned())
+                .tags(tags)
+                .sign_with_keys(&member)
+                .expect("sign");
+            let auth = super::super::work_thread::pg_tests::http_auth(&member);
+            let state = &state;
+            let tenant = &tenant;
+            async move { ingest_event(state, tenant, event, auth).await }
+        };
+
+        let parent = "11".repeat(32);
+        for (label, kind, content, extra) in [
+            (
+                "fork goal",
+                buzz_core::kind::KIND_WORK_THREAD_FORK,
+                "port it for Aurora Dynamics GmbH".to_owned(),
+                vec![vec!["e".to_owned(), parent.clone()]],
+            ),
+            (
+                "canvas document",
+                buzz_core::kind::KIND_CANVAS,
+                "# Accounts\n\n- Aurora Dynamics GmbH — renewal in Q3\n".to_owned(),
+                vec![],
+            ),
+        ] {
+            let refused = post(kind, &content, extra).await.expect_err(label);
+            let msg = format!("{refused:?}");
+            assert!(
+                msg.contains("the northern client"),
+                "{label}: refusal must name the label: {msg}"
+            );
+            assert!(
+                !msg.contains("Aurora Dynamics GmbH"),
+                "{label}: refusal must NOT echo the sealed value: {msg}"
+            );
+        }
+
+        // Control: the same kind with clean text is not refused *by the
+        // seal*. It may still fail later validation (this fork's parent does
+        // not exist), which is exactly the point — the guard must not be
+        // what stops it.
+        let clean = post(
+            buzz_core::kind::KIND_WORK_THREAD_FORK,
+            "port it for someone else",
+            vec![vec!["e".to_owned(), parent]],
+        )
+        .await;
+        let clean_msg = format!("{clean:?}");
+        assert!(
+            !clean_msg.contains("the northern client"),
+            "clean text must not trip the seal guard: {clean_msg}"
+        );
+    }
+
+    /// kind:47001 is a command kind, dispatched before the guard runs, and
+    /// it can rewrite an existing thread's goal. Guarding kind:47000 while
+    /// leaving this open would be decorative: open a thread with a harmless
+    /// goal, then re-goal it to the sealed value.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn a_command_kind_cannot_re_goal_a_thread_to_a_sealed_value() {
+        use buzz_core::channel::{ChannelTier, ChannelType, ChannelVisibility, MemberRole};
+
+        let state = super::super::work_thread::pg_tests::test_state().await;
+        let owner = nostr::Keys::generate();
+        let member = nostr::Keys::generate();
+        let host = format!("seal-regoal-{}.example", Uuid::new_v4().simple());
+        let community = match state
+            .db
+            .create_community_with_owner(&host, &owner.public_key().to_hex())
+            .await
+            .expect("create community")
+        {
+            buzz_db::CreateCommunityWithOwnerResult::Created(rec) => rec.id,
+            other => panic!("expected fresh community, got {other:?}"),
+        };
+        let tenant = TenantContext::resolved(community, host);
+        for keys in [&owner, &member] {
+            state
+                .db
+                .ensure_user(community, keys.public_key().to_bytes().as_ref())
+                .await
+                .expect("ensure user");
+        }
+        state
+            .db
+            .create_seal(buzz_db::seal::CreateSealParams {
+                community_id: community,
+                id: "00112233445566cc",
+                label: "the northern client",
+                literal: "Aurora Dynamics GmbH",
+                min_tier: ChannelTier::Private,
+                created_by: owner.public_key().to_bytes().as_ref(),
+            })
+            .await
+            .expect("create seal");
+        let ch = state
+            .db
+            .create_channel_tiered(
+                community,
+                "open-ch",
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                ChannelTier::Open,
+                None,
+                &owner.public_key().to_bytes(),
+                None,
+            )
+            .await
+            .expect("create channel");
+        state
+            .db
+            .add_member(
+                community,
+                ch.id,
+                &member.public_key().to_bytes(),
+                MemberRole::Member,
+                None,
+            )
+            .await
+            .expect("add member");
+
+        // Step one: a thread whose goal says nothing sealed. Accepted, as it
+        // should be — this is the innocent half of the bypass.
+        let open_thread = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_WORK_THREAD_OPEN as u16),
+            "look into the renewal".to_owned(),
+        )
+        .tags([nostr::Tag::parse(["h", &ch.id.to_string()]).unwrap()])
+        .sign_with_keys(&member)
+        .expect("sign");
+        ingest_event(
+            &state,
+            &tenant,
+            open_thread.clone(),
+            super::super::work_thread::pg_tests::http_auth(&member),
+        )
+        .await
+        .expect("a clean thread goal is accepted");
+        crate::handlers::side_effects::handle_side_effects(
+            &tenant,
+            buzz_core::kind::KIND_WORK_THREAD_OPEN,
+            &open_thread,
+            &state,
+        )
+        .await
+        .expect("47000 side effect");
+
+        let regoal = |goal: &str| {
+            let body = serde_json::json!({ "goal": goal }).to_string();
+            let event = EventBuilder::new(
+                Kind::Custom(buzz_core::kind::KIND_WORK_THREAD_METADATA as u16),
+                body,
+            )
+            .tags([
+                nostr::Tag::parse(["e", &open_thread.id.to_hex()]).unwrap(),
+                nostr::Tag::parse(["h", &ch.id.to_string()]).unwrap(),
+            ])
+            .sign_with_keys(&member)
+            .expect("sign");
+            let auth = super::super::work_thread::pg_tests::http_auth(&member);
+            let state = &state;
+            let tenant = &tenant;
+            async move { ingest_event(state, tenant, event, auth).await }
+        };
+
+        // Step two: the bypass. Must be refused, by label.
+        let refused = regoal("renewal for Aurora Dynamics GmbH")
+            .await
+            .expect_err("re-goaling to a sealed value must be refused");
+        let msg = format!("{refused:?}");
+        assert!(
+            msg.contains("the northern client"),
+            "refusal must name the label: {msg}"
+        );
+        assert!(
+            !msg.contains("Aurora Dynamics GmbH"),
+            "refusal must NOT echo the sealed value: {msg}"
+        );
+
+        // The refusal is containment, not just a message: nothing stored.
+        assert!(
+            state
+                .db
+                .get_work_thread(community, open_thread.id.as_bytes())
+                .await
+                .expect("thread lookup")
+                .expect("thread exists")
+                .goal
+                != "renewal for Aurora Dynamics GmbH",
+            "a refused re-goal must not have been applied"
+        );
+
+        // And an ordinary metadata edit still works — the check must not
+        // have broken the feature it guards.
+        regoal("look into the renewal, priority")
+            .await
+            .expect("a clean re-goal is accepted");
     }
 
     /// A banned relay admin must be refused with the same wire prefix and

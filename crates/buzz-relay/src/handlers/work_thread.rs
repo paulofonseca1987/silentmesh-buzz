@@ -311,6 +311,26 @@ pub(crate) async fn handle_thread_metadata(
         ));
     }
 
+    // silent-mesh (D31): kind:47001 is a *command* kind, so it is dispatched
+    // before the ingest seal guard ever runs and has to check for itself.
+    // It also happens to be the exact bypass of the guarded kind:47000 —
+    // open a thread with a harmless goal, then re-goal it to the sealed
+    // value — so leaving it unchecked would have made guarding 47000
+    // decorative. Only the goal is member prose; deadline and dri are a
+    // timestamp and a pubkey.
+    if let Some(goal) = goal {
+        let channel = state
+            .db
+            .get_channel(tenant.community(), channel_id)
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: channel lookup: {e}")))?;
+        let tier = channel
+            .tier
+            .parse::<buzz_core::channel::ChannelTier>()
+            .unwrap_or(buzz_core::channel::ChannelTier::Owned);
+        crate::handlers::ingest::refuse_sealed_literals(state, tenant, tier, goal).await?;
+    }
+
     let tx = match persist_command_event(state, tenant, event, Some(channel_id)).await? {
         PersistResult::Duplicate => {
             return Ok(IngestResult {

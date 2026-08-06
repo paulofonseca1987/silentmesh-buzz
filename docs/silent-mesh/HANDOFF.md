@@ -821,15 +821,43 @@ no remaining follow-ups.
      (stored history + fan-out), gateway scrub, gate integration, and seal
      revocation (nothing deletes a seal yet).
 
-     **Known coverage gap, deliberately not widened here**: the ingest
-     guard's kind list covers 9 / 40002 / 40003 / 40008 / 45001 / 45003 /
-     47000. Other kinds carry member-authored text into a channel and are
-     *not* seal-checked — notably **kind:47020 (fork)**, whose goal text
-     lands in whatever channel its `h` tag names, and which never compares
-     that channel against the parent thread's (it writes DB rows only, so no
-     files move). 47001/47003 want the same look. That is a coverage audit
-     across all content-bearing kinds, not a one-line addition, and should
-     be its own slice.
+     **Slice 4 did that coverage audit, and the allowlist itself was the
+     bug.** Enumerating every kind in `requires_h_channel_scope` against the
+     guard's seven-kind list turned up **nine** member-authorable kinds
+     carrying free text that nothing seal-checked: fork goals (47020),
+     whole canvas documents (40100 — the largest text surface in the set,
+     and it is fed into agent context), agent recommendations (47003),
+     checkpoint notes (47010), gate-review drafts (47022), scheduled
+     messages (40006), reminders (40007), huddle guidelines (48106), and
+     thread metadata (47001).
+
+     Adding nine constants would have left the same trap set for the tenth
+     kind, so the guard was **inverted to fail closed**: it keys off
+     `requires_h_channel_scope` itself, so a new channel-scoped kind is
+     covered the day it is introduced and *skipping* one becomes a
+     deliberate act rather than an oversight. Scanning kinds whose content
+     is structured JSON is not waste — a literal embedded in a JSON field is
+     still the literal leaving the tier.
+
+     **47001 was the sharp one** and needed a different fix: it is a
+     *command* kind, dispatched before the guard runs, and it rewrites an
+     existing thread's goal. Guarding 47000 while leaving 47001 open was
+     decorative — open a thread with a harmless goal, then re-goal it to the
+     sealed value. Its check lives in `handle_thread_metadata`. The rule now
+     has one home, `ingest::refuse_sealed_literals`, shared by the guard and
+     by the command handlers the guard cannot see (promotion keeps the
+     pre-filtered form, since it scans many blobs and must not re-query per
+     blob).
+
+     Two more mutations killed: reverting the guard to the old seven-kind
+     allowlist, and removing the 47001 check.
+
+     **Still open, and structurally out of the guard's reach**: kind:9002
+     (channel metadata edit) carries its free text — `name`, `about`,
+     `topic`, `purpose` — in **tags**, not `content`, and writes straight to
+     the channels table (`side_effects.rs:1855-1857`). Adding 9002 to the
+     guard would do nothing, because the guard scans `event.content`. That
+     wants a tag-scanning check of its own, and is the next seal slice.
    - **Retrieval foundation (D37)** — pgvector + a continuous owned-tier
      embedding pipeline, ACL-scoped search over buzz-search FTS, retrieval
      tools for copilot and harness agents. **Not started**: `pg_extension`
