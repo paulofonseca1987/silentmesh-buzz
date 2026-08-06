@@ -125,8 +125,10 @@ member's push is rejected; a non-member sees nothing.
   assist (D30)** — local summary + redaction suggestions, pinned owned-tier in
   the router.
 - **Content Seals (D31)**: registry, workspace sweep, ingestion guards
-  (pre-receive + event ingest), delivery redaction envelopes, gateway
-  resolution/scrub, mandatory-redaction integration with the gate.
+  (pre-receive + event ingest), **movement guards** (promotion — summary and
+  promoted tree — where content crosses into a looser channel), delivery
+  redaction envelopes, gateway resolution/scrub, mandatory-redaction
+  integration with the gate.
 - **Retrieval foundation (D37)**: pgvector + continuous local-embedding
   pipeline (owned-tier only, forbidden from remote routes in the router, like
   gate inference); ACL-scoped search API layered over buzz-search FTS; retrieval

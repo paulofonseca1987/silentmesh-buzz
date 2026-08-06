@@ -881,6 +881,31 @@ pub(crate) async fn handle_thread_promote(
     .await
     .map_err(|e| IngestError::Rejected(e.reject_message()))?;
 
+    // silent-mesh (D31): promotion is the movement primitive, so it is the
+    // enforcement point a Content Seal exists for. The tier comparison
+    // above asks whether the *space* may move; this asks whether these
+    // particular values may — a seal names a value that must not travel
+    // past a tier however legitimate the move otherwise looks.
+    //
+    // The decision of *which* seals apply is made here, against the TARGET
+    // tier, and only the filtered set crosses into the gate: the gate
+    // applies seals, it does not choose them. An `owned` target can violate
+    // nothing (it is the strictest tier), so it skips the query entirely.
+    let sealed: Vec<buzz_core::seal::SealedLiteral> =
+        if target_tier == buzz_core::channel::ChannelTier::Owned {
+            Vec::new()
+        } else {
+            let seals = state
+                .db
+                .load_sealed_literals(tenant.community())
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: seal load: {e}")))?;
+            buzz_core::seal::violating_seals(&seals, target_tier)
+                .into_iter()
+                .cloned()
+                .collect()
+        };
+
     // Privacy Gate + graft BEFORE the event exists: a refused or failed
     // promotion stores nothing and transfers nothing. (This deliberately
     // inverts the persist-then-mutate command pattern — the git work takes
@@ -893,6 +918,7 @@ pub(crate) async fn handle_thread_promote(
         event.id.as_bytes(),
         &event.content,
         &ckpt_commit,
+        &sealed,
     )
     .await
     .map_err(|e| IngestError::Rejected(e.reject_message()))?;
@@ -1208,7 +1234,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod pg_tests {
+pub(crate) mod pg_tests {
     //! D41 end-to-end over live Postgres: the kind:47000 side effect creates
     //! the projection, kind:47001 metadata edits respect member authority,
     //! and kind:47002 transitions walk the full matrix through the real
@@ -1225,7 +1251,7 @@ mod pg_tests {
     use crate::handlers::ingest::HttpAuthMethod;
 
     /// Real-PG state mirroring `command_executor::approval_outcome_tests`.
-    async fn test_state() -> Arc<AppState> {
+    pub(crate) async fn test_state() -> Arc<AppState> {
         let mut config = crate::config::Config::from_env().expect("default config loads");
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
@@ -1273,7 +1299,7 @@ mod pg_tests {
             .expect("sign event")
     }
 
-    fn http_auth(keys: &nostr::Keys) -> IngestAuth {
+    pub(crate) fn http_auth(keys: &nostr::Keys) -> IngestAuth {
         IngestAuth::Http {
             pubkey: keys.public_key(),
             scopes: buzz_auth::Scope::all_known(),

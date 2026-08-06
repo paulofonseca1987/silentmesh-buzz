@@ -3363,6 +3363,147 @@ mod tests {
     };
     use nostr::{EventBuilder, Kind};
 
+    /// silent-mesh D31: the containment boundary, exercised against a real
+    /// database rather than by hand.
+    ///
+    /// The live CLI run proved this works; nothing in CI protected it. The
+    /// guard sits in the middle of a very long function, and its placement
+    /// is load-bearing in a way no unit-level call reveals: it must run
+    /// after membership and **before storage**, because refusing after
+    /// storage is not containment — the row exists and fan-out races the
+    /// delete. A future edit could move or drop it and every other test
+    /// would still pass.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn sealed_literals_are_refused_below_their_tier() {
+        use buzz_core::channel::{ChannelTier, ChannelType, ChannelVisibility, MemberRole};
+
+        let state = super::super::work_thread::pg_tests::test_state().await;
+        let owner = nostr::Keys::generate();
+        let member = nostr::Keys::generate();
+
+        let host = format!("seal-{}.example", Uuid::new_v4().simple());
+        let community = match state
+            .db
+            .create_community_with_owner(&host, &owner.public_key().to_hex())
+            .await
+            .expect("create community")
+        {
+            buzz_db::CreateCommunityWithOwnerResult::Created(rec) => rec.id,
+            other => panic!("expected fresh community, got {other:?}"),
+        };
+        let tenant = TenantContext::resolved(community, host);
+        for keys in [&owner, &member] {
+            state
+                .db
+                .ensure_user(community, keys.public_key().to_bytes().as_ref())
+                .await
+                .expect("ensure user");
+        }
+
+        // One seal, minimum tier `private`.
+        state
+            .db
+            .create_seal(buzz_db::seal::CreateSealParams {
+                community_id: community,
+                id: "00112233445566aa",
+                label: "the northern client",
+                literal: "Aurora Dynamics GmbH",
+                min_tier: ChannelTier::Private,
+                created_by: owner.public_key().to_bytes().as_ref(),
+            })
+            .await
+            .expect("create seal");
+
+        // Two channels differing only in tier, so the tier is provably the
+        // deciding input rather than anything about the channel or author.
+        let mut channels = Vec::new();
+        for (name, tier) in [
+            ("open-ch", ChannelTier::Open),
+            ("priv-ch", ChannelTier::Private),
+        ] {
+            let ch = state
+                .db
+                .create_channel_tiered(
+                    community,
+                    name,
+                    ChannelType::Stream,
+                    ChannelVisibility::Open,
+                    tier,
+                    None,
+                    &owner.public_key().to_bytes(),
+                    None,
+                )
+                .await
+                .expect("create channel");
+            state
+                .db
+                .add_member(
+                    community,
+                    ch.id,
+                    &member.public_key().to_bytes(),
+                    MemberRole::Member,
+                    None,
+                )
+                .await
+                .expect("add member");
+            channels.push((tier, ch.id));
+        }
+
+        // Borrowing rather than moving: the same closure posts four times,
+        // and each call must see the same state, tenant and author — a
+        // per-call clone would prove less, since a fresh author could pass
+        // or fail for membership reasons unrelated to the seal.
+        let post = |channel: Uuid, content: &str| {
+            let event =
+                EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), content.to_owned())
+                    .tags([nostr::Tag::parse(["h", &channel.to_string()]).unwrap()])
+                    .sign_with_keys(&member)
+                    .expect("sign");
+            let auth = super::super::work_thread::pg_tests::http_auth(&member);
+            let state = &state;
+            let tenant = &tenant;
+            async move { ingest_event(state, tenant, event, auth).await }
+        };
+
+        let (open_tier, open_ch) = channels[0];
+        let (priv_tier, priv_ch) = channels[1];
+        assert_eq!(open_tier, ChannelTier::Open);
+        assert_eq!(priv_tier, ChannelTier::Private);
+
+        // Below the seal's minimum: refused, and refused by LABEL — this
+        // message is delivered into the very channel the value is barred
+        // from, so echoing the literal here would be the leak.
+        let refused = post(open_ch, "notes: Aurora Dynamics GmbH wants Q3")
+            .await
+            .expect_err("open channel must refuse the literal");
+        let msg = format!("{refused:?}");
+        assert!(
+            msg.contains("the northern client"),
+            "refusal must name the label: {msg}"
+        );
+        assert!(
+            !msg.contains("Aurora Dynamics GmbH"),
+            "refusal must NOT echo the sealed value: {msg}"
+        );
+
+        // At the seal's minimum: accepted.
+        post(priv_ch, "notes: Aurora Dynamics GmbH wants Q3")
+            .await
+            .expect("private channel is strict enough");
+
+        // The token is what makes the looser channel usable at all.
+        post(open_ch, "update for [sm-seal:00112233445566aa] is ready")
+            .await
+            .expect("a token is not a literal");
+
+        // And unrelated text is unaffected — the guard must not be a
+        // blanket refusal that happens to look correct.
+        post(open_ch, "notes: some other client wants Q3")
+            .await
+            .expect("unsealed text is unaffected");
+    }
+
     /// A banned relay admin must be refused with the same wire prefix and
     /// transport status as every other durable-restriction refusal:
     /// `blocked:` and (via `bridge.rs`'s `AuthFailed` arm) HTTP 403 — never

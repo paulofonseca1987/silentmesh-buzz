@@ -1,5 +1,5 @@
 //! Thread promotion out of a personal channel (Silent Mesh Phase 2g,
-//! D29/D30) — the git half of the kind:47021 command.
+//! D29/D30/D31) — the git half of the kind:47021 command.
 //!
 //! Promotion moves a thread's **files** (the tree of one recorded
 //! kind:47010 checkpoint) from the member's personal-channel repo into the
@@ -14,6 +14,16 @@
 //! stored. Binary blobs (NUL-sniffed) are skipped by design; oversized
 //! text blobs are refused as unscannable (fail closed) rather than passed
 //! unread.
+//!
+//! Content Seals (D31) run over the same two surfaces and share those
+//! limits. Where the secret scan asks "does this *look* like a credential",
+//! a seal asks "is this exact registered value allowed to travel this far":
+//! promotion is the movement primitive, so it is where a seal earns its
+//! keep. Which seals apply is decided by the **target** channel's tier and
+//! settled by the caller — this module receives an already-filtered set and
+//! applies it, so the tier rule lives in one place. Refusals name the
+//! seal's public label, never the sealed value, because the refusal travels
+//! to a member standing in the looser channel.
 //!
 //! Mechanics mirror canonicalize-on-close: hydrate both repos, move the
 //! checkpoint objects source → target with a local `git push` into a
@@ -34,6 +44,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use buzz_core::seal::SealedLiteral;
 use buzz_core::secret_scan::{looks_binary, scan_text};
 use buzz_core::tenant::TenantContext;
 use buzz_db::work_thread::WorkThreadRecord;
@@ -68,6 +79,16 @@ pub enum PromoteError {
     /// The Privacy Gate found credential-shaped content. Entries are
     /// `"<rule> in <where>"` — rule names and paths only, never values.
     SecretFindings(Vec<String>),
+    /// A Content Seal (D31) forbids one of the promoted literals in a
+    /// channel this loose. Entries are `"<label> in <where>"` — the seal's
+    /// public label and a path, never the sealed value itself.
+    ///
+    /// Separate from [`PromoteError::SecretFindings`] because the two say
+    /// different things to the member: a credential finding means "this
+    /// looks like a secret, take it out", while a seal finding means "this
+    /// specific value is registered as too sensitive for where you are
+    /// sending it" — actionable only if the refusal names the seal.
+    SealedFindings(Vec<String>),
     /// A text blob was too large to scan; the gate fails closed.
     Unscannable(String),
     /// Pointer CAS lost against concurrent pushes, retries exhausted.
@@ -90,6 +111,11 @@ impl PromoteError {
             }
             PromoteError::SecretFindings(findings) => format!(
                 "forbidden: privacy gate found credential-shaped content: {}",
+                findings.join("; ")
+            ),
+            PromoteError::SealedFindings(findings) => format!(
+                "forbidden: promotion would move a sealed value into a channel it is sealed \
+                 against: {}. Remove it or promote into a channel at the seal's tier or stricter.",
                 findings.join("; ")
             ),
             PromoteError::Unscannable(path) => format!(
@@ -137,9 +163,32 @@ pub async fn resolve_promote_checkpoint(
     }
 }
 
+/// What the gate found in a promoted tree. Both lists are sanitized:
+/// rule names, seal labels and paths only, never matched values.
+#[derive(Default)]
+struct GateFindings {
+    /// Credential-shaped content (D30).
+    secrets: Vec<String>,
+    /// Sealed literals barred from the target's tier (D31).
+    seals: Vec<String>,
+}
+
 /// Run the Privacy Gate over every blob in `commit`'s tree (source repo
 /// already hydrated at `repo_path`). Returns sanitized findings.
-async fn scan_checkpoint_tree(repo_path: &Path, commit: &str) -> Result<Vec<String>, PromoteError> {
+///
+/// `sealed` is the set of seals the **target** tier violates, pre-filtered
+/// by the caller — this function applies seals, it does not decide which
+/// ones apply. An empty slice makes the seal half a no-op, which is what
+/// promoting into an `owned` channel gets.
+///
+/// Both halves inherit the same blind spot: a binary blob is skipped and an
+/// oversized text blob fails closed. A sealed value inside a binary file
+/// therefore passes here, exactly as a credential would.
+async fn scan_checkpoint_tree(
+    repo_path: &Path,
+    commit: &str,
+    sealed: &[SealedLiteral],
+) -> Result<GateFindings, PromoteError> {
     let listing = run_git_env(
         repo_path,
         &["ls-tree", "-r", "-l", "-z", &format!("{commit}^{{tree}}")],
@@ -149,7 +198,7 @@ async fn scan_checkpoint_tree(repo_path: &Path, commit: &str) -> Result<Vec<Stri
     .await
     .map_err(PromoteError::Error)?;
 
-    let mut findings = Vec::new();
+    let mut findings = GateFindings::default();
     for entry in listing.split('\0').filter(|e| !e.is_empty()) {
         // `<mode> <type> <oid> <size>\t<path>`
         let Some((meta, path)) = entry.split_once('\t') else {
@@ -179,7 +228,24 @@ async fn scan_checkpoint_tree(repo_path: &Path, commit: &str) -> Result<Vec<Stri
         }
         let text = String::from_utf8_lossy(&bytes);
         for hit in scan_text(&text) {
-            findings.push(format!("{} in {path}", hit.rule));
+            findings.secrets.push(format!("{} in {path}", hit.rule));
+        }
+        // One finding per (seal, file), not per occurrence: a value pasted
+        // forty times in one file is one thing to fix, and forty copies of
+        // the same line would push the real list off the end of the
+        // refusal message.
+        let mut named = Vec::new();
+        for hit in buzz_core::seal::find_literals(&text, sealed) {
+            if named.contains(&hit.id) {
+                continue;
+            }
+            let label = sealed
+                .iter()
+                .find(|s| s.id == hit.id)
+                .map(|s| s.label.as_str())
+                .unwrap_or("a sealed value");
+            findings.seals.push(format!("{label} in {path}"));
+            named.push(hit.id);
         }
     }
     Ok(findings)
@@ -488,6 +554,7 @@ pub async fn promote_thread_files(
     new_thread_id: &[u8],
     summary: &str,
     ckpt_commit: &str,
+    sealed: &[SealedLiteral],
 ) -> Result<PromoteSuccess, PromoteError> {
     // Gate the summary first — cheapest check, no git work.
     let summary_hits: Vec<String> = scan_text(summary)
@@ -496,6 +563,19 @@ pub async fn promote_thread_files(
         .collect();
     if !summary_hits.is_empty() {
         return Err(PromoteError::SecretFindings(summary_hits));
+    }
+    let mut summary_seals: Vec<String> = Vec::new();
+    for hit in buzz_core::seal::find_literals(summary, sealed) {
+        let Some(seal) = sealed.iter().find(|s| s.id == hit.id) else {
+            continue;
+        };
+        let finding = format!("{} in summary", seal.label);
+        if !summary_seals.contains(&finding) {
+            summary_seals.push(finding);
+        }
+    }
+    if !summary_seals.is_empty() {
+        return Err(PromoteError::SealedFindings(summary_seals));
     }
 
     let source_binding = state
@@ -545,10 +625,16 @@ pub async fn promote_thread_files(
         return Err(PromoteError::CommitMissing);
     }
 
-    // The Privacy Gate over the promoted tree (D30 scaffold).
-    let findings = scan_checkpoint_tree(&source_path, ckpt_commit).await?;
-    if !findings.is_empty() {
-        return Err(PromoteError::SecretFindings(findings));
+    // The Privacy Gate over the promoted tree (D30 scaffold) plus the
+    // Content Seals barred from the target's tier (D31).
+    let findings = scan_checkpoint_tree(&source_path, ckpt_commit, sealed).await?;
+    // Seals first: the more specific refusal, and the one the member can
+    // act on by name. A tree can trip both.
+    if !findings.seals.is_empty() {
+        return Err(PromoteError::SealedFindings(findings.seals));
+    }
+    if !findings.secrets.is_empty() {
+        return Err(PromoteError::SecretFindings(findings.secrets));
     }
 
     let prefix = promoted_prefix(new_thread_id);
@@ -623,6 +709,142 @@ mod tests {
         assert!(PromoteError::Unscannable("big.txt".into())
             .reject_message()
             .contains("big.txt"));
+    }
+
+    #[test]
+    fn a_seal_refusal_reads_differently_from_a_credential_refusal() {
+        // The two must not be confusable: "looks like a secret" and "is a
+        // registered sensitive value" call for different fixes.
+        let sealed = PromoteError::SealedFindings(vec!["the Zurich client in notes.md".into()])
+            .reject_message();
+        let secret = PromoteError::SecretFindings(vec!["aws-access-key-id in notes.md".into()])
+            .reject_message();
+        assert!(sealed.contains("sealed value"), "{sealed}");
+        assert!(sealed.contains("the Zurich client in notes.md"), "{sealed}");
+        assert!(
+            !sealed.contains("credential-shaped"),
+            "a seal is not a credential finding: {sealed}"
+        );
+        assert_ne!(sealed, secret);
+    }
+
+    /// One commit holding `files`. Returns the tempdir (kept alive by the
+    /// caller) and the commit oid.
+    async fn commit_tree(files: &[(&str, &[u8])]) -> (tempfile::TempDir, String) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path();
+        for (name, body) in files {
+            std::fs::write(path.join(name), body).expect("write blob");
+        }
+        for args in [
+            vec!["init", "--quiet", "--initial-branch=main"],
+            vec!["config", "user.email", "seal@test"],
+            vec!["config", "user.name", "seal"],
+            vec!["add", "-A"],
+            vec!["commit", "-m", "seed", "--quiet"],
+        ] {
+            run_git_env(path, &args, &[], None)
+                .await
+                .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        }
+        let head = run_git_env(path, &["rev-parse", "HEAD"], &[], None)
+            .await
+            .expect("rev-parse");
+        (dir, head)
+    }
+
+    fn private_seal(id: &str, label: &str, literal: &str) -> SealedLiteral {
+        SealedLiteral {
+            id: id.into(),
+            label: label.into(),
+            literal: literal.into(),
+            min_tier: buzz_core::channel::ChannelTier::Private,
+        }
+    }
+
+    #[tokio::test]
+    async fn tree_gate_names_the_seal_label_and_never_the_literal() {
+        let (_dir, head) = commit_tree(&[(
+            "notes.md",
+            b"kickoff with Aurora Dynamics GmbH next week\n".as_slice(),
+        )])
+        .await;
+        let seals = [private_seal(
+            "00112233aabbccdd",
+            "the Zurich client",
+            "Aurora Dynamics GmbH",
+        )];
+        let found = scan_checkpoint_tree(_dir.path(), &head, &seals)
+            .await
+            .expect("scan");
+
+        assert_eq!(found.seals, vec!["the Zurich client in notes.md"]);
+        assert!(found.secrets.is_empty(), "{:?}", found.secrets);
+        // The whole point of the label: the refusal travels to a member in
+        // the looser channel, so it must not carry the value.
+        let msg = PromoteError::SealedFindings(found.seals).reject_message();
+        assert!(
+            !msg.contains("Aurora Dynamics GmbH"),
+            "refusal echoed the sealed literal: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_gate_reports_one_finding_per_file_not_per_occurrence() {
+        let (_dir, head) = commit_tree(&[
+            ("a.md", b"Aurora Dynamics GmbH ".repeat(40).as_slice()),
+            ("b.md", b"once: Aurora Dynamics GmbH\n".as_slice()),
+            ("clean.md", b"nothing to see\n".as_slice()),
+        ])
+        .await;
+        let seals = [private_seal(
+            "00112233aabbccdd",
+            "the Zurich client",
+            "Aurora Dynamics GmbH",
+        )];
+        let mut found = scan_checkpoint_tree(_dir.path(), &head, &seals)
+            .await
+            .expect("scan")
+            .seals;
+        found.sort();
+        assert_eq!(
+            found,
+            vec!["the Zurich client in a.md", "the Zurich client in b.md"]
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_gate_is_a_no_op_when_the_target_tier_violates_no_seal() {
+        // What an `owned` target gets: the caller filters to an empty set,
+        // so the same tree that trips above passes untouched.
+        let (_dir, head) = commit_tree(&[(
+            "notes.md",
+            b"kickoff with Aurora Dynamics GmbH next week\n".as_slice(),
+        )])
+        .await;
+        let found = scan_checkpoint_tree(_dir.path(), &head, &[])
+            .await
+            .expect("scan");
+        assert!(found.seals.is_empty(), "{:?}", found.seals);
+    }
+
+    #[tokio::test]
+    async fn tree_gate_skips_binary_blobs_for_seals_as_it_does_for_secrets() {
+        // Not a wish — a recorded blind spot. Binary blobs are skipped by
+        // the D30 scan and the seal scan alike; if that ever changes, this
+        // test should be inverted rather than deleted.
+        let mut blob = b"\x00\x01\x02binary\x00".to_vec();
+        blob.extend_from_slice(b"Aurora Dynamics GmbH");
+        let (_dir, head) = commit_tree(&[("logo.bin", blob.as_slice())]).await;
+        let seals = [private_seal(
+            "00112233aabbccdd",
+            "the Zurich client",
+            "Aurora Dynamics GmbH",
+        )];
+        let found = scan_checkpoint_tree(_dir.path(), &head, &seals)
+            .await
+            .expect("scan");
+        assert!(found.seals.is_empty(), "{:?}", found.seals);
     }
 }
 
@@ -1025,7 +1247,117 @@ mod s3_probe_tests {
             "gated promotion must not store the event"
         );
 
+        // silent-mesh (D31): the same promotion, blocked by a Content Seal
+        // instead of a credential shape. The team channel is `open` and the
+        // seal's floor is `private`, so the value may not travel there.
+        //
+        // This also pins the DIRECTION of the tier filter. The source is a
+        // personal channel, which D24 forces to `owned`, and no seal can be
+        // violated at `owned` — so a call site that filtered by the source
+        // tier instead of the target's would produce an empty seal set and
+        // let both cases below through.
+        const SEALED: &str = "Aurora Dynamics GmbH";
+        state
+            .db
+            .create_seal(buzz_db::seal::CreateSealParams {
+                community_id: community,
+                id: "00112233aabbccdd",
+                label: "the Zurich client",
+                literal: SEALED,
+                min_tier: buzz_core::channel::ChannelTier::Private,
+                created_by: &ws_owner.public_key().to_bytes(),
+            })
+            .await
+            .expect("create seal");
+
+        let sealed_tree_commit = seed_repo(
+            &state,
+            &tenant,
+            &source_repo,
+            "thread-sealed",
+            &[("notes.md", format!("kickoff with {SEALED}\n").as_bytes())],
+            None,
+        )
+        .await;
+        let ckpt = signed(
+            &member,
+            KIND_WORK_THREAD_CHECKPOINT,
+            "turn",
+            &[
+                tag(&["e", &root_hex]),
+                tag(&["h", &personal_hex]),
+                tag(&["commit", &sealed_tree_commit]),
+            ],
+        );
+        state
+            .db
+            .insert_event(community, &ckpt, Some(personal_id))
+            .await
+            .expect("store sealed checkpoint");
+
+        // Both halves of the gate: the member-written summary, and a file
+        // in the promoted tree.
+        for (case, summary, commit) in [
+            (
+                "summary",
+                format!("work for {SEALED}, ready to share"),
+                clean_commit.clone(),
+            ),
+            (
+                "tree",
+                "clean summary".to_owned(),
+                sealed_tree_commit.clone(),
+            ),
+        ] {
+            let sealed_promote = signed(
+                &member,
+                KIND_WORK_THREAD_PROMOTE,
+                &summary,
+                &[
+                    tag(&["e", &root_hex]),
+                    tag(&["h", &team_hex]),
+                    tag(&["from", &personal_hex]),
+                    tag(&["commit", &commit]),
+                ],
+            );
+            let res = crate::handlers::work_thread::handle_thread_promote(
+                &tenant,
+                &state,
+                &sealed_promote,
+                &http_auth(&member),
+            )
+            .await;
+            match res {
+                Err(crate::handlers::ingest::IngestError::Rejected(msg)) => {
+                    assert!(
+                        msg.contains("sealed value"),
+                        "{case}: seal must refuse: {msg}"
+                    );
+                    assert!(
+                        msg.contains("the Zurich client"),
+                        "{case}: refusal must name the seal's label: {msg}"
+                    );
+                    assert!(
+                        !msg.contains(SEALED),
+                        "{case}: refusal must never echo the sealed literal: {msg}"
+                    );
+                }
+                other => panic!("{case}: expected seal rejection, got {other:?}"),
+            }
+            assert!(
+                state
+                    .db
+                    .get_event_by_id(community, sealed_promote.id.as_bytes())
+                    .await
+                    .expect("event lookup")
+                    .is_none(),
+                "{case}: sealed promotion must not store the event"
+            );
+        }
+
         // The real promotion: files + summary move, conversation does not.
+        // Reaching here with a seal registered also shows the guard does
+        // not block clean content.
         let promote = signed(
             &member,
             KIND_WORK_THREAD_PROMOTE,

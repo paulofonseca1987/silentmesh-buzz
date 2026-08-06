@@ -783,12 +783,53 @@ no remaining follow-ups.
      Honest gap from the live run: the forge-a-47100 test was blocked by
      the **CLI's** --kind allowlist, not the relay, so the relay-side
      refusal is pinned by a unit test on the relay-only kind set rather
-     than exercised end-to-end. A PG-gated ingest test for the guard
-     itself (channel row + seals + refusal) is worth adding.
+     than exercised end-to-end.
+
+     **Slice 3 closed the movement hole.** The follow-up PG test the slice-2
+     note asked for now exists (`sealed_literals_are_refused_below_their
+     _tier`), and writing it surfaced something bigger: **promotion —
+     kind:47021, the one primitive whose whole job is moving content into a
+     looser channel — was not seal-checked at all.** Its summary went
+     through the D30 credential scan only, and every blob in the promoted
+     tree likewise; neither knew seals existed. Adding 47021 to the ingest
+     guard would not have worked either: 47021 is a *command* kind, so it is
+     dispatched (ingest.rs:2061) well before the guard runs (ingest.rs:2244)
+     — the guard's list would have been dead code for it. The fix belongs in
+     the promote path, which is also the only place that knows the target
+     tier.
+
+     Both gate surfaces now apply seals: the member-written summary and
+     every text blob in the promoted tree, refusing by the seal's **label**
+     via a distinct `PromoteError::SealedFindings` (a seal is not a
+     credential finding — the two call for different fixes, so they must not
+     read alike). Which seals apply is decided *once*, at the call site,
+     against the **target** tier; the gate receives an already-filtered set.
+     An `owned` target skips the query entirely.
+
+     Five mutations, all killed: disabling the tree scan; naming the literal
+     instead of the label (this one still refuses — it just leaks the sealed
+     value into a message bound for the looser channel, which no
+     did-it-reject assertion would catch); dropping per-file dedup;
+     disabling the tree refusal end-to-end; and **filtering by the source
+     tier instead of the target's**, which is the subtle one — the source is
+     a personal channel, forced to `owned` by D24, where no seal can be
+     violated, so that one line silently promotes sealed values into an open
+     channel (`accepted: true`). The S3 probe pins it because it is the only
+     test where source and target tiers differ.
 
      **Remaining slices**: workspace sweep, delivery redaction envelopes
      (stored history + fan-out), gateway scrub, gate integration, and seal
      revocation (nothing deletes a seal yet).
+
+     **Known coverage gap, deliberately not widened here**: the ingest
+     guard's kind list covers 9 / 40002 / 40003 / 40008 / 45001 / 45003 /
+     47000. Other kinds carry member-authored text into a channel and are
+     *not* seal-checked — notably **kind:47020 (fork)**, whose goal text
+     lands in whatever channel its `h` tag names, and which never compares
+     that channel against the parent thread's (it writes DB rows only, so no
+     files move). 47001/47003 want the same look. That is a coverage audit
+     across all content-bearing kinds, not a one-line addition, and should
+     be its own slice.
    - **Retrieval foundation (D37)** — pgvector + a continuous owned-tier
      embedding pipeline, ACL-scoped search over buzz-search FTS, retrieval
      tools for copilot and harness agents. **Not started**: `pg_extension`
